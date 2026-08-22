@@ -122,6 +122,14 @@ def test_throttled_iterators_guard_zero_transfer_count(client, monkeypatch):
     assert b"".join(client._throttled_upload_iter(b"a")) == b"a"
 
 
+def test_upload_body_can_be_reused_after_sdk_retry(client):
+    client.upload_chunk_size = 2
+    body = client._reusable_upload_body(b"content")
+
+    assert b"".join(body) == b"content"
+    assert b"".join(body) == b"content"
+
+
 @pytest.mark.parametrize(
     "allocation",
     [

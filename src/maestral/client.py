@@ -19,6 +19,7 @@ from typing import (
     Any,
     BinaryIO,
     Callable,
+    Iterable,
     Iterator,
     Sequence,
     TypeVar,
@@ -105,6 +106,20 @@ def get_hash(data: bytes) -> str:
     return hasher.hexdigest()
 
 
+class _ReusableUploadBody:
+    """Create a fresh iterator when the Dropbox SDK retries an HTTP request.
+
+    The SDK reuses ``request_binary`` after rate-limit, server, and auth errors. A
+    generator is empty on the second attempt and can therefore upload zero bytes.
+    """
+
+    def __init__(self, factory: Callable[[], Iterator[bytes]]) -> None:
+        self._factory = factory
+
+    def __iter__(self) -> Iterator[bytes]:
+        return self._factory()
+
+
 class _DropboxSDK(Dropbox):
     def request_json_string(
         self,
@@ -113,7 +128,7 @@ class _DropboxSDK(Dropbox):
         route_style: str,
         request_json_arg: bytes,
         auth_type: str,
-        request_binary: bytes | Iterator[bytes] | None,
+        request_binary: bytes | Iterable[bytes] | None,
         timeout: float | None = None,
     ) -> RouteResult | RouteErrorResult:
         # Custom handling to allow for streamed and chunked uploads. This is mostly
@@ -311,6 +326,9 @@ class DropboxClient:
                 wait_time = target_tock - tock
                 if wait_time > self.DATA_TRANSFER_MIN_SLEEP_TIME:
                     time.sleep(wait_time)
+
+    def _reusable_upload_body(self, data: bytes) -> _ReusableUploadBody:
+        return _ReusableUploadBody(lambda: self._throttled_upload_iter(data))
 
     def _retry_on_error(  # type: ignore
         error_cls: type[Exception],
@@ -940,7 +958,7 @@ class DropboxClient:
         try:
             with convert_api_errors(dbx_path=dbx_path):
                 md = self.dbx.files_upload(
-                    self._throttled_upload_iter(data),
+                    self._reusable_upload_body(data),
                     dbx_path,
                     client_modified=datetime.fromtimestamp(
                         stat.st_mtime, tz=timezone.utc
@@ -975,7 +993,7 @@ class DropboxClient:
         try:
             with convert_api_errors(dbx_path=dbx_path):
                 session_start = self.dbx.files_upload_session_start(
-                    self._throttled_upload_iter(data), content_hash=get_hash(data)
+                    self._reusable_upload_body(data), content_hash=get_hash(data)
                 )
         except Exception:
             # Return to previous position in file.
@@ -1013,7 +1031,7 @@ class DropboxClient:
         with convert_api_errors(dbx_path=dbx_path):
             try:
                 self.dbx.files_upload_session_append_v2(
-                    self._throttled_upload_iter(data),
+                    self._reusable_upload_body(data),
                     cursor,
                     content_hash=get_hash(data),
                 )
@@ -1068,7 +1086,7 @@ class DropboxClient:
         with convert_api_errors(dbx_path=dbx_path):
             try:
                 md = self.dbx.files_upload_session_finish(
-                    self._throttled_upload_iter(data),
+                    self._reusable_upload_body(data),
                     cursor,
                     commit,
                     content_hash=get_hash(data),
