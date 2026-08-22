@@ -1,7 +1,4 @@
-"""
-This module provides interactive commandline dialogs which are based on the
-:mod:`survey` Python library.
-"""
+"""Interactive command-line dialogs built on Click and Rich."""
 
 from __future__ import annotations
 
@@ -9,35 +6,44 @@ import functools
 import os
 from typing import Callable, Sequence, TypeVar
 
+import click
+from rich.console import Console
+from rich.text import Text
 from typing_extensions import ParamSpec
 
 P = ParamSpec("P")
 T = TypeVar("T")
 
 
-def _style_message(message: str) -> str:
-    return f"{message} "
+def _console() -> Console:
+    """Return a console which follows the current standard output stream."""
+    return Console(highlight=False, soft_wrap=True)
 
 
-def _style_hint(hint: str) -> str:
-    return f"{hint} " if hint else ""
+def _show_error(message: str) -> None:
+    click.echo(click.style(message, fg="red"), err=True)
 
 
-def _style_error(message: str) -> str:
-    import survey
+def _show_options(options: Sequence[str], hint: str | None = None) -> None:
+    console = _console()
 
-    return survey.utils.paint(survey.colors.basic("red"), message)
+    if hint:
+        console.print(hint, style="dim")
+
+    for index, option in enumerate(options, start=1):
+        line = Text()
+        line.append(str(index), style="cyan")
+        line.append(f"  {option}")
+        console.print(line)
 
 
 def exit_on_keyboard_interrupt(func: Callable[P, T]) -> Callable[P, T]:
     @functools.wraps(func)
     def wrapper(*args: P.args, **kwargs: P.kwargs) -> T:
-        import survey
-
         try:
             return func(*args, **kwargs)
-        except (KeyboardInterrupt, survey.widgets.Escape):
-            raise SystemExit("Aborted")
+        except (KeyboardInterrupt, click.Abort):
+            raise SystemExit("Aborted") from None
 
     return wrapper
 
@@ -47,136 +53,98 @@ def prompt(
     message: str,
     validate: Callable[[str], bool] | None = None,
 ) -> str:
-    import survey
+    while True:
+        value = click.prompt(message, type=str, show_default=False)
 
-    def check(value: str) -> None:
-        if validate is not None and not validate(value):
-            raise survey.widgets.Abort(_style_error(f"'{value}' is not allowed"))
+        if validate is None or validate(value):
+            return value
 
-    return survey.routines.input(
-        _style_message(message),
-        validate=check,
-        escapable=True,
-        mark_color=survey.colors.basic("cyan"),
-    )
+        _show_error(f"'{value}' is not allowed")
 
 
 @exit_on_keyboard_interrupt
 def confirm(message: str, default: bool | None = True) -> bool:
-    import survey
-
-    default_to_str = {True: "y", False: "n", None: None}
-
-    return survey.routines.inquire(
-        _style_message(message),
-        default=default_to_str[default],
-        escapable=True,
-        mark_color=survey.colors.basic("cyan"),
-    )
+    return click.confirm(message, default=default)
 
 
 @exit_on_keyboard_interrupt
 def select(message: str, options: Sequence[str], hint: str | None = "") -> int:
-    import survey
+    if not options:
+        raise ValueError("Cannot select from an empty option list")
 
-    if hint is None:
-        kwargs = {}
-    else:
-        kwargs = {"hint": _style_hint(hint)}
+    _show_options(options, hint)
+    choice = click.prompt(message, type=click.IntRange(1, len(options)))
+    return choice - 1
 
-    return survey.routines.select(
-        _style_message(message),
-        options=options,
-        escapable=True,
-        mark_color=survey.colors.basic("cyan"),
-        **kwargs,
-    )
+
+def _parse_indices(value: str, option_count: int) -> list[int] | None:
+    value = value.strip()
+
+    if not value:
+        return []
+
+    if value.casefold() == "all":
+        return list(range(option_count))
+
+    try:
+        indices = [int(part.strip()) - 1 for part in value.split(",")]
+    except ValueError:
+        return None
+
+    if any(index < 0 or index >= option_count for index in indices):
+        return None
+
+    return list(dict.fromkeys(indices))
 
 
 @exit_on_keyboard_interrupt
 def select_multiple(
     message: str, options: Sequence[str], hint: str | None = None
 ) -> list[int]:
-    import survey
+    if not options:
+        return []
 
-    if hint is None:
-        kwargs = {}
-    else:
-        kwargs = {"hint": _style_hint(hint)}
+    hint = hint or "Enter comma-separated numbers, 'all', or leave empty for none."
+    _show_options(options, hint)
 
-    def reply(widget: survey.widgets.Widget, indices: set[int]) -> str:
-        chosen = [options[index] for index in indices]
-        response = ", ".join(chosen)
+    while True:
+        value = click.prompt(message, default="", show_default=False, type=str)
+        indices = _parse_indices(value, len(options))
 
-        if len(indices) == 0 or len(response) > 10:
-            response = f"[{len(indices)} chosen]"
+        if indices is not None:
+            return indices
 
-        return survey.utils.paint(survey.colors.basic("cyan"), response)
-
-    return survey.routines.basket(
-        _style_message(message),
-        options=options,
-        positive_mark="[✓] ",
-        negative_mark="[ ] ",
-        reply=reply,
-        escapable=True,
-        mark_color=survey.colors.basic("cyan"),
-        **kwargs,
-    )
+        _show_error(f"Choose numbers from 1 to {len(options)}")
 
 
 @exit_on_keyboard_interrupt
 def select_path(
     message: str,
     default: str | None = None,
-    validate: Callable[[str], bool] = lambda x: True,
+    validate: Callable[[str], bool] = lambda value: True,
     exists: bool = False,
     files_allowed: bool = True,
     dirs_allowed: bool = True,
 ) -> str:
-    import survey
-
-    styled_message = _style_message(message)
-
-    def check(value: str) -> None:
-        value = value.strip()
-
-        if value == "" and default:
-            return
+    while True:
+        value = click.prompt(
+            message,
+            default=default,
+            show_default=default is not None,
+            type=str,
+        ).strip()
 
         full_path = os.path.expanduser(value)
         forbidden_dir = os.path.isdir(full_path) and not dirs_allowed
         forbidden_file = os.path.isfile(full_path) and not files_allowed
-        exist_condition = os.path.exists(full_path) or not exists
 
-        if not exist_condition:
-            raise survey.widgets.Abort(_style_error(f"'{value}' does not exist"))
+        if exists and not os.path.exists(full_path):
+            _show_error(f"'{value}' does not exist")
         elif forbidden_dir:
-            raise survey.widgets.Abort(_style_error(f"'{value}' is not a file"))
+            _show_error(f"'{value}' is not a file")
         elif forbidden_file:
-            raise survey.widgets.Abort(_style_error(f"'{value}' is not a folder"))
+            _show_error(f"'{value}' is not a folder")
         elif not validate(value):
-            raise survey.widgets.Abort(_style_error(f"'{value}' is not allowed"))
-
-    def reply(widget: survey.widgets.Widget, value: str) -> str:
-        return survey.utils.paint(survey.colors.basic("cyan"), value or default)
-
-    kwargs = {"hint": f"[{default}] "} if default else {}
-
-    result = survey.routines.input(
-        styled_message,
-        reply=reply,
-        validate=check,
-        escapable=True,
-        mark_color=survey.colors.basic("cyan"),
-        **kwargs,
-    )
-
-    result = result.strip()
-
-    if result == "" and default:
-        return default
-    elif result == "":
-        raise RuntimeError("No result and no default")
-
-    return result
+            _show_error(f"'{value}' is not allowed")
+        else:
+            return value
