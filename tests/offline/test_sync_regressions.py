@@ -148,6 +148,29 @@ def test_unicode_normalization_only_move_is_skipped(
     sync_engine.client.move.assert_not_called()
 
 
+def test_inactive_scan_ignores_unicode_normalization_differences(
+    sync_engine: SyncEngine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    decomposed_path = str(tmp_path / "cafe\N{COMBINING ACUTE ACCENT}.txt")
+    composed_path = str(tmp_path / "caf\N{LATIN SMALL LETTER E WITH ACUTE}.txt")
+    index_entry = SimpleNamespace(
+        dbx_path_cased="/caf\N{LATIN SMALL LETTER E WITH ACUTE}.txt"
+    )
+    sync_engine.get_index_entry = Mock(return_value=index_entry)
+
+    assert sync_engine.get_index_entry_for_local_path(decomposed_path) is index_entry
+
+    sync_engine._is_fs_case_sensitive = False
+    monkeypatch.setattr(sync_module, "exists", Mock(return_value=True))
+    monkeypatch.setattr(
+        sync_module,
+        "to_existing_unnormalized_path",
+        Mock(return_value=decomposed_path),
+    )
+
+    assert sync_engine._exists_with_given_casing(composed_path)
+
+
 def test_downloaded_symlink_replaces_existing_file(
     sync_engine: SyncEngine, tmp_path: Path
 ) -> None:
