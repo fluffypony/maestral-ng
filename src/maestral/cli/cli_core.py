@@ -9,6 +9,7 @@ import click
 from rich.console import Console, ConsoleRenderable
 
 from ..core import FolderMetadata, SharedLinkMetadata
+from ..constants import ROOT_MARKER_FILE
 from ..utils.path import delete
 from .common import (
     check_for_fatal_errors,
@@ -29,6 +30,21 @@ if TYPE_CHECKING:
 OK = click.style("[OK]", fg="green")
 FAILED = click.style("[FAILED]", fg="red")
 KILLED = click.style("[KILLED]", fg="red")
+
+
+def _looks_like_official_dropbox_folder(folder_path: str) -> bool:
+    """Return whether a folder may belong to the official Dropbox client."""
+    if osp.isfile(osp.join(folder_path, ROOT_MARKER_FILE)):
+        return False
+
+    official_markers = (".dropbox", ".dropbox.attr", ".dropbox.cache")
+    if any(osp.lexists(osp.join(folder_path, name)) for name in official_markers):
+        return True
+
+    folder_name = osp.basename(osp.normpath(folder_path)).casefold()
+    return folder_name == "dropbox" or (
+        folder_name.startswith("dropbox (") and folder_name.endswith(")")
+    )
 
 
 def stop_daemon_with_cli_feedback(config_name: str) -> None:
@@ -75,6 +91,15 @@ def select_dbx_path_dialog(
         dropbox_path = osp.expanduser(res)
 
         if osp.exists(dropbox_path):
+            if _looks_like_official_dropbox_folder(dropbox_path):
+                warn(
+                    "This folder may belong to the official Dropbox client. Never "
+                    "point both clients at one local folder, even if only one client "
+                    "runs at a time. Choose a separate folder."
+                )
+                if not confirm("Do you still want to use this folder?"):
+                    continue
+
             if allow_merge:
                 text = (
                     "Directory already exists. Do you want to replace it "

@@ -8,6 +8,7 @@ from click.testing import CliRunner
 
 import maestral.cli.cli_info as cli_info_module
 import maestral.cli.cli_maintenance as cli_maintenance_module
+import maestral.cli.cli_core as cli_core_module
 import maestral.daemon as daemon_module
 from maestral.autostart import AutoStart
 from maestral.cli import main
@@ -19,6 +20,35 @@ from maestral.notify import level_name_to_number, level_number_to_name
 from maestral.utils.appdirs import get_log_path
 
 TEST_TIMEOUT = 60
+
+
+def test_official_dropbox_folder_warning_can_reselect(tmp_path, monkeypatch) -> None:
+    official_path = tmp_path / "Dropbox"
+    official_path.mkdir()
+    safe_path = tmp_path / "Maestral files"
+    monkeypatch.setattr(
+        cli_core_module,
+        "select_path",
+        Mock(side_effect=[str(official_path), str(safe_path)]),
+    )
+    confirm = Mock(return_value=False)
+    warning = Mock()
+    monkeypatch.setattr(cli_core_module, "confirm", confirm)
+    monkeypatch.setattr(cli_core_module, "warn", warning)
+
+    selected = cli_core_module.select_dbx_path_dialog("test-config", allow_merge=True)
+
+    assert selected == str(safe_path)
+    confirm.assert_called_once_with("Do you still want to use this folder?")
+    assert "official Dropbox client" in warning.call_args.args[0]
+
+
+def test_maestral_root_does_not_trigger_official_client_warning(tmp_path) -> None:
+    dropbox_path = tmp_path / "Dropbox"
+    dropbox_path.mkdir()
+    (dropbox_path / ".maestral-root").touch()
+
+    assert not cli_core_module._looks_like_official_dropbox_folder(str(dropbox_path))
 
 
 def test_help() -> None:
