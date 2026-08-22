@@ -22,18 +22,18 @@ jobs:
     steps:
 
       - name: Checkout merge commit
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
         if: github.event_name == 'pull_request_target'
         with:
           ref: 'refs/pull/${{ github.event.number }}/merge'
           persist-credentials: false
 
       - name: Checkout head commit
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
         if: github.event_name != 'pull_request_target'
 
       - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v6.0.0
+        uses: actions/setup-python@v6.2.0
         with:
           python-version: ${{ matrix.python-version }}
 
@@ -76,18 +76,18 @@ jobs:
     runs-on: ${{ matrix.platform }}
     steps:
       - name: Checkout merge commit
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
         if: github.event_name == 'pull_request_target'
         with:
           ref: 'refs/pull/${{ github.event.number }}/merge'
           persist-credentials: false
 
       - name: Checkout head commit
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
         if: github.event_name != 'pull_request_target'
 
       - name: Set up Python
-        uses: actions/setup-python@v6.0.0
+        uses: actions/setup-python@v6.2.0
         with:
           python-version: '3.x'
 
@@ -150,18 +150,18 @@ jobs:
     runs-on: ${{ matrix.platform }}
     steps:
       - name: Checkout merge commit
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
         if: github.event_name == 'pull_request_target'
         with:
           ref: 'refs/pull/${{ github.event.number }}/merge'
           persist-credentials: false
 
       - name: Checkout head commit
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
         if: github.event_name != 'pull_request_target'
 
       - name: Set up Python
-        uses: actions/setup-python@v6.0.0
+        uses: actions/setup-python@v6.2.0
         with:
           python-version: '3.x'
 
