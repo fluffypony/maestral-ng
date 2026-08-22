@@ -89,6 +89,7 @@ def test_connection_monitor_restarts_after_server_error(
 def test_external_drive_can_retry_same_configured_root(
     m: Maestral, monkeypatch: pytest.MonkeyPatch, tmp_path
 ) -> None:
+    m.manager._connection_helper_running = False
     dropbox_path = tmp_path / "External Dropbox"
     m.sync.dropbox_path = str(dropbox_path)
     m.sync.remote_cursor = "saved-cursor"
@@ -103,3 +104,4 @@ def test_external_drive_can_retry_same_configured_root(
 
     assert m.sync.remote_cursor == "saved-cursor"
     assert m.manager.autostart.is_set()
+    m.manager.autostart.clear()
