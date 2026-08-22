@@ -1,4 +1,4 @@
-FROM python:3.10.1-alpine3.15
+FROM python:3.13-alpine3.22
 
 ARG UID=1000
 ARG VERSION
@@ -6,6 +6,7 @@ ARG VERSION
 RUN set -eux ; \
   adduser -D -u ${UID} -h /dropbox dropbox ; \
   apk add --no-cache --virtual .build-deps \
+    cargo \
     gcc \
     musl-dev \
     python3-dev \

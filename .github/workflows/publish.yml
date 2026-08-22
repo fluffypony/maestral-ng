@@ -130,7 +130,7 @@ jobs:
             org.opencontainers.image.title=Maestral
             org.opencontainers.image.url=${{ github.event.repository.html_url }}
             org.opencontainers.image.version=${{ steps.prep.outputs.version }}
-          platforms: linux/amd64,linux/arm64
+          platforms: linux/amd64,linux/arm64,linux/arm/v7
           push: true
           tags: ${{ steps.prep.outputs.tags }}
       - name: Move cache
