@@ -104,7 +104,8 @@ commands. The most important are:
 - `maestral autostart -Y|-N`: Sets the daemon to start on log in.
 - `maestral status`: Gets the current status of Maestral.
 - `maestral filestatus LOCAL_PATH`: Gets the sync status of an individual file or folder.
-- `maestral excluded add|remove|list`: Command group to manage excluded folders.
+- `maestral selective-sync list|set`: Selects included or excluded Dropbox paths.
+- `maestral symlinks [error|ignore]`: Gets or sets the local symbolic-link policy.
 - `maestral ls DROPBOX_PATH`: Lists the contents of a directory on Dropbox.
 - `maestral notify snooze N`: Snoozes desktop notifications for N minutes.
 
