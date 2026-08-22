@@ -214,6 +214,26 @@ def test_client_encodes_mixed_positional_and_named_arguments():
     )
 
 
+def test_selective_sync_api_is_available_over_rpc(m, monkeypatch):
+    setter = Mock(return_value=None)
+    monkeypatch.setattr(m, "set_selective_sync", setter)
+    dispatcher = JsonRpcDispatcher(m)
+
+    handshake = dispatcher.dispatch(rpc_request("rpc.handshake"))["result"]
+    response = dispatcher.dispatch(
+        rpc_request(
+            "set_selective_sync",
+            {"mode": "include", "dbx_paths": ["/Notes/todo.txt"]},
+        )
+    )
+
+    assert "set_selective_sync" in handshake["methods"]
+    assert "selective_sync_mode" in handshake["properties"]["read"]
+    assert "selective_sync_paths" in handshake["properties"]["read"]
+    assert response["result"] is None
+    setter.assert_called_once_with(mode="include", dbx_paths=["/Notes/todo.txt"])
+
+
 def test_sync_event_longpoll(m):
     result = {}
 
@@ -258,7 +278,7 @@ def test_applied_upload_and_download_batches_publish(m, monkeypatch):
     sync.event_callback = callback
     monkeypatch.setattr(sync, "is_excluded", lambda _path: False)
     monkeypatch.setattr(sync, "is_mignore", lambda _event: False)
-    monkeypatch.setattr(sync, "is_excluded_by_user", lambda _path: False)
+    monkeypatch.setattr(sync, "is_excluded_by_selective_sync", lambda _path: False)
 
     upload = make_sync_event("/upload.txt")
     upload.direction = SyncDirection.Up

@@ -51,7 +51,7 @@ from .logging import scoped_logger
 from .sync import SyncEngine
 from .utils import removeprefix
 from .utils.integration import check_connection, get_inotify_limits
-from .utils.path import delete, is_child, is_equal_or_child, move, normalize
+from .utils.path import delete, is_equal_or_child, move, normalize
 
 __all__ = ["SyncManager"]
 
@@ -143,6 +143,7 @@ class SyncManager:
         self.autostart = Event()
 
         self.download_queue = PersistentQueue(self._state, "sync", "pending_downloads")
+        self.sync.download_callback = self.download_queue.put
 
         self._startup_time = -1.0
 
@@ -500,11 +501,15 @@ class SyncManager:
                 self._logger.debug("Moving %r → %r", tmpdir.name, local_user_home_path)
                 os.rename(tmpdir.name, local_user_home_path)
 
-                # Migrate all excluded items.
-                self._logger.debug("Migrating excluded items")
-                self.sync.excluded_items = {
-                    new_user_home_path + path for path in self.sync.excluded_items
-                }
+                # Migrate all selective-sync paths.
+                self._logger.debug("Migrating selective-sync paths")
+                self.sync.set_selective_sync(
+                    self.sync.selective_sync_mode,
+                    {
+                        new_user_home_path + path
+                        for path in self.sync.selective_sync_paths
+                    },
+                )
 
             elif new_root_type == "user" and current_root_type == "team":
                 # User left a team.
@@ -545,16 +550,16 @@ class SyncManager:
 
                 delete(tmpdir.name)
 
-                # Migrate excluded items:
-                # Prune all teams folders from excluded list. Remove home folder
-                # prefix from excluded items. If the user folder itself is
-                # excluded, keep it excluded.
-                self._logger.debug("Migrating excluded items")
-                self.sync.excluded_items = {
-                    removeprefix(path, current_user_home_path_lower)
-                    for path in self.sync.excluded_items
-                    if is_child(path, current_user_home_path_lower)
-                }
+                # Prune team folders and remove the home prefix from selected paths.
+                self._logger.debug("Migrating selective-sync paths")
+                self.sync.set_selective_sync(
+                    self.sync.selective_sync_mode,
+                    {
+                        removeprefix(path, current_user_home_path_lower) or "/"
+                        for path in self.sync.selective_sync_paths
+                        if is_equal_or_child(path, current_user_home_path_lower)
+                    },
+                )
 
             elif new_root_type == "team" and current_root_type == "team":
                 # User switched between different teams.
@@ -569,15 +574,16 @@ class SyncManager:
                         delete(entry.path, raise_error=True)
                         self._logger.debug("Deleted team folder: %r", entry.path)
 
-                # Migrate excluded items:
-                # Prune all teams folders from excluded list. If the user folder
-                # itself is excluded, keep it excluded.
-                self._logger.debug("Migrating excluded items")
-                self.sync.excluded_items = {
-                    path
-                    for path in self.sync.excluded_items
-                    if is_equal_or_child(path, current_user_home_path_lower)
-                }
+                # Prune team folders from selected paths.
+                self._logger.debug("Migrating selective-sync paths")
+                self.sync.set_selective_sync(
+                    self.sync.selective_sync_mode,
+                    {
+                        path
+                        for path in self.sync.selective_sync_paths
+                        if is_equal_or_child(path, current_user_home_path_lower)
+                    },
+                )
 
             # Update path root of client.
             self.sync.client.update_path_root(root_info)

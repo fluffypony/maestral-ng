@@ -10,7 +10,9 @@ DEFAULTS_CONFIG = {
     },
     "sync": {
         "path": "/Users/Leslie/Dropbox (Maestral)",
-        "excluded_items": ["/Photos"],
+        "selective_sync_mode": "exclude",
+        "selective_sync_paths": ["/Photos"],
+        "ignore_symlinks": False,
         "upload": True,
         "download": True,
     },

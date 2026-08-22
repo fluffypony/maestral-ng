@@ -13,7 +13,7 @@ from .conftest import CONF_VERSION, DEFAULTS_CONFIG
 def fresh_defaults():
     return {
         "auth": {"account_id": "default", "keyring": "automatic"},
-        "sync": {"path": "", "excluded_items": [], "upload": True},
+        "sync": {"path": "", "selective_sync_paths": [], "upload": True},
     }
 
 
@@ -42,11 +42,11 @@ def test_get_failures(config):
 def test_set_option(config):
     # Test setting valid config values of different types.
     config.set("sync", "path", "/test/path")
-    config.set("sync", "excluded_items", ["a", "b", "c"])
+    config.set("sync", "selective_sync_paths", ["a", "b", "c"])
     config.set("new_section", "new_option", {"a", "b", "c"})
 
     assert config.get("sync", "path") == "/test/path"
-    assert config.get("sync", "excluded_items") == ["a", "b", "c"]
+    assert config.get("sync", "selective_sync_paths") == ["a", "b", "c"]
     assert config.get("new_section", "new_option") == {"a", "b", "c"}
 
     # Check setting invalid config values.
@@ -54,7 +54,7 @@ def test_set_option(config):
         config.set("sync", "path", 1234)
 
     with pytest.raises(ValueError):
-        config.set("sync", "excluded_items", "path")
+        config.set("sync", "selective_sync_paths", "path")
 
 
 def test_update(config):

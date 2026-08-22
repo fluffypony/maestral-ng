@@ -14,6 +14,7 @@ import maestral.daemon as daemon_module
 from maestral.autostart import AutoStart
 from maestral.cli import main
 from maestral.cli.core import OrderedGroup
+from maestral.config import MaestralConfig
 from maestral.daemon import MaestralClient, Start, start_maestral_daemon_process
 from maestral.logging import scoped_logger
 from maestral.main import Maestral
@@ -94,9 +95,9 @@ def test_invalid_config() -> None:
         ("history",),
         ("ls",),
         ("autostart",),
-        ("excluded", "add"),
-        ("excluded", "list"),
-        ("excluded", "remove"),
+        ("selective-sync", "list"),
+        ("selective-sync", "set", "include"),
+        ("symlinks",),
         ("notify", "level"),
         ("notify", "snooze"),
         ("move-dir",),
@@ -261,28 +262,61 @@ def test_autostart(m: Maestral) -> None:
     assert not autostart.enabled
 
 
-def test_excluded_list(m: Maestral) -> None:
+def test_selective_sync_list(m: Maestral) -> None:
     runner = CliRunner()
-    result = runner.invoke(main, ["excluded", "list", "-c", m.config_name])
+    result = runner.invoke(main, ["selective-sync", "list", "-c", m.config_name])
 
     assert result.exit_code == 0, result.output
-    assert result.output == "No excluded files or folders.\n"
+    assert result.output == "Mode: exclude\nNo selected paths.\n"
 
 
-def test_excluded_add_raises_not_linked_error(m: Maestral) -> None:
+def test_selective_sync_set_raises_not_linked_error(m: Maestral) -> None:
     runner = CliRunner()
-    result = runner.invoke(main, ["excluded", "add", "test", "-c", m.config_name])
+    result = runner.invoke(
+        main,
+        ["selective-sync", "set", "include", "test", "-c", m.config_name],
+    )
 
     assert result.exit_code == 1
     assert "No Dropbox account linked" in result.output
 
 
-def test_excluded_remove_raises_not_running_error(m: Maestral) -> None:
+def test_selective_sync_help_describes_both_modes() -> None:
     runner = CliRunner()
-    result = runner.invoke(main, ["excluded", "remove", "test", "-c", m.config_name])
+    result = runner.invoke(main, ["selective-sync", "set", "--help"])
 
-    assert result.exit_code == 1
-    assert "Maestral daemon is not running" in result.output
+    assert result.exit_code == 0, result.output
+    assert "EXCLUDE syncs everything except" in result.output
+    assert "INCLUDE syncs only" in result.output
+
+
+def test_config_command_cannot_split_selective_sync_update(m: Maestral) -> None:
+    result = CliRunner().invoke(
+        main,
+        ["config", "set", "selective_sync_mode", "include", "-c", m.config_name],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert (
+        "Use set_selective_sync to update the mode and paths together" in result.output
+    )
+    assert m.selective_sync_mode == "exclude"
+
+
+def test_symlink_help_describes_unmanaged_paths() -> None:
+    result = CliRunner().invoke(main, ["symlinks", "--help"])
+
+    assert result.exit_code == 0, result.output
+    assert "symbolic links unmanaged" in result.output
+    assert "overwrite an ignored link path" in result.output
+
+
+def test_symlink_command_sets_policy(m: Maestral) -> None:
+    result = CliRunner().invoke(main, ["symlinks", "ignore", "-c", m.config_name])
+
+    assert result.exit_code == 0, result.output
+    assert result.output == "✓ Symbolic-link policy set to ignore.\n"
+    assert MaestralConfig(m.config_name).get("sync", "ignore_symlinks") is True
 
 
 def test_notify_level(config_name: str) -> None:

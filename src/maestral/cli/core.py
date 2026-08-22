@@ -102,9 +102,9 @@ class DropboxPath(click.ParamType[str | None]):
         except OSError:
             pass
 
-        # get all matching excluded items
+        # get all matching selective-sync paths
 
-        for dbx_path in config.get("sync", "excluded_items"):
+        for dbx_path in config.get("sync", "selective_sync_paths"):
             if dbx_path.startswith("/" + incomplete):
                 matches.append(dbx_path)
 

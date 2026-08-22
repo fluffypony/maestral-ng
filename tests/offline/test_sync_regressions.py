@@ -4,7 +4,9 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
+from watchdog.events import FileCreatedEvent, FileDeletedEvent
 
+import maestral.config.main as config_main_module
 import maestral.sync as sync_module
 from maestral.client import DropboxClient
 from maestral.config import MaestralConfig
@@ -13,6 +15,7 @@ from maestral.exceptions import InsufficientPermissionsError
 from maestral.keyring import CredentialStorage
 from maestral.models import ChangeType, ItemType, SyncEvent, SyncStatus
 from maestral.sync import Conflict, SyncDirection, SyncEngine
+from maestral.utils.appdirs import get_conf_path
 
 
 def make_sync_engine(config_name: str, dropbox_path: Path) -> SyncEngine:
@@ -61,6 +64,22 @@ def make_event(
         size=0,
         completed=0,
     )
+
+
+def test_legacy_exclusions_migrate_to_selective_sync(config_name: str) -> None:
+    config_main_module._config_instances.pop(config_name, None)
+    config_path = Path(get_conf_path("maestral", f"{config_name}.ini"))
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(
+        "[main]\nversion = 20.0\n\n[sync]\nexcluded_items = ['/Photos']\n"
+    )
+
+    conf = MaestralConfig(config_name)
+
+    assert conf.get("sync", "selective_sync_mode") == "exclude"
+    assert conf.get("sync", "selective_sync_paths") == ["/Photos"]
+    assert not conf.has_option("sync", "excluded_items")
+    assert "excluded_items" not in config_path.read_text()
 
 
 def prepare_local_move(sync: SyncEngine) -> None:
@@ -169,6 +188,112 @@ def test_inactive_scan_ignores_unicode_normalization_differences(
     )
 
     assert sync_engine._exists_with_given_casing(composed_path)
+
+
+def test_include_mode_keeps_deep_file_parents_and_excludes_siblings(
+    sync_engine: SyncEngine,
+) -> None:
+    sync_engine.set_selective_sync("include", ["/Projects/App/config.toml"])
+
+    assert sync_engine.selective_sync_status("/") == "partially included"
+    assert sync_engine.selective_sync_status("/Projects") == "partially included"
+    assert sync_engine.selective_sync_status("/Projects/App") == "partially included"
+    assert sync_engine.selective_sync_status("/Projects/App/config.toml") == "included"
+    assert sync_engine.selective_sync_status("/Projects/App/notes.txt") == "excluded"
+    assert sync_engine.selective_sync_status("/Projects/Other") == "excluded"
+
+
+def test_selective_sync_mode_and_paths_roll_back_together_on_save_failure(
+    sync_engine: SyncEngine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sync_engine.set_selective_sync("exclude", ["/Archive"])
+    config_before = Path(sync_engine._conf.config_path).read_bytes()
+    monkeypatch.setattr(
+        sync_engine._conf,
+        "save",
+        Mock(side_effect=OSError("cannot save")),
+    )
+
+    with pytest.raises(OSError, match="cannot save"):
+        sync_engine.set_selective_sync("include", ["/Projects"])
+
+    assert sync_engine.selective_sync_mode == "exclude"
+    assert sync_engine.selective_sync_paths == {"/archive"}
+    assert sync_engine._conf.get("sync", "selective_sync_mode") == "exclude"
+    assert sync_engine._conf.get("sync", "selective_sync_paths") == ["/archive"]
+    assert Path(sync_engine._conf.config_path).read_bytes() == config_before
+
+
+def test_ignored_symlink_hides_its_subtree_from_local_events(
+    sync_engine: SyncEngine, tmp_path: Path
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    link = tmp_path / "link"
+    link.symlink_to(target, target_is_directory=True)
+    sync_engine.ignore_symlinks = True
+    sync_engine._sync_event_from_fs_event = Mock()
+
+    events = sync_engine._sync_events_from_fs_events(
+        [
+            FileCreatedEvent(str(link)),
+            FileCreatedEvent(str(link / "child.txt")),
+        ]
+    )
+
+    assert events == []
+    assert sync_engine._ignored_symlink_paths == {"/link"}
+    sync_engine._sync_event_from_fs_event.assert_not_called()
+
+
+def test_remote_update_under_ignored_symlink_does_not_touch_target(
+    sync_engine: SyncEngine, tmp_path: Path
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    target_file = target / "child.txt"
+    target_file.write_text("local target")
+    link = tmp_path / "link"
+    link.symlink_to(target, target_is_directory=True)
+    sync_engine.ignore_symlinks = True
+    sync_engine.client.download = Mock()
+    event = make_event(str(link / "child.txt"), "/link/child.txt")
+    event.rev = "remote-rev"
+    event.dbx_id = "id:child"
+
+    result = sync_engine.apply_remote_changes([event])
+
+    assert result == [event]
+    assert event.status is SyncStatus.Skipped
+    assert target_file.read_text() == "local target"
+    assert sync_engine.get_index_entry("/link/child.txt").rev == "remote-rev"  # type: ignore[union-attr]
+    sync_engine.client.download.assert_not_called()
+
+
+def test_removing_ignored_symlink_restores_remote_without_uploading_deletion(
+    sync_engine: SyncEngine, tmp_path: Path
+) -> None:
+    target = tmp_path / "target"
+    target.write_text("target")
+    link = tmp_path / "link"
+    link.symlink_to(target)
+    sync_engine.ignore_symlinks = True
+    sync_engine.download_callback = Mock()
+    sync_engine.client.remove = Mock()
+    remote_event = make_event(str(link), "/link")
+    remote_event.rev = "remote-rev"
+    remote_event.dbx_id = "id:link"
+    sync_engine.apply_remote_changes([remote_event])
+    assert link.is_symlink()
+    assert sync_engine.get_index_entry("/link") is not None
+
+    link.unlink()
+    events = sync_engine._filter_local_events([FileDeletedEvent(str(link))])
+
+    assert events == []
+    assert sync_engine.get_index_entry("/link") is None
+    sync_engine.download_callback.assert_called_once_with("/link")  # type: ignore[union-attr]
+    sync_engine.client.remove.assert_not_called()
 
 
 def test_downloaded_symlink_replaces_existing_file(

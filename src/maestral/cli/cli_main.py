@@ -15,7 +15,7 @@ from .cli_maintenance import (
     restore,
     revs,
 )
-from .cli_settings import autostart, bandwidth_limit, excluded, notify
+from .cli_settings import autostart, bandwidth_limit, notify, selective_sync, symlinks
 
 # local imports
 from .core import OrderedGroup
@@ -42,7 +42,8 @@ main.add_command(ls, section="Information")
 main.add_command(config_files, section="Information")
 
 main.add_command(autostart, section="Settings")
-main.add_command(excluded, section="Settings")
+main.add_command(selective_sync, section="Settings")
+main.add_command(symlinks, section="Settings")
 main.add_command(notify, section="Settings")
 main.add_command(bandwidth_limit, section="Settings")
 

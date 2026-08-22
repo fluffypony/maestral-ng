@@ -21,7 +21,7 @@ from contextlib import contextmanager
 from datetime import datetime
 from pprint import pformat
 from queue import Empty, Queue
-from stat import S_ISDIR
+from stat import S_ISDIR, S_ISLNK
 from tempfile import NamedTemporaryFile
 from threading import Condition, Event, RLock, current_thread
 from typing import (
@@ -550,12 +550,14 @@ class SyncEngine:
         self.config_name = self.client.config_name
         self.fs_events = FSEventHandler()
         self._logger = scoped_logger(__name__, self.config_name)
+        self._ignored_symlinks_lock = RLock()
 
         self._conf = MaestralConfig(self.config_name)
         self._state = MaestralState(self.config_name)
         self.reload_cached_config()
 
         self.event_callback = event_callback
+        self.download_callback: Callable[[str], None] | None = None
 
         # Synchronization
         self.sync_lock = RLock()  # Upload and download cycles.
@@ -619,7 +621,18 @@ class SyncEngine:
         self._mignore_path: str = osp.join(self._dropbox_path, MIGNORE_FILE)
         self._file_cache_path: str = osp.join(self._dropbox_path, FILE_CACHE)
 
-        self._excluded_items: set[str] = set(self._conf.get("sync", "excluded_items"))
+        self._selective_sync_mode: str = self._conf.get("sync", "selective_sync_mode")
+        if self._selective_sync_mode not in {"exclude", "include"}:
+            raise ValueError(
+                "Selective sync mode must be either 'exclude' or 'include'"
+            )
+        self._selective_sync_paths = self.clean_selective_sync_paths(
+            self._conf.get("sync", "selective_sync_paths")
+        )
+        self._ignore_symlinks: bool = self._conf.get("sync", "ignore_symlinks")
+        self._ignored_symlink_paths = self.clean_selective_sync_paths(
+            self._state.get("sync", "ignored_symlink_paths")
+        )
         self._max_cpu_percent: float = (
             self._conf.get("sync", "max_cpu_percent") * CPU_CORE_COUNT
         )
@@ -680,38 +693,206 @@ class SyncEngine:
         return self._file_cache_path
 
     @property
-    def excluded_items(self) -> set[str]:
-        """Set of all files and folders excluded from sync. Changes are saved to the
-        config file. If a parent folder is excluded, its children will automatically be
-        removed from the list. If only children are given but not the parent folder, any
-        new items added to the parent will be synced. Change this property *before*
-        downloading newly included items or deleting excluded items."""
-        return self._excluded_items.copy()
+    def selective_sync_mode(self) -> str:
+        """Selective-sync mode, either ``exclude`` or ``include``."""
+        return self._selective_sync_mode
 
-    @excluded_items.setter
-    def excluded_items(self, dbx_paths: Collection[str]) -> None:
-        """Setter: excluded_items"""
+    @property
+    def selective_sync_paths(self) -> set[str]:
+        """Canonical paths selected by :attr:`selective_sync_mode`."""
+        return self._selective_sync_paths.copy()
+
+    def set_selective_sync(self, mode: str, dbx_paths: Collection[str]) -> None:
+        """Atomically replace the selective-sync mode and its selected paths."""
+        if mode not in {"exclude", "include"}:
+            raise ValueError("Mode must be either 'exclude' or 'include'")
+
+        paths = self.clean_selective_sync_paths(dbx_paths)
+
         with self.sync_lock:
-            self._excluded_items = self.clean_excluded_items_list(dbx_paths)
-            self._conf.set("sync", "excluded_items", list(self._excluded_items))
+            old_mode = self._selective_sync_mode
+            old_paths = self._selective_sync_paths
+
+            try:
+                self._conf.set("sync", "selective_sync_mode", mode, save=False)
+                self._conf.set(
+                    "sync", "selective_sync_paths", sorted(paths), save=False
+                )
+                self._conf.save()
+            except Exception:
+                self._conf.set("sync", "selective_sync_mode", old_mode, save=False)
+                self._conf.set(
+                    "sync", "selective_sync_paths", sorted(old_paths), save=False
+                )
+                raise
+            else:
+                self._selective_sync_mode = mode
+                self._selective_sync_paths = paths
 
     @staticmethod
-    def clean_excluded_items_list(dbx_paths: Collection[str]) -> set[str]:
-        """
-        Removes all duplicates and children of excluded items from the excluded items
-        list. Normalises all paths to lower case.
+    def clean_selective_sync_paths(dbx_paths: Collection[str]) -> set[str]:
+        """Return normalised paths without duplicates or redundant children."""
+        paths = {
+            "/" + normalize(path).strip("/") if path.strip("/") else "/"
+            for path in dbx_paths
+        }
 
-        :param dbx_paths: Dropbox paths to exclude.
-        :returns: Cleaned up items.
-        """
-        # Remove duplicate entries by creating set, strip trailing '/'.
-        dbx_paths_lower = {normalize(f).rstrip("/") for f in dbx_paths}
+        for path in paths.copy():
+            paths = {candidate for candidate in paths if not is_child(candidate, path)}
 
-        # Remove all children of excluded folders.
-        for path in dbx_paths_lower.copy():
-            dbx_paths_lower = {p for p in dbx_paths_lower if not is_child(p, path)}
+        return paths
 
-        return dbx_paths_lower
+    @staticmethod
+    def _is_path_excluded(
+        dbx_path_lower: str, mode: str, selected_paths: Collection[str]
+    ) -> bool:
+        if mode == "exclude":
+            return any(
+                is_equal_or_child(dbx_path_lower, path) for path in selected_paths
+            )
+
+        is_selected = any(
+            is_equal_or_child(dbx_path_lower, path) for path in selected_paths
+        )
+        is_required_parent = any(
+            is_child(path, dbx_path_lower) for path in selected_paths
+        )
+        return not (is_selected or is_required_parent)
+
+    @property
+    def ignore_symlinks(self) -> bool:
+        """Whether local symbolic links remain unmanaged."""
+        return self._ignore_symlinks
+
+    @ignore_symlinks.setter
+    def ignore_symlinks(self, ignore: bool) -> None:
+        """Set whether local symbolic links remain unmanaged."""
+        with self.sync_lock:
+            self._conf.set("sync", "ignore_symlinks", ignore)
+            self._ignore_symlinks = ignore
+
+            if ignore:
+                self.refresh_ignored_symlinks()
+            else:
+                ignored_paths = self._ignored_symlink_paths.copy()
+                self._set_ignored_symlink_paths(set())
+                for dbx_path in ignored_paths:
+                    self.rescan(self._local_path_for_ignored_symlink(dbx_path))
+
+    def _set_ignored_symlink_paths(self, dbx_paths: Collection[str]) -> None:
+        paths = self.clean_selective_sync_paths(dbx_paths)
+        with self._ignored_symlinks_lock:
+            self._state.set("sync", "ignored_symlink_paths", sorted(paths))
+            self._ignored_symlink_paths = paths
+
+    def _remember_ignored_symlink(self, dbx_path: str) -> str:
+        dbx_path_lower = "/" + normalize(dbx_path).strip("/")
+        with self._ignored_symlinks_lock:
+            paths = self._ignored_symlink_paths | {dbx_path_lower}
+            paths = self.clean_selective_sync_paths(paths)
+            if paths != self._ignored_symlink_paths:
+                self._state.set("sync", "ignored_symlink_paths", sorted(paths))
+                self._ignored_symlink_paths = paths
+        return dbx_path_lower
+
+    def _forget_ignored_symlink(self, dbx_path: str) -> None:
+        with self._ignored_symlinks_lock:
+            paths = {
+                path
+                for path in self._ignored_symlink_paths
+                if not is_equal_or_child(path, dbx_path)
+            }
+            if paths != self._ignored_symlink_paths:
+                self._state.set("sync", "ignored_symlink_paths", sorted(paths))
+                self._ignored_symlink_paths = paths
+
+    def _stored_ignored_symlink_for_path(self, dbx_path: str) -> str | None:
+        dbx_path_lower = normalize(dbx_path)
+        with self._ignored_symlinks_lock:
+            return next(
+                (
+                    path
+                    for path in self._ignored_symlink_paths
+                    if is_equal_or_child(dbx_path_lower, path)
+                ),
+                None,
+            )
+
+    def _local_path_for_ignored_symlink(self, dbx_path_lower: str) -> str:
+        local_path = f"{self.dropbox_path}{dbx_path_lower}"
+        try:
+            return to_existing_unnormalized_path(local_path)
+        except (FileNotFoundError, NotADirectoryError):
+            return local_path
+
+    def _find_local_symlink(self, local_path: str | bytes) -> str | None:
+        """Return the Dropbox path of a symlink at or above ``local_path``."""
+        path = os.fsdecode(local_path)
+        try:
+            relative_path = osp.relpath(path, self.dropbox_path)
+        except ValueError:
+            return None
+
+        if relative_path == osp.pardir or relative_path.startswith(
+            osp.pardir + osp.sep
+        ):
+            return None
+
+        current_path = self.dropbox_path
+        for part in relative_path.split(osp.sep):
+            if part in {"", "."}:
+                continue
+            current_path = osp.join(current_path, part)
+            try:
+                stat = os.lstat(current_path)
+            except (FileNotFoundError, NotADirectoryError):
+                return None
+            if S_ISLNK(stat.st_mode):
+                return self._remember_ignored_symlink(
+                    self.to_dbx_path_lower(current_path)
+                )
+
+        return None
+
+    def _ignored_symlink_for_local_path(self, local_path: str | bytes) -> str | None:
+        if not self.ignore_symlinks:
+            return None
+
+        dbx_path_lower = self.to_dbx_path_lower(local_path)
+        stored_path = self._stored_ignored_symlink_for_path(dbx_path_lower)
+
+        if stored_path:
+            stored_local_path = self._local_path_for_ignored_symlink(stored_path)
+            if osp.islink(stored_local_path):
+                return stored_path
+
+            # The overlay has gone. The current remote event can restore the path, but
+            # its old index revision must not make the download look redundant.
+            self._forget_ignored_symlink(stored_path)
+            self.remove_node_from_index(stored_path)
+
+        return self._find_local_symlink(local_path)
+
+    def _restore_after_ignored_symlink(self, dbx_path: str) -> None:
+        self._forget_ignored_symlink(dbx_path)
+        self.clear_sync_errors_for_path(dbx_path, recursive=True)
+        if self.download_callback:
+            self.download_callback(dbx_path)
+        self.remove_node_from_index(dbx_path)
+
+    def refresh_ignored_symlinks(self) -> None:
+        """Find local symlink overlays and clear their upload errors."""
+        if not self.ignore_symlinks or not isdir(self.dropbox_path):
+            return
+
+        paths: set[str] = set()
+        for local_path, stat in walk(self.dropbox_path):
+            if S_ISLNK(stat.st_mode):
+                paths.add(self.to_dbx_path_lower(local_path))
+
+        self._set_ignored_symlink_paths(paths)
+        for dbx_path in paths:
+            self.clear_sync_errors_for_path(dbx_path, recursive=True)
 
     @property
     def max_cpu_percent(self) -> float:
@@ -979,7 +1160,9 @@ class SyncEngine:
 
         return max(last_sync, self.local_cursor)
 
-    def update_index_from_sync_event(self, event: SyncEvent) -> None:
+    def update_index_from_sync_event(
+        self, event: SyncEvent, *, local_present: bool = True
+    ) -> None:
         """
         Updates the local index from a SyncEvent.
 
@@ -1008,7 +1191,11 @@ class SyncEngine:
                     dbx_path_lower=dbx_path_lower,
                     dbx_id=event.dbx_id,
                     item_type=event.item_type,
-                    last_sync=self._get_change_time(event.local_path),
+                    last_sync=(
+                        self._get_change_time(event.local_path)
+                        if local_present
+                        else None
+                    ),
                     rev=event.rev,
                     content_hash=event.content_hash,
                     symlink_target=event.symlink_target,
@@ -1511,14 +1698,38 @@ class SyncEngine:
 
         return False
 
-    def is_excluded_by_user(self, dbx_path_lower: str) -> bool:
+    def is_excluded_by_selective_sync(self, dbx_path_lower: str) -> bool:
         """
-        Check if file has been excluded through "selective sync" by the user.
+        Check if a path is outside the current selective-sync selection.
 
         :param dbx_path_lower: Normalised lower case Dropbox path.
         :returns: Whether the path is excluded from download syncing by the user.
         """
-        return any(is_equal_or_child(dbx_path_lower, p) for p in self.excluded_items)
+        return self._is_path_excluded(
+            normalize(dbx_path_lower),
+            self.selective_sync_mode,
+            self.selective_sync_paths,
+        )
+
+    def selective_sync_status(self, dbx_path: str) -> str:
+        """Return ``included``, ``partially included``, or ``excluded``."""
+        dbx_path_lower = "/" + normalize(dbx_path).strip("/")
+
+        if self.is_excluded_by_selective_sync(dbx_path_lower):
+            return "excluded"
+
+        if self.selective_sync_mode == "include":
+            if any(
+                is_equal_or_child(dbx_path_lower, path)
+                for path in self.selective_sync_paths
+            ):
+                return "included"
+            return "partially included"
+
+        if any(is_child(path, dbx_path_lower) for path in self.selective_sync_paths):
+            return "partially included"
+
+        return "included"
 
     def is_mignore(self, event: SyncEvent) -> bool:
         """
@@ -1690,11 +1901,50 @@ class SyncEngine:
     def _sync_event_from_fs_event(self, fs_event: FileSystemEvent) -> SyncEvent:
         return SyncEvent.from_file_system_event(fs_event, self)
 
+    def _filter_local_events(
+        self, fs_events: Collection[FileSystemEvent]
+    ) -> list[FileSystemEvent]:
+        """Remove events outside include mode and events from ignored symlinks."""
+        filtered_events: list[FileSystemEvent] = []
+
+        for event in fs_events:
+            dbx_src_path = self.to_dbx_path_lower(event.src_path)
+
+            if self.ignore_symlinks:
+                stored_source = self._stored_ignored_symlink_for_path(dbx_src_path)
+
+                if is_deleted(event) and stored_source:
+                    if dbx_src_path == stored_source:
+                        self._restore_after_ignored_symlink(stored_source)
+                    continue
+
+                if is_moved(event):
+                    dest_symlink = self._find_local_symlink(event.dest_path)
+
+                    if stored_source or dest_symlink:
+                        restore_path = stored_source or dbx_src_path
+                        self._restore_after_ignored_symlink(restore_path)
+                        continue
+
+                elif self._ignored_symlink_for_local_path(event.src_path):
+                    continue
+
+            if (
+                self.selective_sync_mode == "include"
+                or "/" in self.selective_sync_paths
+            ) and self.is_excluded_by_selective_sync(dbx_src_path):
+                continue
+
+            filtered_events.append(event)
+
+        return filtered_events
+
     def _sync_events_from_fs_events(
         self, fs_events: list[FileSystemEvent]
     ) -> list[SyncEvent]:
         """Convert local file system events to sync events. This is done in a thread
         pool to parallelize content hashing."""
+        fs_events = self._filter_local_events(fs_events)
         res = do_parallel(
             self._sync_event_from_fs_event,
             fs_events,
@@ -1820,9 +2070,25 @@ class SyncEngine:
                     changes += [event0, event1]
 
         # Get deleted items.
+        released_symlinks: set[str] = set()
         for entry in self.iter_index():
             local_path_indexed = self.to_local_path_from_cased(entry.dbx_path_cased)
             is_mignore = self._is_mignore_path(entry.dbx_path_cased, entry.is_directory)
+
+            if self.ignore_symlinks:
+                ignored_path = self._stored_ignored_symlink_for_path(
+                    entry.dbx_path_lower
+                )
+                if ignored_path:
+                    ignored_local_path = self._local_path_for_ignored_symlink(
+                        ignored_path
+                    )
+                    if osp.islink(ignored_local_path):
+                        continue
+                    if not exists(ignored_local_path):
+                        released_symlinks.add(ignored_path)
+                        continue
+                    self._forget_ignored_symlink(ignored_path)
 
             if is_mignore or not self._exists_with_given_casing(local_path_indexed):
                 if entry.is_directory:
@@ -1830,6 +2096,9 @@ class SyncEngine:
                 else:
                     event = FileDeletedEvent(local_path_indexed)
                 changes.append(event)
+
+        for dbx_path in released_symlinks:
+            self._restore_after_ignored_symlink(dbx_path)
 
         # Ensure that the local Dropbox folder still exists before returning changes.
         # This prevents a deletion of the Dropbox folder from being incorrectly
@@ -1953,7 +2222,31 @@ class SyncEngine:
         other: defaultdict[int, list[SyncEvent]] = defaultdict(list)
 
         for event in sync_events:
-            if self.is_excluded(event.local_path) or self.is_mignore(event):
+            if (
+                self.is_excluded(event.local_path)
+                or self.is_mignore(event)
+                or (
+                    (
+                        self.selective_sync_mode == "include"
+                        or "/" in self.selective_sync_paths
+                    )
+                    and self.is_excluded_by_selective_sync(event.dbx_path_lower)
+                )
+            ):
+                continue
+
+            stored_symlink = self._stored_ignored_symlink_for_path(event.dbx_path_lower)
+            if self.ignore_symlinks and event.is_deleted and stored_symlink:
+                if event.dbx_path_lower == stored_symlink:
+                    self._restore_after_ignored_symlink(stored_symlink)
+                continue
+
+            if self.ignore_symlinks and (
+                event.symlink_target is not None
+                or self._ignored_symlink_for_local_path(event.local_path)
+            ):
+                if event.symlink_target is not None:
+                    self._remember_ignored_symlink(event.dbx_path_lower)
                 continue
 
             if event.is_deleted:
@@ -2230,8 +2523,8 @@ class SyncEngine:
         if (
             self.is_excluded(event.src_path)
             or self.is_excluded(event.dest_path)
-            or self.is_excluded_by_user(normalize(dbx_src_path))
-            or self.is_excluded_by_user(normalize(dbx_dest_path))
+            or self.is_excluded_by_selective_sync(normalize(dbx_src_path))
+            or self.is_excluded_by_selective_sync(normalize(dbx_dest_path))
         ):
             return True
 
@@ -2304,7 +2597,10 @@ class SyncEngine:
         if not (event.is_added or event.is_moved):
             return False
 
-        if self.is_excluded_by_user(event.dbx_path_lower):
+        if (
+            self.selective_sync_mode == "exclude"
+            and self.is_excluded_by_selective_sync(event.dbx_path_lower)
+        ):
             local_path_cc = generate_cc_name(
                 event.local_path,
                 suffix="selective sync conflict",
@@ -2669,7 +2965,7 @@ class SyncEngine:
         if event.local_path == self.dropbox_path:
             self.ensure_dropbox_folder_present()
 
-        if self.is_excluded_by_user(event.dbx_path_lower):
+        if self.is_excluded_by_selective_sync(event.dbx_path_lower):
             self._logger.debug(
                 'Not deleting "%s": is excluded by selective sync', event.dbx_path
             )
@@ -2844,6 +3140,11 @@ class SyncEngine:
         self._logger.info(f"Syncing ↓ {dbx_path}")
 
         with self.sync_lock:
+            if dbx_path == "/":
+                success = self._get_remote_folder(dbx_path)
+                self._clear_caches()
+                return success
+
             md = self.client.get_metadata(dbx_path, include_deleted=True)
 
             dbx_path_lower = normalize(dbx_path)
@@ -2862,7 +3163,12 @@ class SyncEngine:
             event = SyncEvent.from_metadata(md, self)
 
             if event.is_directory:
-                success = self._get_remote_folder(dbx_path)
+                self.activity.add(event)
+                root_result = self._create_local_entry(event)
+                success = root_result.status in (
+                    SyncStatus.Done,
+                    SyncStatus.Skipped,
+                ) and self._get_remote_folder(dbx_path)
             else:
                 self.activity.add(event)
                 e = self._create_local_entry(event)
@@ -3050,8 +3356,8 @@ class SyncEngine:
         if len(sync_events) == 0:
             return results
 
-        # Sort changes into folders, files and deleted items. Discard excluded items
-        # and remove and deleted items from our excluded list.
+        # Sort changes into folders, files and deleted items. Discard paths outside the
+        # current selection. Deleted exclusions are pruned in exclude mode.
         # Sort according to path hierarchy:
         # - Do not create sub-folder / file before parent exists.
         # - Delete parents before deleting children to save some work.
@@ -3060,21 +3366,26 @@ class SyncEngine:
         folders: defaultdict[int, list[SyncEvent]] = defaultdict(list)
         deleted: defaultdict[int, list[SyncEvent]] = defaultdict(list)
 
-        new_excluded = self.excluded_items
+        selected_paths = self.selective_sync_paths
 
         for event in sync_events:
-            is_excluded = self.is_excluded_by_user(
+            is_excluded = self.is_excluded_by_selective_sync(
                 event.dbx_path_lower
             ) or self.is_excluded(event.dbx_path)
 
             if is_excluded:
-                if event.is_deleted:
-                    # Remove deleted item and its children from the excluded list.
-                    new_excluded = {
+                if event.is_deleted and self.selective_sync_mode == "exclude":
+                    selected_paths = {
                         path
-                        for path in new_excluded
+                        for path in selected_paths
                         if not is_equal_or_child(path, event.dbx_path_lower)
                     }
+
+            elif self._ignored_symlink_for_local_path(event.local_path):
+                # Keep the remote index current without touching the local overlay.
+                self.update_index_from_sync_event(event, local_present=False)
+                event.status = SyncStatus.Skipped
+                results.append(event)
 
             else:
                 level = event.dbx_path.count("/")
@@ -3089,7 +3400,8 @@ class SyncEngine:
                 # Housekeeping.
                 self.activity.add(event)
 
-        self.excluded_items = new_excluded
+        if selected_paths != self.selective_sync_paths:
+            self.set_selective_sync(self.selective_sync_mode, selected_paths)
 
         # Apply deleted items.
         if deleted:
@@ -3769,8 +4081,20 @@ class SyncEngine:
         with os.scandir(path) as it:
             for entry in it:
                 dbx_path = self.to_dbx_path(entry.path)
+                is_dir = entry.is_dir(follow_symlinks=False)
+
+                if self.ignore_symlinks and entry.is_symlink():
+                    self._remember_ignored_symlink(dbx_path)
+                    continue
+
+                if (
+                    self.selective_sync_mode == "include"
+                    or "/" in self.selective_sync_paths
+                ) and self.is_excluded_by_selective_sync(normalize(dbx_path)):
+                    continue
+
                 if not self.is_excluded(entry.path) and not self._is_mignore_path(
-                    dbx_path, entry.is_dir(follow_symlinks=False)
+                    dbx_path, is_dir
                 ):
                     yield entry
 

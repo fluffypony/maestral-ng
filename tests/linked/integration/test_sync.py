@@ -445,20 +445,18 @@ def test_excluded_folder_cleared_on_deletion(m: Maestral) -> None:
     wait_for_idle(m)
 
     # Exclude the folder from sync.
-    m.exclude_items(dbx_path)
+    m.set_selective_sync("exclude", [dbx_path])
     wait_for_idle(m)
 
-    assert normalize(dbx_path) in m.excluded_items
-    assert m.excluded_status(dbx_path) == "excluded"
+    assert normalize(dbx_path) in m.selective_sync_paths
+    assert m.selective_sync_status(dbx_path) == "excluded"
     assert not osp.exists(local_path)
 
     # Check that an excluded folder is removed from excluded_list on deletion.
     m.client.remove(dbx_path)
     wait_for_idle(m)
 
-    assert (
-        normalize(dbx_path) not in m.excluded_items
-    ), 'deleted item is still in "excluded_items" list'
+    assert normalize(dbx_path) not in m.selective_sync_paths
 
     assert_synced(m)
     assert_no_errors(m)
@@ -823,7 +821,7 @@ def test_selective_sync_conflict(m: Maestral) -> None:
     wait_for_idle(m)
 
     # exclude 'folder' from sync
-    m.exclude_items("/folder")
+    m.set_selective_sync("exclude", ["/folder"])
     wait_for_idle(m)
 
     assert_synced(m, {})
@@ -1414,7 +1412,7 @@ def assert_synced(m: Maestral, tree: DirTreeType | None = None) -> None:
 
     # Assert that all items from server are present locally with the same content hash.
     for md0 in listing.entries:
-        if m.sync.is_excluded_by_user(md0.path_lower):
+        if m.sync.is_excluded_by_selective_sync(md0.path_lower):
             continue
 
         local_path = m.to_local_path(md0.path_display)
@@ -1468,7 +1466,7 @@ def assert_synced(m: Maestral, tree: DirTreeType | None = None) -> None:
 
     # Check that each server item is in our index.
     for md2 in listing.entries:
-        if not m.sync.is_excluded_by_user(md2.path_lower):
+        if not m.sync.is_excluded_by_selective_sync(md2.path_lower):
             e1 = m.sync.get_index_entry(md2.path_lower)
             assert e1, f"{md2.path_lower} missing in index"
 

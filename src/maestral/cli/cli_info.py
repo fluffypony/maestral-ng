@@ -225,10 +225,10 @@ def ls(m: Maestral, long: bool, dropbox_path: str, include_deleted: bool) -> Non
             color = "bright_black" if text == "private" else ""
             shared_field = Text(text, style=color)
 
-            excluded_status = m.excluded_status(entry.path_lower)
-            color = "green" if excluded_status == "included" else ""
-            text = "✓" if excluded_status == "included" else excluded_status
-            excluded_field = Text(text, style=color)
+            sync_status = m.selective_sync_status(entry.path_lower)
+            color = "green" if sync_status == "included" else ""
+            text = "✓" if sync_status == "included" else sync_status
+            selective_sync_field = Text(text, style=color)
 
             dt_field: ConsoleRenderable
 
@@ -254,7 +254,7 @@ def ls(m: Maestral, long: bool, dropbox_path: str, include_deleted: bool) -> Non
                 item_type,
                 size,
                 shared_field,
-                excluded_field,
+                selective_sync_field,
                 dt_field,
             )
 

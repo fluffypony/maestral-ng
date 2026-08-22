@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING
 import click
 
 from .common import convert_api_errors, existing_config_option, inject_client
-from .core import CliException, DropboxPath
+from .core import DropboxPath
 from .output import echo, ok
 
 if TYPE_CHECKING:
@@ -49,60 +49,71 @@ def autostart(yes: bool, no: bool, config_name: str) -> None:
             echo("Autostart is disabled. Use -Y to enable.")
 
 
-@click.group(help="View and manage excluded folders.")
-def excluded() -> None:
+@click.group(
+    name="selective-sync",
+    help="Choose which Dropbox paths Maestral syncs.",
+)
+def selective_sync() -> None:
     pass
 
 
-@excluded.command(name="list", help="List all excluded files and folders.")
+@selective_sync.command(
+    name="list",
+    help="Show the selective-sync mode and its selected paths.",
+)
 @inject_client(fallback=True, existing_config=True)
-def excluded_list(m: Maestral) -> None:
-    excluded_items = m.excluded_items
+def selective_sync_list(m: Maestral) -> None:
+    echo(f"Mode: {m.selective_sync_mode}")
 
-    if len(excluded_items) == 0:
-        echo("No excluded files or folders.")
+    if len(m.selective_sync_paths) == 0:
+        echo("No selected paths.")
     else:
-        for item in sorted(excluded_items):
+        for item in sorted(m.selective_sync_paths):
             echo(item)
 
 
-@excluded.command(
-    name="add",
-    help="Add files or folders to the excluded list and re-sync.",
+@selective_sync.command(
+    name="set",
+    help="""
+Atomically replace the selective-sync mode and all selected paths.
+
+EXCLUDE syncs everything except the named paths. INCLUDE syncs only the named paths
+and keeps the parent folders needed to reach them. An empty INCLUDE selection syncs no
+Dropbox content.
+""",
 )
+@click.argument("mode", type=click.Choice(["exclude", "include"]))
 @click.argument("dropbox_paths", type=DropboxPath(), nargs=-1)
 @inject_client(fallback=True, existing_config=True)
 @convert_api_errors
-def excluded_add(m: Maestral, dropbox_paths: list[str]) -> None:
-    if any(p == "/" for p in dropbox_paths):
-        raise CliException("Cannot exclude the root directory.")
-
-    m.exclude_items(*dropbox_paths)
-    for path in dropbox_paths:
-        ok(f"Excluded '{path}'")
+def selective_sync_set(m: Maestral, mode: str, dropbox_paths: list[str]) -> None:
+    m.set_selective_sync(mode, dropbox_paths)
+    ok(f"Selective sync set to {mode} mode.")
 
 
-@excluded.command(
-    name="remove",
+@click.command(
+    name="symlinks",
     help="""
-Remove files or folders from the excluded list and re-sync.
+Get or set the local symbolic-link policy.
 
-It is safe to call this method with items which have already been included, they will
-not be downloaded again. If the given path lies inside an excluded folder, the parent
-folder will be included as well (but no other items inside it).
+ERROR reports symbolic links that Dropbox cannot accept. IGNORE leaves local symbolic
+links unmanaged. Maestral will not warn about, upload, delete remotely, or overwrite an
+ignored link path.
 """,
 )
-@click.argument("dropbox_paths", type=DropboxPath(), nargs=-1)
-@inject_client(fallback=False, existing_config=True)
-@convert_api_errors
-def excluded_remove(m: Maestral, dropbox_paths: str) -> None:
-    if any(p == "/" for p in dropbox_paths):
-        return echo("The root directory is always included")
-
-    m.include_items(*dropbox_paths)
-    for path in dropbox_paths:
-        ok(f"Included '{path}'")
-    ok("Downloading...")
+@click.argument(
+    "policy",
+    required=False,
+    type=click.Choice(["error", "ignore"]),
+)
+@inject_client(fallback=True, existing_config=True)
+def symlinks(m: Maestral, policy: str | None) -> None:
+    if policy is None:
+        current_policy = "ignore" if m.ignore_symlinks else "error"
+        echo(f"Symbolic-link policy: {current_policy}.")
+    else:
+        m.ignore_symlinks = policy == "ignore"
+        ok(f"Symbolic-link policy set to {policy}.")
 
 
 @click.group(help="Manage desktop notifications.")

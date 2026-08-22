@@ -37,7 +37,9 @@ DEFAULTS_CONFIG: _DefaultsType = {
     },
     "sync": {
         "path": "",  # dropbox folder location
-        "excluded_items": [],  # files and folders excluded from sync
+        "selective_sync_mode": "exclude",  # "exclude" or "include"
+        "selective_sync_paths": [],  # paths selected by selective sync mode
+        "ignore_symlinks": False,  # leave local symbolic links unmanaged
         "max_cpu_percent": 20.0,  # max CPU usage target (100% = all cores busy)
         "keep_history": 60 * 60 * 24 * 7,  # default: one week
         "upload": True,  # if download sync is enabled
@@ -71,6 +73,7 @@ DEFAULTS_STATE: _DefaultsType = {
         "did_finish_indexing": False,  # indicates completed indexing
         "pending_uploads": [],  # incomplete uploads to retry on next sync
         "pending_downloads": [],  # incomplete downloads to retry on next sync
+        "ignored_symlink_paths": [],  # local symlink overlays ignored by sync
     },
 }
 
@@ -89,7 +92,7 @@ for section_name, section_values in DEFAULTS_CONFIG.items():
 #    or if you want to *rename* options, then you need to do a MAJOR update in
 #    version, e.g. from 3.0 to 4.0
 # 3. You don't need to touch this value if you're just adding a new option
-CONF_VERSION = Version("20.0")
+CONF_VERSION = Version("21.0")
 
 
 # =============================================================================
@@ -141,7 +144,25 @@ def MaestralConfig(config_name: str) -> UserConfig:
     """
     with _config_lock:
         config_path = get_conf_path(CONFIG_DIR_NAME, f"{config_name}.ini")
-        return _get_conf(config_name, config_path, DEFAULTS_CONFIG, _config_instances)
+        conf = _get_conf(config_name, config_path, DEFAULTS_CONFIG, _config_instances)
+
+        # Migrate the old exclusion list to the single selective-sync model. UserConfig
+        # keeps unknown options until this point, so old data remains available even
+        # though ``excluded_items`` is no longer a default option.
+        legacy_items: list[str] | None = None
+        for section in ("sync", "main"):
+            if conf.has_option(section, "excluded_items"):
+                legacy_items = conf.get(section, "excluded_items")
+                break
+
+        if legacy_items is not None:
+            conf.set("sync", "selective_sync_mode", "exclude", save=False)
+            conf.set("sync", "selective_sync_paths", legacy_items, save=False)
+            for section in ("sync", "main"):
+                conf.remove_option(section, "excluded_items", save=False)
+            conf.save()
+
+        return conf
 
 
 _state_instances: dict[str, UserConfig] = {}

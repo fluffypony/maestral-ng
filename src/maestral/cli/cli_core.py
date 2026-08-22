@@ -8,8 +8,8 @@ from typing import TYPE_CHECKING
 import click
 from rich.console import Console, ConsoleRenderable
 
-from ..core import FolderMetadata, SharedLinkMetadata
 from ..constants import ROOT_MARKER_FILE
+from ..core import FolderMetadata, SharedLinkMetadata
 from ..utils.path import delete
 from .common import (
     check_for_fatal_errors,
@@ -244,13 +244,11 @@ def start(foreground: bool, verbose: bool, config_name: str) -> None:
                     "Choose which folders to include", options=names
                 )
 
-                excluded_paths = [
-                    f"/{name}"
-                    for index, name in enumerate(names)
-                    if index not in choices
+                included_paths = [
+                    f"/{name}" for index, name in enumerate(names) if index in choices
                 ]
 
-                m.excluded_items = excluded_paths
+                m.set_selective_sync("include", included_paths)
 
             ok("Setup completed. Starting sync.")
 

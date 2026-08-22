@@ -6,11 +6,10 @@ The config files are located at ``$XDG_CONFIG_HOME/maestral`` on Linux (typicall
 ``~/.config/maestral``) and ``~/Library/Application Support/maestral`` on macOS. Each
 configuration will get its own INI file with the settings documented below.
 
-Config values for ``path`` and ``excluded_items`` should not be edited manually but
-rather through the corresponding CLI commands or GUI options. This is because changes of
-these settings require Maestral to perform accompanying actions, e.g., download items
-which have been removed from the excluded list or move the local Dropbox directory.
-Those will not be performed if the user edits the options manually.
+Config values for ``path``, ``selective_sync_mode``, and ``selective_sync_paths``
+should not be edited manually. Use the corresponding CLI commands or GUI options.
+Changes require accompanying actions, such as downloading newly selected items or
+moving the local Dropbox directory. Manual edits do not perform those actions.
 
 This also holds for the ``account_id`` which will be written to the config file after
 successfully completing the OAuth flow with Dropbox servers.
@@ -23,7 +22,7 @@ config file may be overwritten without warning if made while the sync daemon is 
     [main]
 
     # Config file version (not the Maestral version!)
-    version = 15.0.0
+    version = 21.0
 
     [auth]
 
@@ -60,8 +59,14 @@ config file may be overwritten without warning if made while the sync daemon is 
     # The current Dropbox directory
     path = /Users/UserName/Dropbox (Maestral)
 
-    # List of excluded files and folders
-    excluded_items = ['/test_folder', '/sub/folder']
+    # Interpret selected paths as "exclude" or "include"
+    selective_sync_mode = exclude
+
+    # Paths selected by the selective-sync mode
+    selective_sync_paths = ['/test_folder', '/sub/folder']
+
+    # Leave local symbolic links unmanaged
+    ignore_symlinks = False
 
     # Interval in sec to perform a full reindexing
     reindex_interval = 604800

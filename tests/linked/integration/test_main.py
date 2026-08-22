@@ -148,11 +148,7 @@ def test_move_dropbox_folder_to_existing(m: Maestral, tmp_path) -> None:
 # API integration tests
 
 
-def test_exclude_items(m: Maestral) -> None:
-    """
-    Tests :meth:`Maestral.exclude_item`, :meth:`MaestralMaestral.include_item`,
-    :meth:`Maestral.excluded_status` and :meth:`Maestral.excluded_items`.
-    """
+def test_selective_sync_exclude_mode(m: Maestral) -> None:
     dbx_dirs = [
         "/selective_sync_test_folder",
         "/independent_folder",
@@ -169,30 +165,31 @@ def test_exclude_items(m: Maestral) -> None:
     wait_for_idle(m)
 
     # exclude "/selective_sync_test_folder" from sync
-    m.exclude_items(
-        "/selective_sync_test_folder",
-        "/selective_sync_test_folder/subfolder_0",
+    m.set_selective_sync(
+        "exclude",
+        {
+            "/selective_sync_test_folder",
+            "/selective_sync_test_folder/subfolder_0",
+        },
     )
     wait_for_idle(m)
 
     # check that local items have been deleted
     assert not osp.exists(m.to_local_path("/selective_sync_test_folder"))
 
-    # check that `Maestral.excluded_items` only contains top-level folder
-    assert m.excluded_items == {"/selective_sync_test_folder"}
+    assert m.selective_sync_paths == {"/selective_sync_test_folder"}
 
-    # check that `Maestral.excluded_status` returns the correct values
-    assert m.excluded_status("") == "partially excluded"
-    assert m.excluded_status("/independent_folder") == "included"
+    assert m.selective_sync_status("") == "partially included"
+    assert m.selective_sync_status("/independent_folder") == "included"
 
     for dbx_path in dbx_dirs:
         if dbx_path != "/independent_folder":
-            assert m.excluded_status(dbx_path) == "excluded"
+            assert m.selective_sync_status(dbx_path) == "excluded"
 
 
-def test_include_items(m: Maestral) -> None:
+def test_selective_sync_reinclude_all(m: Maestral) -> None:
     # create remote folder structure and exclude from sync
-    m.exclude_items("/selective_sync_test_folder")
+    m.set_selective_sync("exclude", ["/selective_sync_test_folder"])
     dbx_dirs = [
         "/selective_sync_test_folder",
         "/independent_folder",
@@ -206,23 +203,23 @@ def test_include_items(m: Maestral) -> None:
     wait_for_idle(m)
 
     # include folder in sync, check that it worked
-    m.include_items("/selective_sync_test_folder")
+    m.set_selective_sync("exclude", [])
     wait_for_idle(m)
 
     assert osp.exists(m.to_local_path("/selective_sync_test_folder"))
-    assert "/selective_sync_test_folder" not in m.excluded_items
+    assert m.selective_sync_paths == set()
 
     for dbx_path in dbx_dirs:
-        assert m.excluded_status(dbx_path) == "included"
+        assert m.selective_sync_status(dbx_path) == "included"
 
     # check for fatal errors
     assert not m.fatal_errors
 
 
-def test_include_items_nested(m: Maestral) -> None:
+def test_selective_sync_include_nested(m: Maestral) -> None:
     """Tests special cases of nested selected sync changes."""
     # create remote folder structure and exclude from sync
-    m.exclude_items("/selective_sync_test_folder")
+    m.set_selective_sync("exclude", ["/selective_sync_test_folder"])
     dbx_dirs = [
         "/selective_sync_test_folder",
         "/independent_folder",
@@ -238,11 +235,16 @@ def test_include_items_nested(m: Maestral) -> None:
     # test including a folder inside "/selective_sync_test_folder",
     # "/selective_sync_test_folder" should become included itself but
     # its other children will still be excluded
-    m.include_items("/selective_sync_test_folder/subfolder_0")
+    m.set_selective_sync("include", ["/selective_sync_test_folder/subfolder_0"])
     wait_for_idle(m)
 
-    assert "/selective_sync_test_folder" not in m.excluded_items
-    assert "/selective_sync_test_folder/subfolder_1" in m.excluded_items
+    assert m.selective_sync_paths == {"/selective_sync_test_folder/subfolder_0"}
+    assert (
+        m.selective_sync_status("/selective_sync_test_folder") == "partially included"
+    )
+    assert (
+        m.selective_sync_status("/selective_sync_test_folder/subfolder_1") == "excluded"
+    )
     assert osp.exists(m.to_local_path("/selective_sync_test_folder/subfolder_0"))
     assert not osp.exists(m.to_local_path("/selective_sync_test_folder/subfolder_1"))
 
@@ -251,7 +253,7 @@ def test_include_items_nested(m: Maestral) -> None:
 
 
 def test_selective_sync_global(m: Maestral) -> None:
-    """Test :meth:`Maestral.exclude_items` to change all items at once."""
+    """Test :meth:`Maestral.set_selective_sync` to change all items at once."""
     dbx_dirs = [
         "/selective_sync_test_folder",
         "/independent_folder",
@@ -268,25 +270,27 @@ def test_selective_sync_global(m: Maestral) -> None:
     wait_for_idle(m)
 
     # exclude "/selective_sync_test_folder" and one child from sync
-    m.excluded_items = {
-        "/selective_sync_test_folder",
-        "/selective_sync_test_folder/subfolder_0",
-    }
+    m.set_selective_sync(
+        "exclude",
+        {
+            "/selective_sync_test_folder",
+            "/selective_sync_test_folder/subfolder_0",
+        },
+    )
     wait_for_idle(m)
 
     # check that local items have been deleted
     assert not osp.exists(m.to_local_path("/selective_sync_test_folder"))
 
-    # check that `Maestral.excluded_items` has been updated correctly
-    assert m.excluded_items == {"/selective_sync_test_folder"}
+    assert m.selective_sync_paths == {"/selective_sync_test_folder"}
 
     # exclude only child folder from sync, check that it worked
-    m.excluded_items = {"/selective_sync_test_folder/subfolder_0"}
+    m.set_selective_sync("exclude", ["/selective_sync_test_folder/subfolder_0"])
     wait_for_idle(m)
 
     assert osp.exists(m.to_local_path("/selective_sync_test_folder"))
     assert osp.exists(m.to_local_path("/selective_sync_test_folder/subfolder_1"))
-    assert m.excluded_items == {"/selective_sync_test_folder/subfolder_0"}
+    assert m.selective_sync_paths == {"/selective_sync_test_folder/subfolder_0"}
 
     # check for fatal errors
     assert not m.fatal_errors

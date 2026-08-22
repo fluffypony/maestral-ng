@@ -25,8 +25,11 @@ Maestral processes remote events as follows:
 2) :meth:`SyncEngine.list_remote_changes` lists all remote changes since the last sync.
    Those events are processed at follows:
 
-   * Events for entries which are excluded by selective sync and hard-coded file names
-     which are always excluded (e.g., '.DS_Store') are filtered out at this stage.
+   * Events outside the selective-sync selection and hard-coded file names which are
+     always excluded (e.g., '.DS_Store') are filtered out at this stage. Include mode
+     keeps selected paths, their descendants, and their required parent folders.
+   * If symbolic-link ignoring is enabled, remote events at a local link or below a
+     linked folder update the remote index but do not change the local link path.
    * Multiple events per file path are combined to one. This is rarely necessary,
      Dropbox typically already provides only a single event per path but this is not
      guaranteed and may change. One exception is sharing a folder: Dropbox does this
@@ -56,6 +59,8 @@ moved, modified and deleted events. They are processed as follows:
 
    * Events ignored by a "mignore" pattern as well as hard-coded file names and
      changes in our cache path are filtered out at this stage.
+   * Include mode filters events outside its selected paths. If symbolic-link ignoring
+     is enabled, events at local links and below linked folders are filtered out too.
    * Events are further cleaned up to return the minimum number of events necessary to
      reproduce the actual changes: Multiple events per path are combined into a single
      event which reproduces the file change. The only exception is when the entry type
@@ -91,9 +96,9 @@ locally saved revision identifier in Maestral's index. We assign folders a rev o
 
 Conflict resolution for uploads is handled as follows:
 
-#. For created and moved events, we check if the new path has been excluded by the user
-   with selective sync but still exists on Dropbox. If yes, it will be renamed by
-   appending "(selective sync conflict)".
+#. In exclude mode, created and moved events whose paths are excluded but still exist
+   on Dropbox are renamed by appending "(selective sync conflict)". Include mode leaves
+   paths outside its selection unmanaged.
 #. On case-sensitive file systems, we check if the new path differs only in casing from
    an existing path. If yes, it will be renamed by appending "(case conflict)".
 #. If a file has been replaced with a folder or vice versa, we check if any un-synced
