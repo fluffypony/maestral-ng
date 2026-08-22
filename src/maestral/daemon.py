@@ -1,48 +1,43 @@
-"""
-This module defines functions to start and stop the sync daemon and retrieve proxy
-objects for a running daemon.
-"""
+"""Start and stop the sync daemon and connect local API clients."""
 
 from __future__ import annotations
 
 import argparse
 import enum
-import fcntl
-
-# system imports
-import inspect
+import ipaddress
+import json
 import os
-import pickle
+import platform
 import signal
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pprint import pformat
 from types import TracebackType
 from typing import TYPE_CHECKING, Any, ContextManager, Iterable
 
-# external imports
-import Pyro5
 from fasteners import InterProcessLock
-from Pyro5.api import (
-    Daemon,
-    Proxy,
-    expose,
-    register_class_to_dict,
-    register_dict_to_class,
-)
-from Pyro5.errors import CommunicationError
-from Pyro5.serializers import serpent
 
-from . import core, exceptions, models
 from .constants import ENV, IS_MACOS
-
-# local imports
+from .rpc import (
+    PROTOCOL_VERSION,
+    CommunicationError,
+    JsonRpcConnection,
+    JsonRpcServer,
+    ProtocolError,
+    RpcEndpoint,
+)
 from .utils import exc_info_tuple
 from .utils.appdirs import get_runtime_path
 from .utils.integration import SystemdNotifier
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - only used on Windows
+    fcntl = None  # type: ignore[assignment]
 
 if TYPE_CHECKING:
     from .main import Maestral
@@ -55,6 +50,8 @@ __all__ = [
     "maestral_lock",
     "get_maestral_pid",
     "sockpath_for_config",
+    "endpoint_path_for_config",
+    "endpoint_for_config",
     "lockpath_for_config",
     "wait_for_startup",
     "is_running",
@@ -62,8 +59,9 @@ __all__ = [
     "start_maestral_daemon",
     "start_maestral_daemon_process",
     "stop_maestral_daemon_process",
-    "MaestralProxy",
+    "MaestralClient",
     "CommunicationError",
+    "ProtocolError",
 ]
 
 
@@ -73,9 +71,6 @@ WATCHDOG_USEC = os.getenv("WATCHDOG_USEC")
 WATCHDOG_PID = os.getenv("WATCHDOG_PID")
 IS_WATCHDOG = WATCHDOG_PID is None or WATCHDOG_PID == str(os.getpid())
 
-
-URI = "PYRO:maestral.{0}@{1}"
-Pyro5.config.THREADPOOL_SIZE_MIN = 2
 
 _DAEMON_START_SCRIPT = (
     "from maestral.daemon import start_maestral_daemon; "
@@ -115,44 +110,6 @@ class Start(enum.Enum):
     AlreadyRunning = 1
     Failed = 2
     Uninitialized = 3
-
-
-# ==== error serialization =============================================================
-
-
-def check_signature(signature: str, obj: bytes) -> None:
-    pass
-
-
-def serialize_api_types(obj: Any) -> dict[str, Any]:
-    """
-    :param obj: Object to serialize.
-    :returns: Serialized object.
-    """
-    res = pickle.dumps(obj)
-    return {"__class__": type(obj).__name__, "object": res, "signature": ""}
-
-
-def deserialize_api_types(class_name: str, d: dict[str, Any]) -> Any:
-    """
-    Deserializes an API type. Allowed classes are defined in:
-        * :mod:`maestral.core`
-        * :mod:`maestral.model`
-        * :mod:`maestral.exceptions`
-
-    :param class_name: Name of class to deserialize.
-    :param d: Dictionary of serialized class.
-    :returns: Deserialized object.
-    """
-    bytes_message = serpent.tobytes(d["object"])
-    check_signature(d["signature"], bytes_message)
-    return pickle.loads(bytes_message)
-
-
-for module in core, models, exceptions:
-    for klass_name, klass in inspect.getmembers(module, inspect.isclass):
-        register_class_to_dict(klass, serialize_api_types)
-        register_dict_to_class(klass_name, deserialize_api_types)
 
 
 # ==== interprocess locking ============================================================
@@ -202,7 +159,15 @@ class Lock:
         with self._lock:
             if self._external_lock.acquired:
                 return False
-            return self._external_lock.acquire(blocking=False)
+            acquired = self._external_lock.acquire(blocking=False)
+            if acquired and fcntl is None:
+                pid_path = f"{self.path}.pid"
+                fd = os.open(pid_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                with os.fdopen(fd, "w") as file:
+                    file.write(str(self.pid))
+                    file.flush()
+                    os.fsync(file.fileno())
+            return acquired
 
     def release(self) -> None:
         """Release the previously acquired lock."""
@@ -213,6 +178,11 @@ class Lock:
                 )
 
             self._external_lock.release()
+            if fcntl is None:
+                try:
+                    os.unlink(f"{self.path}.pid")
+                except FileNotFoundError:
+                    pass
 
     def locked(self) -> bool:
         """
@@ -232,6 +202,17 @@ class Lock:
         with self._lock:
             if self._external_lock.acquired:
                 return self.pid
+
+            if fcntl is None:
+                probe = InterProcessLock(self.path)
+                if probe.acquire(blocking=False):
+                    probe.release()
+                    return None
+                try:
+                    with open(f"{self.path}.pid") as file:
+                        return int(file.read())
+                except (FileNotFoundError, OSError, ValueError):
+                    return -1
 
             try:
                 fh = open(self._external_lock.path, "a")
@@ -277,9 +258,20 @@ def maestral_lock(config_name: str) -> Lock:
     :param config_name: The name of the Maestral configuration.
     :returns: Lock instance for the config name
     """
-    name = f"{config_name}.lock"
-    path = get_runtime_path("maestral")
-    return Lock.singleton(os.path.join(path, name))
+    return Lock.singleton(lockpath_for_config(config_name))
+
+
+def _is_windows() -> bool:
+    return platform.system() == "Windows"
+
+
+def _windows_runtime_path(filename: str) -> str:
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    if not local_app_data:
+        raise RuntimeError("LOCALAPPDATA is not set")
+    directory = os.path.join(local_app_data, "maestral")
+    os.makedirs(directory, exist_ok=True)
+    return os.path.join(directory, filename)
 
 
 def sockpath_for_config(config_name: str) -> str:
@@ -293,6 +285,63 @@ def sockpath_for_config(config_name: str) -> str:
     return get_runtime_path("maestral", f"{config_name}.sock")
 
 
+def endpoint_path_for_config(config_name: str) -> str:
+    """Return the Windows TCP endpoint discovery-file path."""
+    return _windows_runtime_path(f"{config_name}.endpoint")
+
+
+def _validate_tcp_endpoint(host: Any, port: Any) -> tuple[str, int]:
+    if not isinstance(host, str) or not isinstance(port, int):
+        raise CommunicationError("Invalid daemon endpoint")
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError as exc:
+        raise CommunicationError("Invalid daemon endpoint host") from exc
+    if not address.is_loopback:
+        raise CommunicationError("Refusing a non-loopback daemon endpoint")
+    if isinstance(port, bool) or not 1 <= port <= 65535:
+        raise CommunicationError("Invalid daemon endpoint port")
+    return host, port
+
+
+def _publish_tcp_endpoint(config_name: str, host: str, port: int) -> None:
+    """Atomically publish a Windows TCP endpoint for local clients."""
+    host, port = _validate_tcp_endpoint(host, port)
+    destination = endpoint_path_for_config(config_name)
+    directory = os.path.dirname(destination)
+    fd, temporary = tempfile.mkstemp(prefix=f".{config_name}.", dir=directory)
+
+    try:
+        os.chmod(temporary, 0o600)
+        with os.fdopen(fd, "w") as file:
+            json.dump({"host": host, "port": port}, file, separators=(",", ":"))
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(temporary, destination)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+
+def endpoint_for_config(config_name: str) -> RpcEndpoint:
+    """Discover the local JSON-RPC endpoint for a configuration."""
+    if not _is_windows():
+        return RpcEndpoint("unix", sockpath_for_config(config_name))
+
+    try:
+        with open(endpoint_path_for_config(config_name)) as file:
+            endpoint = json.load(file)
+        host, port = _validate_tcp_endpoint(endpoint["host"], endpoint["port"])
+    except CommunicationError:
+        raise
+    except (FileNotFoundError, OSError, KeyError, TypeError, ValueError) as exc:
+        raise CommunicationError("Could not read the daemon endpoint") from exc
+
+    return RpcEndpoint("tcp", (host, port))
+
+
 def lockpath_for_config(config_name: str) -> str:
     """
     Returns the lock file location to be used for the config. This will be the apps
@@ -301,6 +350,8 @@ def lockpath_for_config(config_name: str) -> str:
     :param config_name: The name of the Maestral configuration.
     :returns: Path of lock file to use.
     """
+    if _is_windows():
+        return _windows_runtime_path(f"{config_name}.lock")
     return get_runtime_path("maestral", f"{config_name}.lock")
 
 
@@ -324,6 +375,32 @@ def is_running(config_name: str) -> bool:
     return maestral_lock(config_name).locked()
 
 
+def _validate_handshake(
+    handshake: Any,
+) -> tuple[set[str], set[str], set[str]]:
+    try:
+        protocol_version = handshake["protocol_version"]
+        daemon_version = handshake["daemon_version"]
+        methods = handshake["methods"]
+        properties = handshake["properties"]
+        readable = properties["read"]
+        writable = properties["write"]
+    except (KeyError, TypeError) as exc:
+        raise ProtocolError("Invalid RPC handshake") from exc
+
+    if type(protocol_version) is not int or protocol_version != PROTOCOL_VERSION:
+        raise ProtocolError("The daemon uses an incompatible RPC protocol")
+    if not isinstance(daemon_version, str) or not daemon_version:
+        raise ProtocolError("Invalid RPC handshake")
+    if not all(
+        isinstance(values, list) and all(isinstance(value, str) for value in values)
+        for values in (methods, readable, writable)
+    ):
+        raise ProtocolError("Invalid RPC handshake")
+
+    return set(methods), set(readable), set(writable)
+
+
 def wait_for_startup(
     config_name: str,
     timeout: float = 30,
@@ -338,14 +415,14 @@ def wait_for_startup(
     :raises CommunicationError: if we cannot communicate with the daemon within the
         given timeout.
     """
-    sock_name = sockpath_for_config(config_name)
-    maestral_daemon = Proxy(URI.format(config_name, "./u:" + sock_name))
-
     t0 = time.time()
 
     while True:
+        connection: JsonRpcConnection | None = None
         try:
-            maestral_daemon._pyroBind()
+            connection = JsonRpcConnection(endpoint_for_config(config_name))
+            handshake = connection.request("rpc.handshake")
+            _validate_handshake(handshake)
             return
         except Exception as exc:
             if process is not None and process.poll() is not None:
@@ -357,7 +434,8 @@ def wait_for_startup(
             else:
                 time.sleep(0.2)
         finally:
-            maestral_daemon._pyroRelease()
+            if connection is not None:
+                connection.close()
 
 
 # ==== main functions to manage daemon =================================================
@@ -370,12 +448,9 @@ def start_maestral_daemon(
     Starts the Maestral daemon with event loop in the current thread.
 
     Startup is race free: there will never be more than one daemon running with the same
-    config name. The daemon is a :class:`maestral.main.Maestral` instance which is
-    exposed as Pyro daemon object and listens for requests on a unix domain socket. This
-    call starts an asyncio event loop to process client requests and blocks until the
-    event loop shuts down. On macOS, the event loop is integrated with Cocoa's
-    CFRunLoop. This allows processing Cocoa events and callbacks, for instance for
-    desktop notifications.
+    config name. The daemon exposes a :class:`maestral.main.Maestral` instance through
+    JSON-RPC. It listens on a Unix socket on macOS and Linux, or loopback TCP on
+    Windows. This call starts an asyncio event loop and blocks until shutdown.
 
     :param config_name: The name of the Maestral configuration to use.
     :param log_to_stderr: If ``True``, write logs to stderr.
@@ -413,6 +488,10 @@ def start_maestral_daemon(
         dlogger.error("Could not acquire lock, daemon is already running")
         return
 
+    loop: asyncio.AbstractEventLoop | None = None
+    socket_path: str | None = None
+    endpoint_path: str | None = None
+
     try:
         # ==== System integration ======================================================
         # Integrate with CFRunLoop in macOS.
@@ -433,13 +512,12 @@ def start_maestral_daemon(
 
         # Get the default event loop.
         loop = event_loop_policy.new_event_loop()
+        asyncio.set_event_loop(loop)
 
         # Notify systemd that we have started.
         if NOTIFY_SOCKET:
             dlogger.debug("Running as systemd notify service")
             dlogger.debug("NOTIFY_SOCKET = %s", NOTIFY_SOCKET)
-
-        sd_notifier.notify("READY=1")
 
         # Notify systemd periodically if alive.
         if IS_WATCHDOG and WATCHDOG_USEC:
@@ -456,59 +534,79 @@ def start_maestral_daemon(
             dlogger.debug("WATCHDOG_PID = %s", WATCHDOG_PID)
             loop.create_task(periodic_watchdog())
 
-        # ==== Run Maestral as Pyro server =============================================
-        # Get socket for config name.
-        sockpath = sockpath_for_config(config_name)
-        dlogger.debug("Socket path: %r", sockpath)
-
-        # Clean up old socket.
-        try:
-            os.remove(sockpath)
-        except (FileNotFoundError, NotADirectoryError):
-            pass
-
-        # Expose maestral as Pyro server.
-        dlogger.debug("Creating Pyro daemon")
-
+        # ==== Run Maestral as JSON-RPC server ========================================
         shutdown_future = loop.create_future()
-        maestral_daemon = expose(Maestral)(
+        maestral_daemon = Maestral(
             config_name,
             log_to_stderr=log_to_stderr,
             event_loop=loop,
             shutdown_future=shutdown_future,
         )
+        rpc_server = JsonRpcServer(maestral_daemon)
+
+        if _is_windows():
+            loop.run_until_complete(rpc_server.start_tcp("127.0.0.1"))
+            server_socket = rpc_server.sockets[0]
+            host, port = server_socket.getsockname()[:2]
+            host, port = _validate_tcp_endpoint(host, port)
+            _publish_tcp_endpoint(config_name, host, port)
+            endpoint_path = endpoint_path_for_config(config_name)
+            dlogger.debug("TCP endpoint: %s:%s", host, port)
+        else:
+            socket_path = sockpath_for_config(config_name)
+            dlogger.debug("Socket path: %r", socket_path)
+            try:
+                os.remove(socket_path)
+            except (FileNotFoundError, NotADirectoryError):
+                pass
+            loop.run_until_complete(rpc_server.start_unix(socket_path))
+            os.chmod(socket_path, 0o600)
+
+        sd_notifier.notify("READY=1")
 
         dlogger.debug("Starting event loop")
 
-        with Daemon(unixsocket=sockpath) as daemon:
-            daemon.register(maestral_daemon, f"maestral.{config_name}")
+        handled_signals = [signal.SIGTERM, signal.SIGINT]
+        if hasattr(signal, "SIGHUP"):
+            handled_signals.insert(0, signal.SIGHUP)
 
-            # Reduce Pyro's housekeeping frequency from 2 sec to 20 sec.
-            # This avoids constantly waking the CPU when we are idle.
-            if daemon.transportServer.housekeeper:
-                daemon.transportServer.housekeeper.waittime = 20
+        for handled_signal in handled_signals:
+            try:
+                loop.add_signal_handler(handled_signal, maestral_daemon.shutdown_daemon)
+            except (NotImplementedError, RuntimeError):
+                signal.signal(
+                    handled_signal,
+                    lambda _signum, _frame: maestral_daemon.shutdown_daemon(),
+                )
 
-            for socket in daemon.sockets:
-                loop.add_reader(socket.fileno(), daemon.events, daemon.sockets)
-
-            # Handle sigterm gracefully.
-            signals = (signal.SIGHUP, signal.SIGTERM, signal.SIGINT)
-            for s in signals:
-                loop.add_signal_handler(s, maestral_daemon.shutdown_daemon)
-
+        try:
             loop.run_until_complete(shutdown_future)
-
-            for socket in daemon.sockets:
-                loop.remove_reader(socket.fileno())
-
-            # Prevent Pyro housekeeping from blocking shutdown.
-            daemon.transportServer.housekeeper = None
+        finally:
+            loop.run_until_complete(rpc_server.close())
 
     except Exception as exc:
         dlogger.error(str(exc), exc_info=True)
     finally:
         # Notify systemd that we are shutting down.
         sd_notifier.notify("STOPPING=1")
+
+        for path in (socket_path, endpoint_path):
+            if path:
+                try:
+                    os.remove(path)
+                except (FileNotFoundError, NotADirectoryError):
+                    pass
+
+        if loop is not None:
+            pending_tasks = asyncio.all_tasks(loop)
+            for task in pending_tasks:
+                task.cancel()
+            if pending_tasks:
+                loop.run_until_complete(
+                    asyncio.gather(*pending_tasks, return_exceptions=True)
+                )
+            loop.close()
+            asyncio.set_event_loop(None)
 
         lock.release()
 
@@ -617,71 +715,52 @@ def stop_maestral_daemon_process(
     return Stop.Killed
 
 
-class MaestralProxy(ContextManager["MaestralProxy"]):
-    """A Proxy to the Maestral daemon
+class MaestralClient(ContextManager["MaestralClient"]):
+    """A JSON-RPC client for the Maestral daemon.
 
-    All methods and properties of Maestral's public API are accessible and calls /
-    access will be forwarded to the corresponding Maestral instance. This class can be
-    used as a context manager to close the connection to the daemon on exit.
-
-    :Example:
-
-        Use MaestralProxy as a context manager:
-
-        >>> import src.maestral.cli.cli_info
-        >>> with MaestralProxy() as m:
-        ...     print(src.maestral.cli.cli_info.status)
-
-        Use MaestralProxy directly:
-
-        >>> import src.maestral.cli.cli_info
-        >>> m = MaestralProxy()
-        >>> print(src.maestral.cli.cli_info.status)
-        >>> m._disconnect()
-
-    :ivar _is_fallback: Whether we are using an actual Maestral instance as fallback
-        instead of a Proxy.
-
-    :param config_name: The name of the Maestral configuration to use.
-    :param fallback: If ``True``, a new instance of Maestral will be created in the
-        current process when the daemon is not running.
-    :raises CommunicationError: if the daemon is running but cannot be reached or if the
-        daemon is not running and ``fallback`` is ``False``.
+    Public methods and properties mirror :class:`maestral.main.Maestral`. When
+    ``fallback`` is true and no daemon runs, calls use an in-process Maestral instance.
     """
 
-    _m: Maestral | Proxy
+    _m: Maestral | JsonRpcConnection
 
     def __init__(self, config_name: str = "maestral", fallback: bool = False) -> None:
-        self._config_name = config_name
+        from .config import validate_config_name
+
+        self._config_name = validate_config_name(config_name)
         self._is_fallback = False
+        self._remote_methods: set[str] = set()
+        self._readable_properties: set[str] = set()
+        self._writable_properties: set[str] = set()
 
-        if is_running(config_name):
-            sock_name = sockpath_for_config(config_name)
-
-            # print remote tracebacks locally
-            sys.excepthook = Pyro5.errors.excepthook
-
-            self._m = Proxy(URI.format(config_name, "./u:" + sock_name))
+        if is_running(self._config_name):
+            connection = JsonRpcConnection(endpoint_for_config(self._config_name))
             try:
-                self._m._pyroBind()
-            except CommunicationError:
-                self._m._pyroRelease()
+                handshake = connection.request("rpc.handshake")
+                (
+                    self._remote_methods,
+                    self._readable_properties,
+                    self._writable_properties,
+                ) = _validate_handshake(handshake)
+            except Exception:
+                connection.close()
                 raise
-
+            self._m = connection
         elif fallback:
             from .main import Maestral
 
-            self._m = Maestral(config_name)
+            self._m = Maestral(self._config_name)
+            self._is_fallback = True
         else:
-            raise CommunicationError(f"Could not get proxy for '{config_name}'")
-
-        self._is_fallback = not isinstance(self._m, Proxy)
+            raise CommunicationError(
+                f"Could not connect to daemon for '{self._config_name}'"
+            )
 
     def _disconnect(self) -> None:
-        if isinstance(self._m, Proxy):
-            self._m._pyroRelease()
+        if isinstance(self._m, JsonRpcConnection):
+            self._m.close()
 
-    def __enter__(self) -> MaestralProxy:
+    def __enter__(self) -> MaestralClient:
         return self
 
     def __exit__(
@@ -691,27 +770,59 @@ class MaestralProxy(ContextManager["MaestralProxy"]):
         tb: TracebackType | None,
     ) -> None:
         self._disconnect()
-        del self._m
 
     def __getattr__(self, item: str) -> Any:
         if item.startswith("_"):
-            super().__getattribute__(item)
-        elif isinstance(self._m, Proxy):
-            return self._m.__getattr__(item)
-        else:
-            return self._m.__getattribute__(item)
+            raise AttributeError(item)
+
+        target = self._m
+        if not isinstance(target, JsonRpcConnection):
+            return getattr(target, item)
+
+        if item in self._readable_properties:
+            return target.request("rpc.get", {"name": item})
+
+        if item in self._remote_methods:
+
+            def remote_method(*args: Any, **kwargs: Any) -> Any:
+                if args and kwargs:
+                    params: dict[str, Any] | list[Any] = {
+                        "__maestral_args__": list(args),
+                        "__maestral_kwargs__": kwargs,
+                    }
+                elif kwargs:
+                    params = kwargs
+                else:
+                    params = list(args)
+                return target.request(item, params)
+
+            remote_method.__name__ = item
+            return remote_method
+
+        raise AttributeError(item)
 
     def __setattr__(self, key: str, value: Any) -> None:
         if key.startswith("_"):
             super().__setattr__(key, value)
+            return
+
+        target = self._m
+        if not isinstance(target, JsonRpcConnection):
+            setattr(target, key, value)
+        elif key in self._writable_properties:
+            target.request("rpc.set", {"name": key, "value": value})
+        elif key in self._readable_properties:
+            raise AttributeError(f"Property '{key}' is read-only")
         else:
-            self._m.__setattr__(key, value)
+            raise AttributeError(key)
 
     def __dir__(self) -> Iterable[str]:
         own_result = dir(self.__class__) + list(self.__dict__.keys())
-        proxy_result = [k for k in self._m.__dir__() if not k.startswith("_")]
-
-        return sorted(set(own_result) | set(proxy_result))
+        if isinstance(self._m, JsonRpcConnection):
+            remote_result = self._remote_methods | self._readable_properties
+        else:
+            remote_result = {key for key in dir(self._m) if not key.startswith("_")}
+        return sorted(set(own_result) | remote_result)
 
     def __repr__(self) -> str:
         return (

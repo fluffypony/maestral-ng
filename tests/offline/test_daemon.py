@@ -1,5 +1,6 @@
 import asyncio
 import os
+import stat
 import subprocess
 import sys
 import threading
@@ -8,7 +9,6 @@ import uuid
 from unittest.mock import Mock
 
 import pytest
-from Pyro5.api import Proxy
 
 import maestral.daemon as daemon_module
 import maestral.logging as logging_module
@@ -16,14 +16,16 @@ from maestral.config import validate_config_name
 from maestral.daemon import (
     CommunicationError,
     Lock,
-    MaestralProxy,
+    MaestralClient,
     Start,
     Stop,
+    sockpath_for_config,
     start_maestral_daemon_process,
     stop_maestral_daemon_process,
 )
 from maestral.exceptions import NotLinkedError
 from maestral.main import Maestral
+from maestral.rpc import JsonRpcConnection
 
 # locking tests
 
@@ -153,17 +155,25 @@ def test_locked_uses_read_only_probe(tmp_path, monkeypatch):
 
 
 def test_wait_for_startup_fails_when_child_exits(monkeypatch):
-    proxy = Mock()
-    proxy._pyroBind.side_effect = CommunicationError("not ready")
+    connection = Mock()
+    connection.request.side_effect = CommunicationError("not ready")
     process = Mock(returncode=7)
     process.poll.return_value = 7
 
-    monkeypatch.setattr(daemon_module, "Proxy", Mock(return_value=proxy))
+    monkeypatch.setattr(
+        daemon_module, "JsonRpcConnection", Mock(return_value=connection)
+    )
+    monkeypatch.setattr(
+        daemon_module,
+        "endpoint_for_config",
+        Mock(return_value=Mock()),
+    )
 
     with pytest.raises(ChildProcessError, match="status 7"):
         daemon_module.wait_for_startup("test-config", timeout=30, process=process)
 
     process.poll.assert_called_once_with()
+    connection.close.assert_called_once_with()
 
 
 def test_start_process_passes_config_as_argv_and_reaps(monkeypatch):
@@ -264,7 +274,7 @@ def test_lifecycle(config_name: str) -> None:
     assert res_stop is Stop.NotRunning
 
 
-# proxy tests
+# client tests
 
 
 def test_connection(config_name: str) -> None:
@@ -272,11 +282,14 @@ def test_connection(config_name: str) -> None:
     res_start = start_maestral_daemon_process(config_name, timeout=20)
     assert res_start is Start.Ok
 
-    # create proxy
-    with MaestralProxy(config_name) as m:
+    # create client
+    with MaestralClient(config_name) as m:
         assert m.config_name == config_name
         assert not m._is_fallback
-        assert isinstance(m._m, Proxy)
+        assert isinstance(m._m, JsonRpcConnection)
+        if not daemon_module._is_windows():
+            mode = os.stat(sockpath_for_config(config_name)).st_mode
+            assert stat.S_IMODE(mode) == 0o600
 
     # stop daemon
     res_stop = stop_maestral_daemon_process(config_name)
@@ -284,12 +297,12 @@ def test_connection(config_name: str) -> None:
 
 
 def test_fallback(config_name: str) -> None:
-    # create proxy w/o fallback
+    # create client w/o fallback
     with pytest.raises(CommunicationError):
-        MaestralProxy(config_name)
+        MaestralClient(config_name)
 
-    # create proxy w/ fallback
-    with MaestralProxy(config_name, fallback=True) as m:
+    # create client w/ fallback
+    with MaestralClient(config_name, fallback=True) as m:
         assert m.config_name == config_name
         assert m._is_fallback
         assert isinstance(m._m, Maestral)
@@ -299,8 +312,8 @@ def test_remote_exceptions(config_name: str) -> None:
     # start daemon process
     start_maestral_daemon_process(config_name, timeout=20)
 
-    # create proxy and call a remote method which raises an error
-    with MaestralProxy(config_name) as m:
+    # create a client and call a remote method which raises an error
+    with MaestralClient(config_name) as m:
         with pytest.raises(NotLinkedError):
             m.get_account_info()
 

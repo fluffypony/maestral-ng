@@ -15,8 +15,10 @@ import random
 import shutil
 import sqlite3
 import tempfile
+import threading
 import time
 from asyncio import AbstractEventLoop, Future
+from collections import deque
 from datetime import datetime, timezone
 from typing import Any, Collection, Iterator, Sequence
 
@@ -116,10 +118,8 @@ def _sql_drop_table(db: Database, table: str) -> None:
 class Maestral:
     """The public API
 
-    All methods and properties return objects or raise exceptions which can safely be
-    serialized, i.e., pure Python types. The only exception are instances of
-    :exc:`maestral.exceptions.MaestralApiError`: they need to be registered explicitly
-    with the serpent serializer which is used for communication to frontends.
+    All methods and properties return objects or raise exceptions which the JSON-RPC
+    transport can serialize safely.
 
     Sync errors and fatal errors which occur in the sync threads can be read with the
     properties :attr:`sync_errors` and :attr:`fatal_errors`, respectively.
@@ -199,7 +199,17 @@ class Maestral:
             bandwidth_limit_up=self.bandwidth_limit_up,
             bandwidth_limit_down=self.bandwidth_limit_down,
         )
-        self.sync = SyncEngine(self.client, self._dn)
+        self._sync_event_condition = threading.Condition()
+        self._sync_event_cursor = 0
+        self._sync_event_batches: deque[tuple[int, tuple[SyncEvent, ...]]] = deque(
+            maxlen=100
+        )
+        self._sync_event_stream_closed = False
+        self.sync = SyncEngine(
+            self.client,
+            self._dn,
+            event_callback=self._publish_sync_events,
+        )
         self.manager = SyncManager(self.sync, self._dn)
 
         # Create a future which will return once `shutdown_daemon` is called.
@@ -539,6 +549,123 @@ class Maestral:
         .. versionadded:: 1.3.0
         """
         return self._log_handler_status_longpoll.wait_for_emit(timeout)
+
+    def get_app_snapshot(self) -> dict[str, Any]:
+        """Return the state needed to render a frontend without repeated RPC calls."""
+        account = {
+            "email": self.get_state("account", "email"),
+            "display_name": self.get_state("account", "display_name"),
+            "type": self.get_state("account", "type"),
+        }
+        space_usage = {
+            "used": self.get_state("account", "usage_used"),
+            "allocated": self.get_state("account", "usage_allocated"),
+        }
+        active_events = sorted(
+            self.sync.activity.get_events(),
+            key=lambda event: (
+                event.dbx_path_lower,
+                event.direction.value,
+                event.change_type.value,
+                event.sync_time,
+            ),
+        )
+        recent_events = list(reversed(self.sync.get_history()[-100:]))
+        activity: list[SyncEvent] = []
+        seen_events: set[tuple[Any, ...]] = set()
+
+        for event in active_events + recent_events:
+            event_key: tuple[Any, ...]
+            if event.id is not None:
+                event_key = ("id", event.id)
+            else:
+                event_key = (
+                    "event",
+                    event.direction,
+                    event.dbx_path_lower,
+                    event.change_type,
+                    event.sync_time,
+                )
+            if event_key not in seen_events:
+                seen_events.add(event_key)
+                activity.append(event)
+
+        return {
+            "config_name": self.config_name,
+            "version": self.version,
+            "status": self.status,
+            "pending_link": self.pending_link,
+            "pending_dropbox_folder": self.pending_dropbox_folder,
+            "pending_first_download": self.pending_first_download,
+            "paused": self.paused,
+            "running": self.running,
+            "connected": self.connected,
+            "sync_errors": self.sync_errors,
+            "fatal_errors": self.fatal_errors,
+            "activity": activity,
+            "account": account,
+            "space_usage": space_usage,
+            "excluded_items": self.excluded_items,
+            "dropbox_path": self.dropbox_path,
+            "notification_snooze": self.notification_snooze,
+            "notification_level": self.notification_level,
+            "bandwidth_limit_down": self.bandwidth_limit_down,
+            "bandwidth_limit_up": self.bandwidth_limit_up,
+        }
+
+    def _publish_sync_events(self, sync_events: Sequence[SyncEvent]) -> None:
+        events = tuple(
+            event for event in sync_events if event.status is not SyncStatus.Skipped
+        )
+        if not events:
+            return
+
+        with self._sync_event_condition:
+            self._sync_event_cursor += 1
+            self._sync_event_batches.append((self._sync_event_cursor, events))
+            self._sync_event_condition.notify_all()
+
+    def wait_for_sync_events(
+        self, cursor: int | None = None, timeout: float | None = 60
+    ) -> dict[str, Any]:
+        """Wait for completed sync events after ``cursor``.
+
+        A ``None`` cursor starts at the current position and waits only for new events.
+        """
+        if cursor is not None and (
+            not isinstance(cursor, int) or isinstance(cursor, bool) or cursor < 0
+        ):
+            raise ValueError("cursor must be a non-negative integer")
+        if timeout is not None and (
+            not isinstance(timeout, (int, float))
+            or isinstance(timeout, bool)
+            or timeout < 0
+        ):
+            raise ValueError("timeout must be non-negative or None")
+
+        with self._sync_event_condition:
+            if cursor is None:
+                cursor = self._sync_event_cursor
+
+            if cursor == self._sync_event_cursor and not self._sync_event_stream_closed:
+                self._sync_event_condition.wait_for(
+                    lambda: cursor != self._sync_event_cursor
+                    or self._sync_event_stream_closed,
+                    timeout,
+                )
+
+            current_cursor = self._sync_event_cursor
+            if cursor > current_cursor:
+                events: list[SyncEvent] = []
+            else:
+                events = [
+                    event
+                    for batch_cursor, batch in self._sync_event_batches
+                    if batch_cursor > cursor
+                    for event in batch
+                ]
+
+            return {"cursor": current_cursor, "events": events}
 
     @property
     def pending_link(self) -> bool:
@@ -1477,6 +1604,10 @@ class Maestral:
         Stop syncing and notify anyone monitoring ``shutdown_future`` that we are done.
         """
         self.stop_sync()
+
+        with self._sync_event_condition:
+            self._sync_event_stream_closed = True
+            self._sync_event_condition.notify_all()
 
         if self.shutdown_future and self._loop and self._loop.is_running():
             self._loop.call_soon_threadsafe(self.shutdown_future.set_result, True)

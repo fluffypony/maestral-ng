@@ -16,7 +16,7 @@ from rich.text import Text
 
 from ..core import DeletedMetadata, FileMetadata, FolderMetadata
 from ..models import SyncDirection, SyncEvent, SyncStatus
-from .common import check_for_fatal_errors, convert_api_errors, inject_proxy
+from .common import check_for_fatal_errors, convert_api_errors, inject_client
 from .core import DropboxPath
 from .output import RichDateField, echo, rich_table
 
@@ -25,7 +25,7 @@ if TYPE_CHECKING:
 
 
 @click.command(help="Show the status of the daemon.")
-@inject_proxy(fallback=False, existing_config=True)
+@inject_client(fallback=False, existing_config=True)
 @convert_api_errors
 def status(m: Maestral) -> None:
     email = m.get_state("account", "email")
@@ -77,7 +77,7 @@ a file-manager.
 """,
 )
 @click.argument("local_path", type=click.Path(exists=True, resolve_path=True))
-@inject_proxy(fallback=True, existing_config=True)
+@inject_client(fallback=True, existing_config=True)
 @convert_api_errors
 def filestatus(m: Maestral, local_path: str) -> None:
     stat = m.get_file_status(local_path)
@@ -85,13 +85,13 @@ def filestatus(m: Maestral, local_path: str) -> None:
 
 
 @click.command(help="Live view of all items being synced.")
-@inject_proxy(fallback=False, existing_config=True)
+@inject_client(fallback=False, existing_config=True)
 @convert_api_errors
 def activity(m: Maestral) -> None:
     if check_for_fatal_errors(m):
         return
 
-    from Pyro5.errors import ConnectionClosedError
+    from ..daemon import CommunicationError
 
     EventKey = Tuple[str, SyncDirection]
     progressbar_for_path: dict[EventKey, TaskID] = {}
@@ -151,13 +151,13 @@ def activity(m: Maestral) -> None:
 
                     time.sleep(0.2)
                     progress.refresh()
-    except ConnectionClosedError:
+    except CommunicationError:
         return echo("Maestral daemon is not running.")
 
 
 @click.command(help="Show sync history.")
 @click.argument("dropbox_path", type=DropboxPath(), default="/")
-@inject_proxy(fallback=True, existing_config=True)
+@inject_client(fallback=True, existing_config=True)
 @convert_api_errors
 def history(m: Maestral, dropbox_path: str) -> None:
     dbx_path = None if dropbox_path == "/" else dropbox_path
@@ -194,7 +194,7 @@ def history(m: Maestral, dropbox_path: str) -> None:
     default=False,
     help="Include deleted items in listing.",
 )
-@inject_proxy(fallback=True, existing_config=True)
+@inject_client(fallback=True, existing_config=True)
 @convert_api_errors
 def ls(m: Maestral, long: bool, dropbox_path: str, include_deleted: bool) -> None:
     echo("Loading...\r", nl=False)

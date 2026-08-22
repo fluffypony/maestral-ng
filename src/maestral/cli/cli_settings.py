@@ -4,7 +4,7 @@ from typing import TYPE_CHECKING
 
 import click
 
-from .common import convert_api_errors, existing_config_option, inject_proxy
+from .common import convert_api_errors, existing_config_option, inject_client
 from .core import CliException, DropboxPath
 from .output import echo, ok
 
@@ -55,7 +55,7 @@ def excluded() -> None:
 
 
 @excluded.command(name="list", help="List all excluded files and folders.")
-@inject_proxy(fallback=True, existing_config=True)
+@inject_client(fallback=True, existing_config=True)
 def excluded_list(m: Maestral) -> None:
     excluded_items = m.excluded_items
 
@@ -71,7 +71,7 @@ def excluded_list(m: Maestral) -> None:
     help="Add files or folders to the excluded list and re-sync.",
 )
 @click.argument("dropbox_paths", type=DropboxPath(), nargs=-1)
-@inject_proxy(fallback=True, existing_config=True)
+@inject_client(fallback=True, existing_config=True)
 @convert_api_errors
 def excluded_add(m: Maestral, dropbox_paths: list[str]) -> None:
     if any(p == "/" for p in dropbox_paths):
@@ -93,7 +93,7 @@ folder will be included as well (but no other items inside it).
 """,
 )
 @click.argument("dropbox_paths", type=DropboxPath(), nargs=-1)
-@inject_proxy(fallback=False, existing_config=True)
+@inject_client(fallback=False, existing_config=True)
 @convert_api_errors
 def excluded_remove(m: Maestral, dropbox_paths: str) -> None:
     if any(p == "/" for p in dropbox_paths):
@@ -119,7 +119,7 @@ def notify() -> None:
     required=False,
     type=click.Choice(["ERROR", "SYNCISSUE", "FILECHANGE"], case_sensitive=False),
 )
-@inject_proxy(fallback=True, existing_config=True)
+@inject_client(fallback=True, existing_config=True)
 def notify_level(m: Maestral, level_name: str) -> None:
     from .. import notify as _notify
 
@@ -136,7 +136,7 @@ def notify_level(m: Maestral, level_name: str) -> None:
     help="Snooze desktop notifications of file changes.",
 )
 @click.argument("minutes", type=click.IntRange(min=0))
-@inject_proxy(fallback=True, existing_config=True)
+@inject_client(fallback=True, existing_config=True)
 def notify_snooze(m: Maestral, minutes: int) -> None:
     m.notification_snooze = minutes
 
@@ -159,7 +159,7 @@ def bandwidth_limit() -> None:
     required=False,
     type=click.FLOAT,
 )
-@inject_proxy(fallback=True, existing_config=True)
+@inject_client(fallback=True, existing_config=True)
 def bandwidth_limit_up(m: Maestral, mb_per_second: float | None) -> None:
     if mb_per_second is not None:
         m.bandwidth_limit_up = mb_per_second * 10**6
@@ -179,7 +179,7 @@ def bandwidth_limit_up(m: Maestral, mb_per_second: float | None) -> None:
     required=False,
     type=click.FLOAT,
 )
-@inject_proxy(fallback=True, existing_config=True)
+@inject_client(fallback=True, existing_config=True)
 def bandwidth_limit_down(m: Maestral, mb_per_second: float | None) -> None:
     if mb_per_second is not None:
         m.bandwidth_limit_down = mb_per_second * 10**6

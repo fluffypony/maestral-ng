@@ -11,7 +11,7 @@ import maestral.daemon as daemon_module
 from maestral.autostart import AutoStart
 from maestral.cli import main
 from maestral.cli.core import OrderedGroup
-from maestral.daemon import MaestralProxy, Start, start_maestral_daemon_process
+from maestral.daemon import MaestralClient, Start, start_maestral_daemon_process
 from maestral.logging import scoped_logger
 from maestral.main import Maestral
 from maestral.notify import level_name_to_number, level_number_to_name
@@ -241,7 +241,7 @@ def test_excluded_remove_raises_not_running_error(m: Maestral) -> None:
 
 def test_notify_level(config_name: str) -> None:
     start_maestral_daemon_process(config_name, timeout=TEST_TIMEOUT)
-    m = MaestralProxy(config_name)
+    m = MaestralClient(config_name)
 
     runner = CliRunner()
     result = runner.invoke(main, ["notify", "level", "-c", m.config_name])
@@ -267,7 +267,7 @@ def test_notify_level(config_name: str) -> None:
 
 def test_notify_snooze(config_name: str) -> None:
     start_maestral_daemon_process(config_name, timeout=TEST_TIMEOUT)
-    m = MaestralProxy(config_name)
+    m = MaestralClient(config_name)
 
     runner = CliRunner()
     result = runner.invoke(main, ["notify", "snooze", "20", "-c", m.config_name])

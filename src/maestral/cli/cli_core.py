@@ -16,14 +16,14 @@ from .common import (
     config_option,
     convert_api_errors,
     existing_config_option,
-    inject_proxy,
+    inject_client,
 )
 from .core import CliException, DropboxPath
 from .dialogs import confirm, prompt, select, select_multiple, select_path
 from .output import RichDateField, echo, info, ok, rich_table, warn
 
 if TYPE_CHECKING:
-    from ..daemon import MaestralProxy
+    from ..daemon import MaestralClient
     from ..main import Maestral
 
 
@@ -109,12 +109,12 @@ def select_dbx_path_dialog(
 
 
 def link_dialog(
-    m: MaestralProxy | Maestral, allow_plaintext_keyring: bool = False
+    m: MaestralClient | Maestral, allow_plaintext_keyring: bool = False
 ) -> None:
     """
     A CLI dialog for linking a Dropbox account.
 
-    :param m: Proxy to Maestral daemon.
+    :param m: Client for the Maestral daemon.
     :param allow_plaintext_keyring: Whether to allow storage of the refresh token in
         plain text when no secure keyring is available.
     """
@@ -169,7 +169,7 @@ def link_dialog(
 def start(foreground: bool, verbose: bool, config_name: str) -> None:
     from ..daemon import (
         CommunicationError,
-        MaestralProxy,
+        MaestralClient,
         Start,
         is_running,
         start_maestral_daemon,
@@ -188,7 +188,7 @@ def start(foreground: bool, verbose: bool, config_name: str) -> None:
         except CommunicationError:
             return
 
-        m = MaestralProxy(config_name)
+        m = MaestralClient(config_name)
 
         if m.pending_link:
             link_dialog(m)
@@ -316,14 +316,14 @@ def gui(config_name: str) -> None:
 
 
 @click.command(help="Pause syncing.")
-@inject_proxy(fallback=False, existing_config=True)
+@inject_client(fallback=False, existing_config=True)
 def pause(m: Maestral) -> None:
     m.stop_sync()
     ok("Syncing paused.")
 
 
 @click.command(help="Resume syncing.")
-@inject_proxy(fallback=False, existing_config=True)
+@inject_client(fallback=False, existing_config=True)
 def resume(m: Maestral) -> None:
     if not check_for_fatal_errors(m):
         m.start_sync()
@@ -359,7 +359,7 @@ def auth() -> None:
     default=False,
     help="Allow plain text token storage if no secure keyring is available.",
 )
-@inject_proxy(fallback=True, existing_config=False)
+@inject_client(fallback=True, existing_config=False)
 @convert_api_errors
 def auth_link(
     m: Maestral,
@@ -451,7 +451,7 @@ def sharelink() -> None:
     type=click.DateTime(formats=["%Y-%m-%d", "%Y-%m-%dT%H:%M", "%Y-%m-%d %H:%M"]),
     help="Expiry time for the link (e.g. '2025-07-24 20:50').",
 )
-@inject_proxy(fallback=True, existing_config=True)
+@inject_client(fallback=True, existing_config=True)
 @convert_api_errors
 def sharelink_create(
     m: Maestral,
@@ -465,7 +465,7 @@ def sharelink_create(
 
 @sharelink.command(name="revoke", help="Revoke a shared link.")
 @click.argument("url", nargs=-1, required=True)
-@inject_proxy(fallback=True, existing_config=True)
+@inject_client(fallback=True, existing_config=True)
 @convert_api_errors
 def sharelink_revoke(m: Maestral, url: list[str]) -> None:
     for u in url:
@@ -484,7 +484,7 @@ def sharelink_revoke(m: Maestral, url: list[str]) -> None:
     default=False,
     help="Show output in long format with metadata.",
 )
-@inject_proxy(fallback=True, existing_config=True)
+@inject_client(fallback=True, existing_config=True)
 @convert_api_errors
 def sharelink_list(m: Maestral, dropbox_path: list[str], long: bool) -> None:
     links: list[SharedLinkMetadata]

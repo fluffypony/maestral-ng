@@ -14,7 +14,7 @@ from rich.console import Console
 from rich.text import Text
 
 from .cli_core import select_dbx_path_dialog
-from .common import convert_api_errors, existing_config_option, inject_proxy
+from .common import convert_api_errors, existing_config_option, inject_client
 from .core import CliException, ConfigKey, DropboxPath
 from .dialogs import confirm, select
 from .output import RichDateField, echo, echo_via_pager, ok, rich_table, warn
@@ -26,7 +26,7 @@ if TYPE_CHECKING:
 
 @click.command(help="Move the local Dropbox folder.")
 @click.argument("new_path", required=False, type=click.Path(writable=True))
-@inject_proxy(fallback=True, existing_config=True)
+@inject_client(fallback=True, existing_config=True)
 def move_dir(m: Maestral, new_path: str) -> None:
     new_path = new_path or select_dbx_path_dialog(m.config_name)
     new_path = osp.realpath(osp.expanduser(new_path))
@@ -46,7 +46,7 @@ Rebuilding may take several minutes, depending on the size of your Dropbox.
 @click.option(
     "--yes", "-Y", is_flag=True, default=False, help="Skip confirmation prompt."
 )
-@inject_proxy(fallback=True, existing_config=True)
+@inject_client(fallback=True, existing_config=True)
 @convert_api_errors
 def rebuild_index(m: Maestral, yes: bool) -> None:
     size = get_term_size()
@@ -81,7 +81,7 @@ def rebuild_index(m: Maestral, yes: bool) -> None:
     type=click.IntRange(min=1, max=100),
     default=10,
 )
-@inject_proxy(fallback=True, existing_config=True)
+@inject_client(fallback=True, existing_config=True)
 @convert_api_errors
 def revs(m: Maestral, dropbox_path: str, limit: int) -> None:
     table = rich_table("Revision", "Modified Time")
@@ -124,7 +124,7 @@ and memory.
     type=click.IntRange(min=1, max=100),
     default=10,
 )
-@inject_proxy(fallback=True, existing_config=True)
+@inject_client(fallback=True, existing_config=True)
 @convert_api_errors
 def diff(
     m: Maestral,
@@ -242,7 +242,7 @@ If no revision number is given, old revisions will be listed.
     type=click.IntRange(min=1, max=100),
     default=10,
 )
-@inject_proxy(fallback=True, existing_config=True)
+@inject_client(fallback=True, existing_config=True)
 @convert_api_errors
 def restore(m: Maestral, dropbox_path: str, rev: str, limit: int) -> None:
     if not rev:
@@ -329,7 +329,7 @@ def log_clear(config_name: str) -> None:
     required=False,
     type=click.Choice(["DEBUG", "INFO", "WARNING", "ERROR"], case_sensitive=False),
 )
-@inject_proxy(fallback=True, existing_config=True)
+@inject_client(fallback=True, existing_config=True)
 def log_level(m: Maestral, level_name: str) -> None:
     if level_name:
         m.log_level = cast(int, getattr(logging, level_name))
@@ -375,7 +375,7 @@ def config() -> None:
 
 @config.command(name="get", help="Print the value of a given configuration key.")
 @click.argument("key", type=ConfigKey())
-@inject_proxy(fallback=True, existing_config=True)
+@inject_client(fallback=True, existing_config=True)
 def config_get(m: Maestral, key: str) -> None:
     from ..config.main import KEY_SECTION_MAP
 
@@ -401,7 +401,7 @@ instance, setting a boolean config value to 1 will actually set it to True.
 )
 @click.argument("key", type=ConfigKey())
 @click.argument("value")
-@inject_proxy(fallback=True, existing_config=True)
+@inject_client(fallback=True, existing_config=True)
 @convert_api_errors
 def config_set(m: Maestral, key: str, value: str) -> None:
     from ..config.main import DEFAULTS_CONFIG, KEY_SECTION_MAP

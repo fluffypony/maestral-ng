@@ -545,6 +545,7 @@ class SyncEngine:
         self,
         client: DropboxClient,
         desktop_notifier: notify.MaestralDesktopNotifier | None = None,
+        event_callback: Callable[[Sequence[SyncEvent]], None] | None = None,
     ) -> None:
         self.client = client
         self.config_name = self.client.config_name
@@ -556,6 +557,7 @@ class SyncEngine:
         self.reload_cached_config()
 
         self.desktop_notifier = desktop_notifier
+        self.event_callback = event_callback
 
         # Synchronization
         self.sync_lock = RLock()  # Upload and download cycles.
@@ -1977,6 +1979,12 @@ class SyncEngine:
 
         self._clean_history()
 
+        completed = [
+            event for event in results if event.status is not SyncStatus.Skipped
+        ]
+        if self.event_callback and completed:
+            self.event_callback(completed)
+
         return results
 
     def _clean_local_events(
@@ -3095,6 +3103,12 @@ class SyncEngine:
         results.extend(res)
 
         self._clean_history()
+
+        completed = [
+            event for event in results if event.status is not SyncStatus.Skipped
+        ]
+        if self.event_callback and completed:
+            self.event_callback(completed)
 
         return results
 

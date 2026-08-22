@@ -725,6 +725,8 @@ class DropboxClient:
         # Save results to config.
         self._state.set("account", "usage", space_usage)
         self._state.set("account", "usage_type", usage_type)
+        self._state.set("account", "usage_used", used)
+        self._state.set("account", "usage_allocated", allocated)
 
         return converted_usage
 

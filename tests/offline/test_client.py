@@ -185,6 +185,8 @@ def test_get_space_usage_handles_zero_allocation(client, allocation):
     assert usage.used == 10
     assert usage.allocated == 0
     assert "%" not in client._state.get("account", "usage")
+    assert client._state.get("account", "usage_used") == 10
+    assert client._state.get("account", "usage_allocated") == 0
 
 
 def test_create_shared_link_converts_aware_expiry_to_utc(client, monkeypatch):
