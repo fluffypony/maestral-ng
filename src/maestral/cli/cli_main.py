@@ -7,6 +7,7 @@ from .cli_info import activity, config_files, filestatus, history, ls, status
 from .cli_maintenance import (
     completion,
     config,
+    confirm_root,
     diff,
     log,
     move_dir,
@@ -47,6 +48,7 @@ main.add_command(notify, section="Settings")
 main.add_command(bandwidth_limit, section="Settings")
 
 main.add_command(move_dir, section="Maintenance")
+main.add_command(confirm_root, section="Maintenance")
 main.add_command(rebuild_index, section="Maintenance")
 main.add_command(revs, section="Maintenance")
 main.add_command(diff, section="Maintenance")

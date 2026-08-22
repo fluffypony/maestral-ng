@@ -7,6 +7,7 @@ import click
 from click.testing import CliRunner
 
 import maestral.cli.cli_info as cli_info_module
+import maestral.cli.cli_maintenance as cli_maintenance_module
 import maestral.daemon as daemon_module
 from maestral.autostart import AutoStart
 from maestral.cli import main
@@ -68,6 +69,7 @@ def test_invalid_config() -> None:
         ("notify", "level"),
         ("notify", "snooze"),
         ("move-dir",),
+        ("confirm-root",),
         ("rebuild-index",),
         ("revs",),
         ("diff",),
@@ -158,6 +160,15 @@ def test_ls_handles_empty_terminal_listing(monkeypatch) -> None:
     callback(m, long=False, dropbox_path="/", include_deleted=False)
 
     console.print.assert_called_once_with()
+
+
+def test_confirm_root_calls_public_api() -> None:
+    m = Mock(dropbox_path="/Dropbox")
+
+    callback = inspect.unwrap(cli_maintenance_module.confirm_root.callback)
+    callback(m, yes=True)
+
+    m.confirm_dropbox_directory.assert_called_once_with()
 
 
 def test_stop(config_name: str) -> None:

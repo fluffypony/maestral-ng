@@ -9,9 +9,9 @@ import platform
 # system imports
 import sys
 from enum import Enum
-from typing import ContextManager
 from importlib.metadata import PackageNotFoundError, metadata
 from importlib.resources import as_file, files
+from typing import ContextManager
 
 
 def resource_path(package: str, resource: str) -> ContextManager[pathlib.Path]:
@@ -43,6 +43,7 @@ DEFAULT_CONFIG_NAME = "maestral"
 OLD_REV_FILE = ".maestral"
 MIGNORE_FILE = ".mignore"
 FILE_CACHE = ".maestral.cache"
+ROOT_MARKER_FILE = ".maestral-root"
 
 EXCLUDED_FILE_NAMES = frozenset(
     [
@@ -64,6 +65,7 @@ EXCLUDED_FILE_NAMES = frozenset(
         ".dropbox.cache",
         FILE_CACHE,
         OLD_REV_FILE,
+        ROOT_MARKER_FILE,
     ]
 )
 

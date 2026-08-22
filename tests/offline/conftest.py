@@ -31,6 +31,7 @@ def sync():
     sync = SyncEngine(DropboxClient("test-config", CredentialStorage("test-config")))
     sync.fs_events.enable()
     sync.dropbox_path = local_dir
+    sync.create_root_marker()
 
     observer = Observer()
     observer.schedule(sync.fs_events, sync.dropbox_path, recursive=True)

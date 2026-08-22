@@ -1447,10 +1447,38 @@ class Maestral:
 
         # Update config file and client.
         self.sync.dropbox_path = path
+        self.sync.create_root_marker()
 
         # Resume syncing.
         if resume:
             self.start_sync()
+
+    def confirm_dropbox_directory(self) -> None:
+        """Confirms the configured Dropbox folder as the intended sync root.
+
+        This creates Maestral's root marker. Existing installations must call this
+        method once before they can resume syncing. Check that the configured drive or
+        network mount is available before confirmation.
+
+        :raises NotLinkedError: if no Dropbox account is linked.
+        :raises NoDropboxDirError: if no Dropbox folder is configured or it is missing.
+        :raises MaestralApiError: if the root marker cannot be created.
+        """
+        self._check_linked()
+
+        if self.pending_dropbox_folder:
+            raise NoDropboxDirError(
+                "No local Dropbox directory",
+                "Please set up a local Dropbox directory using the GUI or CLI.",
+            )
+
+        try:
+            self.sync.create_root_marker()
+        except OSError as exc:
+            raise MaestralApiError(
+                "Could not confirm Dropbox folder",
+                exc.strerror or str(exc),
+            ) from exc
 
     def create_shared_link(
         self,
@@ -1629,6 +1657,8 @@ class Maestral:
                 "No local Dropbox directory",
                 "Please set up a local Dropbox directory using the GUI or CLI.",
             )
+
+        self.sync.ensure_dropbox_folder_present()
 
     # ==== Housekeeping on update  =====================================================
 

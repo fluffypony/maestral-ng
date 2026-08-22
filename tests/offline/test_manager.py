@@ -5,7 +5,12 @@ from unittest import mock
 import pytest
 from keyrings.alt.file import PlaintextKeyring
 
-from maestral.constants import FILE_CACHE, MIGNORE_FILE, OLD_REV_FILE
+from maestral.constants import (
+    FILE_CACHE,
+    MIGNORE_FILE,
+    OLD_REV_FILE,
+    ROOT_MARKER_FILE,
+)
 from maestral.core import AccountType, FullAccount, TeamRootInfo, UserRootInfo
 from maestral.exceptions import CancelledError, NoDropboxDirError
 from maestral.main import Maestral
@@ -71,6 +76,7 @@ def test_migrate_path_root_user_to_team(m: Maestral) -> None:
 
     try:
         m.sync.dropbox_path = local_dropbox_dir
+        m.sync.create_root_marker()
 
         m.set_state("account", "path_root_type", "user")
         m.set_state("account", "path_root_nsid", "1")
@@ -107,6 +113,7 @@ def test_migrate_path_root_user_to_team(m: Maestral) -> None:
         m.manager.check_and_update_path_root()
 
         verify_folder_structure(local_dropbox_dir, dir_layout_new)
+        assert os.path.isfile(os.path.join(local_dropbox_dir, ROOT_MARKER_FILE))
 
         assert m.get_state("account", "path_root_type") == "team"
         assert m.get_state("account", "path_root_nsid") == new_namespace_id
@@ -134,6 +141,7 @@ def test_migrate_path_root_team_to_user(m: Maestral) -> None:
 
     try:
         m.sync.dropbox_path = local_dropbox_dir
+        m.sync.create_root_marker()
 
         m.set_state("account", "path_root_type", "team")
         m.set_state("account", "path_root_nsid", "2")
@@ -180,6 +188,7 @@ def test_migrate_path_root_team_to_user(m: Maestral) -> None:
         assert os.path.isfile(os.path.join(local_dropbox_dir, MIGNORE_FILE))
         assert os.path.isfile(os.path.join(local_dropbox_dir, OLD_REV_FILE))
         assert os.path.isdir(os.path.join(local_dropbox_dir, FILE_CACHE))
+        assert os.path.isfile(os.path.join(local_dropbox_dir, ROOT_MARKER_FILE))
 
         assert m.get_state("account", "path_root_type") == "user"
         assert m.get_state("account", "path_root_nsid") == new_namespace_id
@@ -208,6 +217,7 @@ def test_migrate_path_root_team_to_team(m: Maestral) -> None:
 
     try:
         m.sync.dropbox_path = local_dropbox_dir
+        m.sync.create_root_marker()
 
         m.set_state("account", "path_root_type", "team")
         m.set_state("account", "path_root_nsid", "2")
@@ -250,6 +260,7 @@ def test_migrate_path_root_team_to_team(m: Maestral) -> None:
         m.manager.check_and_update_path_root()
 
         verify_folder_structure(local_dropbox_dir, dir_layout_new)
+        assert os.path.isfile(os.path.join(local_dropbox_dir, ROOT_MARKER_FILE))
 
         assert m.get_state("account", "path_root_type") == "team"
         assert m.get_state("account", "path_root_nsid") == new_namespace_id

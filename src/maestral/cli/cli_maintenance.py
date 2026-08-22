@@ -36,6 +36,24 @@ def move_dir(m: Maestral, new_path: str) -> None:
     ok(f"Dropbox folder moved to {new_path}.")
 
 
+@click.command(help="Confirm the configured Dropbox folder as the intended sync root.")
+@click.option(
+    "--yes", "-Y", is_flag=True, default=False, help="Skip confirmation prompt."
+)
+@inject_client(fallback=True, existing_config=True)
+@convert_api_errors
+def confirm_root(m: Maestral, yes: bool) -> None:
+    msg = (
+        f'Maestral will confirm "{m.dropbox_path}" as the Dropbox folder. '
+        "Make sure that the correct drive or network mount is available."
+    )
+    echo(textwrap.fill(msg, width=get_term_size().columns) + "\n")
+
+    if yes or confirm("Do you want to continue?", default=False):
+        m.confirm_dropbox_directory()
+        ok("Dropbox folder confirmed.")
+
+
 @click.command(
     help="""
 Rebuild the sync index.

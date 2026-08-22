@@ -32,6 +32,7 @@ from .constants import (
     MIGNORE_FILE,
     OLD_REV_FILE,
     PAUSED,
+    ROOT_MARKER_FILE,
     SYNCING,
 )
 from .core import TeamRootInfo, UserRootInfo
@@ -193,6 +194,8 @@ class SyncManager:
         """Creates observer threads and starts syncing."""
         if self.running.is_set():
             return
+
+        self.sync.ensure_dropbox_folder_present()
 
         if not check_connection(DROPBOX_API_HOSTNAME, logger=self._logger):
             # Schedule autostart when connection becomes available.
@@ -397,6 +400,8 @@ class SyncManager:
 
         :returns: Whether the path root was updated.
         """
+        self.sync.ensure_dropbox_folder_present()
+
         if self._needs_path_root_update():
             was_running = self.running.is_set()
             self.stop()
@@ -433,7 +438,8 @@ class SyncManager:
         current_user_home_path_lower = normalize(current_user_home_path)
         current_user_home_name_lower = normalize(current_user_home_path.lstrip("/"))
         maestral_file_names = {
-            normalize(name) for name in (FILE_CACHE, MIGNORE_FILE, OLD_REV_FILE)
+            normalize(name)
+            for name in (FILE_CACHE, MIGNORE_FILE, OLD_REV_FILE, ROOT_MARKER_FILE)
         }
 
         if current_root_type == "team" and current_user_home_path == "":

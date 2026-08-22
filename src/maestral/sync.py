@@ -70,6 +70,7 @@ from .constants import (
     FILE_CACHE,
     IDLE,
     MIGNORE_FILE,
+    ROOT_MARKER_FILE,
 )
 from .core import (
     DeletedMetadata,
@@ -1173,10 +1174,11 @@ class SyncEngine:
 
     # ==== Helper functions ============================================================
 
-    def ensure_dropbox_folder_present(self) -> None:
+    def ensure_dropbox_folder_present(self, require_marker: bool = True) -> None:
         """
         Checks if the Dropbox folder still exists where we expect it to be.
 
+        :param require_marker: Whether the root marker must be present.
         :raises NoDropboxDirError: When local Dropbox directory does not exist.
         """
         exception = NoDropboxDirError(
@@ -1204,6 +1206,41 @@ class SyncEngine:
                     "or restart Maestral to set up a new folder."
                 )
                 raise NoDropboxDirError(title, msg)
+
+        if require_marker and not osp.isfile(
+            osp.join(self.dropbox_path, ROOT_MARKER_FILE)
+        ):
+            raise NoDropboxDirError(
+                "Dropbox folder not confirmed",
+                f'The folder does not contain "{ROOT_MARKER_FILE}". Check that the '
+                "correct drive or network mount is available. If this is an existing "
+                "Dropbox folder, confirm it before syncing.",
+            )
+
+    def create_root_marker(self) -> None:
+        """Creates the marker which identifies the configured Dropbox folder."""
+        self.ensure_dropbox_folder_present(require_marker=False)
+
+        marker_path = osp.join(self.dropbox_path, ROOT_MARKER_FILE)
+
+        with self.fs_events.ignore(
+            FileCreatedEvent(marker_path),
+            FileModifiedEvent(marker_path),
+        ):
+            try:
+                marker_fd = os.open(
+                    marker_path,
+                    os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                    0o600,
+                )
+            except FileExistsError:
+                if not osp.isfile(marker_path):
+                    raise
+            else:
+                try:
+                    os.fsync(marker_fd)
+                finally:
+                    os.close(marker_fd)
 
     def ensure_cache_dir_present(self) -> None:
         """
@@ -1685,6 +1722,8 @@ class SyncEngine:
         Collects changes while sync has not been running and uploads them to Dropbox.
         Call this method when resuming sync.
         """
+        self.ensure_dropbox_folder_present()
+
         with self.sync_lock:
             # Delete upload sync errors before starting indexing. This prevents errors
             # from now deleted or ignored (.mignore) items from lingering on. All other
@@ -1857,6 +1896,8 @@ class SyncEngine:
         Handles updating the local cursor for you. If monitoring for local file events
         was interrupted, call :meth:`upload_local_changes_while_inactive` instead.
         """
+        self.ensure_dropbox_folder_present()
+
         with self.sync_lock:
             changes, cursor = self.list_local_changes()
             self.apply_local_changes(changes)
@@ -2815,6 +2856,7 @@ class SyncEngine:
         :param dbx_path: Path relative to Dropbox folder.
         :returns: Whether download was successful.
         """
+        self.ensure_dropbox_folder_present()
         self._logger.info(f"Syncing ↓ {dbx_path}")
 
         with self.sync_lock:
@@ -2924,6 +2966,8 @@ class SyncEngine:
         Handles updating the remote cursor and resuming interrupted syncs for you.
         Calling this method will perform a full indexing if this is the first download.
         """
+        self.ensure_dropbox_folder_present()
+
         with self.sync_lock:
             if self.remote_cursor == "":
                 self._state.set("sync", "last_reindex", time.time())
