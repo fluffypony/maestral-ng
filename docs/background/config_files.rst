@@ -38,7 +38,7 @@ config file may be overwritten without warning if made while the sync daemon is 
 
     [app]
 
-    # Level for desktop notifications:
+    # Level for notifications from the desktop app:
     # 15 = FILECHANGE
     # 30 = SYNCISSUE
     # 40 = ERROR

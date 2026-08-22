@@ -23,7 +23,6 @@ urls = { Homepage = "https://maestral.app" }
 requires-python = ">=3.11"
 dependencies = [
     "click>=8.2.0",
-    "desktop-notifier>=5.0.0",
     "dropbox>=12.1.0,<13.0",
     "fasteners>=0.15",
     "keyring>=22",
@@ -32,7 +31,6 @@ dependencies = [
     "pathspec>=0.5.8",
     "requests>=2.16.2",
     "rich",
-    "rubicon-objc>=0.5;sys_platform=='darwin'",
     "typing_extensions",
     "watchdog>=2.0.1",
     "xattr",
@@ -43,10 +41,6 @@ file = "README.md"
 content-type = "text/markdown"
 
 [project.optional-dependencies]
-gui = [
-    "maestral-qt>=1.9.7.dev0;sys_platform=='linux'",
-    "maestral-cocoa>=1.9.7.dev0;sys_platform=='darwin'",
-]
 syslog = ["systemd-python"]
 lint = [
     "black",

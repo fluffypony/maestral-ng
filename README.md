@@ -39,8 +39,8 @@ or downloading a file if it already exists with the same content locally or in t
 
 ## Warning
 
-- Never sync a local folder with both the official Dropbox client and Maestral at the same
-  time.
+- Never point Maestral and the official Dropbox client at the same local folder, even if
+  you run only one client at a time. Give each client a separate folder.
 - Network drives and some external hard drives are not supported as locations for the
   Dropbox folder.
 
@@ -74,13 +74,9 @@ $ source maestral-venv/bin/activate
 (maestral-venv)$ python3 -m pip install --upgrade maestral
 ```
 
-If you intend to use the graphical user interface, you also need to specify the GUI option
-during installation or upgrade. This will install the `maestral-qt` frontend and `PyQt5`
-on Linux and `maestral-cocoa` on macOS:
-
-```console
-(maestral-venv)$ python3 -m pip install --upgrade 'maestral[gui]'
-```
+This package provides the headless daemon and command-line interface. Download the
+self-contained desktop app from [getmaestral.com](https://getmaestral.com). The app
+includes the daemon and does not need a separate Python installation.
 
 ### Docker image
 
@@ -93,12 +89,9 @@ $ docker pull maestraldbx/maestral
 
 ## Usage
 
-Run `maestral gui` in the command line (or open the Maestral app on macOS) to start
-Maestral with a graphical user interface. On its first run, Maestral will guide you
-through linking and configuring your Dropbox and will then start syncing.
-
-<img src="https://raw.githubusercontent.com/SamSchott/maestral-dropbox/master/screenshots/macOS_dark.png" alt="screenshot macOS" width="840"/>
-<img src="https://raw.githubusercontent.com/SamSchott/maestral-dropbox/master/screenshots/Ubuntu.png" alt="screenshot Fedora" width="840"/>
+Open the Maestral desktop app for guided setup. For a headless installation, run
+`maestral start`. The command-line setup links your Dropbox account, selects a local
+folder, and starts the sync daemon.
 
 ### Command line usage
 
@@ -106,7 +99,6 @@ After installation, Maestral will be available as a command line script by typin
 `maestral` in the command prompt. Type `maestral --help` to get a full list of available
 commands. The most important are:
 
-- `maestral gui`: Starts the Maestral GUI. Creates a sync daemon if not already running.
 - `maestral start|stop`: Starts or stops the Maestral sync daemon.
 - `maestral pause|resume`: Pauses or resumes syncing.
 - `maestral autostart -Y|-N`: Sets the daemon to start on log in.
@@ -118,7 +110,7 @@ commands. The most important are:
 
 Maestral supports syncing multiple Dropbox accounts by running multiple instances
 with different configuration files. This needs to be configured from the command
-line by passing the option `--config-name` to `maestral start` or `maestral gui`.
+line by passing the option `--config-name` to `maestral start`.
 Maestral will then select an existing config with the given name or create a new one.
 For example:
 

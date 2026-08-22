@@ -229,18 +229,11 @@ def test_daemon_logs_exception_without_args(monkeypatch):
     lock = Mock()
     lock.acquire.return_value = True
 
-    class BrokenPolicy:
-        def new_event_loop(self):
-            raise RuntimeError()
-
     monkeypatch.setattr(logging_module, "setup_logging", Mock())
     monkeypatch.setattr(logging_module, "scoped_logger", Mock(return_value=logger))
     monkeypatch.setattr(daemon_module, "maestral_lock", Mock(return_value=lock))
     monkeypatch.setattr(daemon_module, "SystemdNotifier", Mock(return_value=Mock()))
-    monkeypatch.setattr(daemon_module, "IS_MACOS", False)
-    monkeypatch.setattr(
-        asyncio, "get_event_loop_policy", Mock(return_value=BrokenPolicy())
-    )
+    monkeypatch.setattr(asyncio, "new_event_loop", Mock(side_effect=RuntimeError()))
 
     daemon_module.start_maestral_daemon("test-config")
 

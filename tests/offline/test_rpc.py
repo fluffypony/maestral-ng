@@ -237,7 +237,6 @@ def test_sync_event_longpoll(m):
 
 
 def test_app_snapshot_uses_cached_usage_and_deduplicates_history(m, monkeypatch):
-    m._dn = Mock(snoozed=0.0, notify_level=15)
     m.set_state("account", "usage_used", 123)
     m.set_state("account", "usage_allocated", 456)
     active = make_sync_event("/active.txt")

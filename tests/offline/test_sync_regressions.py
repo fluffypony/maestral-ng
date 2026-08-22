@@ -1,7 +1,7 @@
 import os
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock, call
+from unittest.mock import Mock
 
 import pytest
 
@@ -265,44 +265,6 @@ def test_parallel_download_setting_is_used(config_name: str, tmp_path: Path) -> 
         assert sync._parallel_up_semaphore._value == 5
     finally:
         sync._connection.close()
-
-
-def test_conflict_notifications_use_their_own_event(
-    sync_engine: SyncEngine, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    notifier = Mock()
-    sync_engine.desktop_notifier = notifier
-    sync_engine.client._cached_account_info = SimpleNamespace(account_id="self")
-    first = make_event(
-        "/local/first.txt",
-        "/first.txt",
-        change_type=ChangeType.Modified,
-        status=SyncStatus.Conflict,
-    )
-    second = make_event(
-        "/local/second.txt",
-        "/second.txt",
-        change_type=ChangeType.Modified,
-        status=SyncStatus.Conflict,
-    )
-    launch = Mock()
-    monkeypatch.setattr(sync_module.click, "launch", launch)
-
-    sync_engine.notify_user([first, second])
-
-    conflict_calls = notifier.notify.call_args_list[1:]
-    assert [notification.args[1] for notification in conflict_calls] == [
-        "Conflicting copy for first.txt",
-        "Conflicting copy for second.txt",
-    ]
-
-    for notification in conflict_calls:
-        notification.kwargs["on_click"]()
-
-    assert launch.call_args_list == [
-        call(first.local_path, locate=True),
-        call(second.local_path, locate=True),
-    ]
 
 
 def test_unicode_conflict_uses_unicode_suffix(

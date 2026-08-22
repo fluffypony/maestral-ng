@@ -42,8 +42,8 @@ Maestral processes remote events as follows:
    top-level events coming first. Deleted and folder events are processed in order,
    file events in parallel with up to 6 worker threads.
 
-4) :meth:`SyncEngine.notify_user`: Shows a desktop notification for the remote
-   changes.
+4) Completed changes are sent to the daemon event stream. The desktop app uses this
+   stream for activity and native notifications.
 
 Local file events come in eight types: For both files and folders we collect created,
 moved, modified and deleted events. They are processed as follows:

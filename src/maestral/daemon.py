@@ -493,25 +493,8 @@ def start_maestral_daemon(
     endpoint_path: str | None = None
 
     try:
-        # ==== System integration ======================================================
-        # Integrate with CFRunLoop in macOS.
-        event_loop_policy: asyncio.AbstractEventLoopPolicy
-        if IS_MACOS:
-            dlogger.debug("Integrating with CFEventLoop")
-
-            from rubicon.objc.runtime import load_library
-
-            load_library("AppKit")
-
-            from rubicon.objc.eventloop import EventLoopPolicy
-
-            event_loop_policy = EventLoopPolicy()
-
-        else:
-            event_loop_policy = asyncio.get_event_loop_policy()
-
         # Get the default event loop.
-        loop = event_loop_policy.new_event_loop()
+        loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
 
         # Notify systemd that we have started.

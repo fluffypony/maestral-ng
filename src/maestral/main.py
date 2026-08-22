@@ -78,7 +78,6 @@ from .logging import (
 )
 from .manager import SyncManager
 from .models import SyncErrorEntry, SyncEvent, SyncStatus
-from .notify import MaestralDesktopNotifier
 from .sync import SyncDirection, SyncEngine, pf_repr
 from .utils import get_newer_version
 from .utils.appdirs import get_cache_path, get_data_path
@@ -146,9 +145,7 @@ class Maestral:
     :param log_to_stderr: If ``True``, Maestral will print log messages to stderr.
         When started as a systemd services, this can result in duplicate log messages
         in the systemd journal. Defaults to ``False``.
-    :param event_loop: Event loop to use for any features that require an asyncio event
-        loop. If not given, those features will be disabled. This currently only affects
-        desktop notifications.
+    :param event_loop: Event loop used by ``shutdown_future``.
     :param shutdown_future: Feature to set a result when shutdown is complete. Used to
         inform the caller if an API client calls :method:`shutdown_daemon`. The event
         loop associated with the Future must be the same as ``event_loop``.
@@ -175,6 +172,7 @@ class Maestral:
         self._state = MaestralState(self.config_name)
         self._logger = scoped_logger(__name__, self.config_name)
         self.cred_storage = CredentialStorage(self.config_name)
+        self._notification_snooze_until = 0.0
 
         # Set up logging.
         self._log_to_stderr = log_to_stderr
@@ -186,11 +184,6 @@ class Maestral:
 
         # Run update scripts after init of loggers and config / state.
         self._check_and_run_post_update_scripts()
-
-        # Set up desktop notifier using event loop.
-        self._dn: MaestralDesktopNotifier | None = None
-        if self._loop:
-            self._dn = MaestralDesktopNotifier(self._config_name, self._loop)
 
         # Set up sync infrastructure.
         self.client = DropboxClient(
@@ -205,12 +198,8 @@ class Maestral:
             maxlen=100
         )
         self._sync_event_stream_closed = False
-        self.sync = SyncEngine(
-            self.client,
-            self._dn,
-            event_callback=self._publish_sync_events,
-        )
-        self.manager = SyncManager(self.sync, self._dn)
+        self.sync = SyncEngine(self.client, event_callback=self._publish_sync_events)
+        self.manager = SyncManager(self.sync)
 
         # Create a future which will return once `shutdown_daemon` is called.
         # This can be used by an event loop to wait until maestral has been stopped.
@@ -481,32 +470,23 @@ class Maestral:
 
     @property
     def notification_snooze(self) -> float:
-        """Snooze time for desktop notifications in minutes. Defaults to 0 if
-        notifications are not snoozed."""
-        if not self._dn:
-            raise RuntimeError("Desktop notifications require an event loop")
-        return self._dn.snoozed
+        """Remaining notification snooze time in minutes."""
+        return max(0.0, (self._notification_snooze_until - time.time()) / 60.0)
 
     @notification_snooze.setter
     def notification_snooze(self, minutes: float) -> None:
         """Setter: notification_snooze."""
-        if not self._dn:
-            raise RuntimeError("Desktop notifications require an event loop")
-        self._dn.snoozed = minutes
+        self._notification_snooze_until = time.time() + max(0.0, minutes) * 60.0
 
     @property
     def notification_level(self) -> int:
-        """Level for desktop notifications. See :mod:`notify` for level definitions."""
-        if not self._dn:
-            raise RuntimeError("Desktop notifications require an event loop")
-        return self._dn.notify_level
+        """Notification level used by the desktop app."""
+        return self._conf.get("app", "notification_level")
 
     @notification_level.setter
     def notification_level(self, level: int) -> None:
         """Setter: notification_level."""
-        if not self._dn:
-            raise RuntimeError("Desktop notifications require an event loop")
-        self._dn.notify_level = level
+        self._conf.set("app", "notification_level", level)
 
     @property
     def bandwidth_limit_down(self) -> float:

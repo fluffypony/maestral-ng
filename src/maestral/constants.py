@@ -3,39 +3,16 @@ This module provides constants used throughout the maestral, the GUI and CLI. It
 be kept free of memory heavy imports.
 """
 
-import pathlib
 import platform
 
 # system imports
 import sys
 from enum import Enum
-from importlib.metadata import PackageNotFoundError, metadata
-from importlib.resources import as_file, files
-from typing import ContextManager
-
-
-def resource_path(package: str, resource: str) -> ContextManager[pathlib.Path]:
-    return as_file(files(package) / resource)
-
 
 FROZEN = getattr(sys, "frozen", False)
 
-for package in (
-    __package__,
-    "maestral",
-    "maestral-cocoa",
-    "maestral-qt",
-    "maestral-gui",
-):
-    try:
-        FROZEN = "Briefcase-Version" in metadata(package) or FROZEN
-    except PackageNotFoundError:
-        pass
-
 # app
-APP_NAME = "Maestral"
 BUNDLE_ID = "com.samschott.maestral"
-APP_ICON_PATH = resource_path("maestral.resources", "maestral.png").__enter__()
 ENV = {"PYTHONOPTIMIZE": "2", "LC_CTYPE": "UTF-8"}
 DEFAULT_CONFIG_NAME = "maestral"
 

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import sys
 import threading
 from datetime import datetime
 from os import path as osp
@@ -259,60 +258,6 @@ def start(foreground: bool, verbose: bool, config_name: str) -> None:
 @existing_config_option
 def stop(config_name: str) -> None:
     stop_daemon_with_cli_feedback(config_name)
-
-
-@click.command(help="Run the GUI if installed.")
-@config_option
-def gui(config_name: str) -> None:
-    import termios
-    from importlib.metadata import entry_points, requires, version
-
-    from packaging.requirements import Requirement
-    from packaging.version import Version
-
-    from ..daemon import start_maestral_daemon_process
-
-    # Find all entry points for "maestral_gui" registered by other packages.
-    gui_entry_points = entry_points(group="maestral_gui")
-
-    if len(gui_entry_points) == 0:
-        raise CliException(
-            "No maestral GUI installed. Please run 'pip3 install maestral[gui]'."
-        )
-
-    entry_point_names = [e.name for e in gui_entry_points]
-
-    if len(entry_point_names) > 1 and sys.stdout.isatty():
-        try:
-            index = select("Multiple GUIs found, please choose:", entry_point_names)
-        except termios.error:
-            # Error can occur when not connected to a terminal. Fall back to the first
-            # detected GUI instead of failing with an error.
-            index = 0
-    else:
-        index = 0
-
-    entry_point = gui_entry_points[entry_point_names[index]]
-
-    if entry_point.name in {"maestral_cocoa", "maestral_qt"}:
-        # For 1st party GUIs "maestral_cocoa" or "maestral_qt", check if the installed
-        # version fulfills requirements in maestral's gui extra.
-        requirement_names = requires("maestral")
-        if requirement_names is not None:
-            for name in requirement_names:
-                r = Requirement(name)
-                if r.marker and r.marker.evaluate({"extra": "gui"}):
-                    version_str = version(r.name)
-                    if not r.specifier.contains(Version(version_str), prereleases=True):
-                        raise CliException(
-                            f"{r.name}{r.specifier} required but you have {version_str}"
-                        )
-    # Start the daemon
-    res = start_maestral_daemon_process(config_name)
-
-    # Run the GUI.
-    run = entry_point.load()
-    run(config_name, res)
 
 
 @click.command(help="Pause syncing.")

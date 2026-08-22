@@ -14,7 +14,6 @@ import sqlite3
 import sys
 import threading
 import time
-import urllib.parse
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
@@ -38,7 +37,6 @@ from typing import (
 )
 
 # external imports
-import click
 from pathspec import PathSpec
 from pathspec.pattern import Pattern
 from typing_extensions import ParamSpec, TypeGuard
@@ -61,7 +59,6 @@ from watchdog.events import (
 )
 
 # local imports
-from . import notify
 from .client import DropboxClient
 from .config import MaestralConfig, MaestralState
 from .constants import (
@@ -537,7 +534,7 @@ class SyncEngine:
     conflict resolution and updates to our index.
 
     :param client: Dropbox API client instance.
-    :param desktop_notifier: Desktop notifier instance to use for user notifications.
+    :param event_callback: Called with each completed batch of sync events.
     """
 
     _max_history = 1000
@@ -545,7 +542,6 @@ class SyncEngine:
     def __init__(
         self,
         client: DropboxClient,
-        desktop_notifier: notify.MaestralDesktopNotifier | None = None,
         event_callback: Callable[[Sequence[SyncEvent]], None] | None = None,
     ) -> None:
         self.client = client
@@ -557,7 +553,6 @@ class SyncEngine:
         self._state = MaestralState(self.config_name)
         self.reload_cached_config()
 
-        self.desktop_notifier = desktop_notifier
         self.event_callback = event_callback
 
         # Synchronization
@@ -1301,10 +1296,6 @@ class SyncEngine:
                     raise exc
 
                 self._logger.error(exc.title, exc_info=exc_info_tuple(exc))
-                if self.desktop_notifier:
-                    self.desktop_notifier.notify(
-                        exc.title, exc.message, level=notify.ERROR
-                    )
 
     def _new_tmp_file(self) -> str:
         """Creates a new temporary file in our cache directory and returns its path."""
@@ -1610,22 +1601,6 @@ class SyncEngine:
 
         self._logger.info("Could not sync %s", printable_file_name, exc_info=True)
 
-        def callback() -> None:
-            if err.local_path:
-                click.launch(err.local_path, locate=True)
-            elif err.dbx_path:
-                url_path = urllib.parse.quote(err.dbx_path)
-                click.launch(f"https://www.dropbox.com/preview{url_path}")
-
-        if self.desktop_notifier:
-            self.desktop_notifier.notify(
-                "Sync error",
-                f"Could not {direction.value}load {printable_file_name}",
-                level=notify.SYNCISSUE,
-                actions={"Show": callback},
-                on_click=callback,
-            )
-
         # Save sync errors to retry later.
 
         dbx_path_lower = normalize(err.dbx_path)
@@ -1690,8 +1665,6 @@ class SyncEngine:
             if raise_error:
                 raise new_exc
             self._logger.error(title, exc_info=exc_info_tuple(new_exc))
-            if self.desktop_notifier:
-                self.desktop_notifier.notify(title, msg, level=notify.ERROR)
 
     def _clear_caches(self) -> None:
         """
@@ -1901,9 +1874,6 @@ class SyncEngine:
         with self.sync_lock:
             changes, cursor = self.list_local_changes()
             self.apply_local_changes(changes)
-
-            conflicts = [e for e in changes if e.status is SyncStatus.Conflict]
-            self.notify_user(conflicts)
 
             self.local_cursor = cursor
 
@@ -2999,10 +2969,6 @@ class SyncEngine:
                 self.remote_cursor = cursor
                 self._state.set("sync", "indexing_counter", idx)
 
-                # Send desktop notifications when not indexing.
-                if not is_indexing:
-                    self.notify_user(downloaded)
-
                 if self._cancel_requested.is_set():
                     raise CancelledError("Sync cancelled")
 
@@ -3155,110 +3121,6 @@ class SyncEngine:
             self.event_callback(completed)
 
         return results
-
-    def notify_user(self, sync_events: Sequence[SyncEvent]) -> None:
-        """
-        Shows a desktop notification for the given file changes.
-
-        :param sync_events: List of SyncEvents from download sync.
-        """
-        if not self.desktop_notifier:
-            return
-
-        changes: list[SyncEvent] = []
-        events_conflict: list[SyncEvent] = []
-
-        for event in sync_events:
-            if event.status is not SyncStatus.Skipped:
-                changes.append(event)
-            if event.status is SyncStatus.Conflict:
-                events_conflict.append(event)
-
-        # Get number of remote changes.
-        n_changed = len(changes)
-
-        if n_changed == 0:
-            return
-
-        # Find out who changed the item(s).
-        user_name: str | None
-        dbid_set = {e.change_dbid for e in changes}
-        if len(dbid_set) == 1:
-            # All files have been modified by the same user
-            dbid = dbid_set.pop()
-            if dbid == self.client.account_info.account_id:
-                user_name = "You"
-            else:
-                user_name = self._display_name_for_account(dbid)
-        else:
-            # Don't display multiple usernames in notification.
-            user_name = None
-
-        buttons: dict[str, Callable[[], None]]
-
-        if n_changed == 1:
-            # Display the username, file name, and type of change in notification.
-            event = changes[0]
-            file_name = osp.basename(event.dbx_path)
-            change_type = event.change_type.value
-
-            def callback() -> None:
-                click.launch(event.local_path, locate=True)
-
-            buttons = {"Show": callback}
-
-        else:
-            # Display the number of files changed and potentially the type of change in
-            # notification.
-
-            if all(e.change_type == sync_events[0].change_type for e in sync_events):
-                change_type = sync_events[0].change_type.value
-            else:
-                change_type = "changed"
-
-            if all(e.is_file for e in sync_events):
-                file_name = f"{n_changed} files"
-            elif all(e.is_directory for e in sync_events):
-                file_name = f"{n_changed} folders"
-            else:
-                file_name = f"{n_changed} items"
-
-            def callback() -> None:
-                pass
-
-            buttons = {}
-
-        if change_type == ChangeType.Removed.value:
-
-            def callback() -> None:
-                # Show Dropbox website with deleted files.
-                click.launch("https://www.dropbox.com/deleted_files")
-
-            buttons = {"Show": callback}
-
-        if user_name:
-            msg = f"{user_name} {change_type} {file_name}"
-        else:
-            msg = f"{file_name} {change_type}"
-
-        # Notify in bulk for all batched changes.
-        self.desktop_notifier.notify(
-            "Items synced", msg, actions=buttons, on_click=callback
-        )
-
-        # Notify separately for each sync conflict.
-        for event in events_conflict:
-
-            def conflict_callback(event: SyncEvent = event) -> None:
-                click.launch(event.local_path, locate=True)
-
-            file_name = osp.basename(event.dbx_path)
-            self.desktop_notifier.notify(
-                "Sync conflict",
-                f"Conflicting copy for {file_name}",
-                actions={"Show": conflict_callback},
-                on_click=conflict_callback,
-            )
 
     def _display_name_for_account(self, dbid: str | None) -> str | None:
         """
