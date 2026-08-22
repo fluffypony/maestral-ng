@@ -130,6 +130,43 @@ def test_upload_body_can_be_reused_after_sdk_retry(client):
     assert b"".join(body) == b"content"
 
 
+def test_dropbox_sdk_rate_limit_retry_resends_upload_body(client):
+    sdk = object.__new__(client_module._DropboxSDK)
+    sdk._logger = Mock()
+    sdk._max_retries_on_error = 0
+    sdk._max_retries_on_rate_limit = 1
+    attempts = []
+
+    def request_json_string(
+        host,
+        route_name,
+        route_style,
+        request_json_arg,
+        auth_type,
+        request_binary,
+        **kwargs,
+    ):
+        attempts.append(b"".join(request_binary))
+        if len(attempts) == 1:
+            raise client_module.exceptions.RateLimitError("request", backoff=0)
+        return "ok"
+
+    sdk.request_json_string = request_json_string
+    body = client._reusable_upload_body(b"content")
+
+    result = sdk.request_json_string_with_retry(
+        "content",
+        "files/upload",
+        "upload",
+        b"{}",
+        "user",
+        body,
+    )
+
+    assert result == "ok"
+    assert attempts == [b"content", b"content"]
+
+
 @pytest.mark.parametrize(
     "allocation",
     [
