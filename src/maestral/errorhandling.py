@@ -713,16 +713,27 @@ def get_lookup_error_msg(
 
 
 def get_session_lookup_error_msg(
-    session_lookup_error: files.UploadSessionLookupError,
+    session_lookup_error: (
+        files.UploadSessionLookupError | files.UploadSessionAppendError
+    ),
 ) -> tuple[str, type[SyncError]]:
     err_cls = SyncError
 
-    if session_lookup_error.is_closed():
+    if (
+        isinstance(session_lookup_error, files.UploadSessionAppendError)
+        and session_lookup_error.is_content_hash_mismatch()
+    ):
+        text = "A network error occurred during the upload session."
+        err_cls = DataCorruptionError
+    elif session_lookup_error.is_closed():
         text = "Cannot append data to a closed upload session."
     elif session_lookup_error.is_incorrect_offset():
         text = "A network error occurred during the upload session."
         err_cls = DataCorruptionError
-    elif session_lookup_error.is_not_closed():
+    elif (
+        isinstance(session_lookup_error, files.UploadSessionLookupError)
+        and session_lookup_error.is_not_closed()
+    ):
         text = "Upload session is still open, cannot finish."
     elif session_lookup_error.is_not_found():
         text = (
@@ -734,12 +745,6 @@ def get_session_lookup_error_msg(
         err_cls = FileSizeError
     elif session_lookup_error.is_payload_too_large():
         text = "Can only upload in chunks of at most 150 MB."
-    elif (
-        isinstance(session_lookup_error, files.UploadSessionAppendError)
-        and session_lookup_error.is_content_hash_mismatch()
-    ):
-        text = "A network error occurred during the upload session."
-        err_cls = DataCorruptionError
     else:
         text = "An unexpected error occurred. Please try again later."
 

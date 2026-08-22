@@ -136,8 +136,8 @@ def is_fs_case_sensitive(path: str) -> bool:
     :param path: Path to check.
     :returns: Whether ``path`` lies on a partition with a case-sensitive file system.
     """
-    if path == osp.pathsep:
-        raise ValueError(f"Cannot check '{osp.pathsep}'")
+    if path == osp.sep:
+        raise ValueError(f"Cannot check '{osp.sep}'")
 
     if path.islower():
         check_path = path.upper()
@@ -339,10 +339,15 @@ def delete(
     """
     err: Optional[OSError] = None
 
-    if force_case_sensitive and not equal_but_for_unicode_norm(
-        path, to_existing_unnormalized_path(path)
-    ):
-        err = FileNotFoundError(f"No such file '{path}'")
+    try:
+        if force_case_sensitive and not equal_but_for_unicode_norm(
+            path, to_existing_unnormalized_path(path)
+        ):
+            err = FileNotFoundError(f"No such file '{path}'")
+    except OSError as exc:
+        err = exc
+
+    if err:
         if raise_error:
             raise err
         else:
@@ -432,7 +437,14 @@ def walk(
     :param listdir: Function to call to get the folder content.
     :returns: Iterator over (path, stat) results.
     """
-    for entry in listdir(os.fsdecode(root)):
+    try:
+        entries = listdir(os.fsdecode(root))
+    except OSError as exc:
+        if exc.errno in (errno.ENOENT, errno.ENOTDIR, errno.EINVAL):
+            return
+        raise
+
+    for entry in entries:
         try:
             path = entry.path
             stat = entry.stat(follow_symlinks=False)
@@ -449,7 +461,7 @@ def walk(
             # with a file of the same name (less likely, but possible), it will be
             # treated as empty.
             if exc.errno in (errno.ENOENT, errno.ENOTDIR, errno.EINVAL):
-                return
+                continue
             else:
                 raise
 
@@ -515,9 +527,9 @@ def fs_max_lengths_for_path(path: str = "/") -> Tuple[int, int]:
 
     while True:
         try:
-            max_char_path = os.pathconf(dirname, "PC_PATH_MAX")
             max_char_name = os.pathconf(dirname, "PC_NAME_MAX")
-            return max_char_path, max_char_name
+            max_char_path = os.pathconf(dirname, "PC_PATH_MAX")
+            return max_char_name, max_char_path
         except (FileNotFoundError, NotADirectoryError):
             dirname = osp.dirname(dirname)
         except ValueError:

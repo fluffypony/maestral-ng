@@ -108,11 +108,15 @@ def select_dbx_path_dialog(
             return dropbox_path
 
 
-def link_dialog(m: MaestralProxy | Maestral) -> None:
+def link_dialog(
+    m: MaestralProxy | Maestral, allow_plaintext_keyring: bool = False
+) -> None:
     """
     A CLI dialog for linking a Dropbox account.
 
     :param m: Proxy to Maestral daemon.
+    :param allow_plaintext_keyring: Whether to allow storage of the refresh token in
+        plain text when no secure keyring is available.
     """
     authorize_url = m.get_auth_url()
 
@@ -134,7 +138,7 @@ def link_dialog(m: MaestralProxy | Maestral) -> None:
         auth_code = prompt("Enter the auth code:")
         auth_code = auth_code.strip()
 
-        res = m.link(auth_code)
+        res = m.link(auth_code, allow_plaintext_keyring=allow_plaintext_keyring)
 
         if res == 0:
             email = m.get_state("account", "email")
@@ -245,9 +249,10 @@ def start(foreground: bool, verbose: bool, config_name: str) -> None:
             echo("\rStarting Maestral...        " + "Already running.")
         else:
             echo("\rStarting Maestral...        " + FAILED)
-            echo("Please check logs for more information.")
+            raise CliException("Please check logs for more information.")
 
-        startup_dialog()
+        if res == Start.Ok:
+            startup_dialog()
 
 
 @click.command(help="Stop the sync daemon.")
@@ -260,8 +265,8 @@ def stop(config_name: str) -> None:
 @config_option
 def gui(config_name: str) -> None:
     import termios
-
     from importlib.metadata import entry_points, requires, version
+
     from packaging.requirements import Requirement
     from packaging.version import Version
 
@@ -348,16 +353,30 @@ def auth() -> None:
     hidden=True,
     help="Access token to bypass OAuth exchange.",
 )
+@click.option(
+    "--allow-plaintext-keyring",
+    is_flag=True,
+    default=False,
+    help="Allow plain text token storage if no secure keyring is available.",
+)
 @inject_proxy(fallback=True, existing_config=False)
 @convert_api_errors
 def auth_link(
-    m: Maestral, relink: bool, refresh_token: str | None, access_token: str | None
+    m: Maestral,
+    relink: bool,
+    refresh_token: str | None,
+    access_token: str | None,
+    allow_plaintext_keyring: bool,
 ) -> None:
     if m.pending_link or relink:
         if refresh_token or access_token:
-            m.link(refresh_token=refresh_token, access_token=access_token)
+            m.link(
+                refresh_token=refresh_token,
+                access_token=access_token,
+                allow_plaintext_keyring=allow_plaintext_keyring,
+            )
         else:
-            link_dialog(m)
+            link_dialog(m, allow_plaintext_keyring=allow_plaintext_keyring)
     else:
         echo(
             "Maestral is already linked. Use '-r' to relink to the same "

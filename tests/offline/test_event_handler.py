@@ -5,11 +5,12 @@ from watchdog.events import (
     DirCreatedEvent,
     DirModifiedEvent,
     DirMovedEvent,
+    FileModifiedEvent,
     FileMovedEvent,
 )
 
 from maestral.models import ChangeType, ItemType
-from maestral.sync import SyncDirection, SyncEngine
+from maestral.sync import FSEventHandler, SyncDirection, SyncEngine
 from maestral.utils.path import move
 
 
@@ -60,6 +61,14 @@ def test_fs_ignore_tree_creation(sync: SyncEngine) -> None:
     sync.wait_for_local_changes(timeout=1)
     sync_events, _ = sync.list_local_changes()
     assert len(sync_events) == 0
+
+
+def test_recursive_ignore_accepts_child_event_with_different_type() -> None:
+    handler = FSEventHandler()
+
+    with handler.ignore(DirCreatedEvent("/parent")):
+        assert handler._is_ignored(FileModifiedEvent("/parent/file.txt"))
+        assert not handler._is_ignored(FileModifiedEvent("/other/file.txt"))
 
 
 def test_fs_ignore_tree_move(sync: SyncEngine) -> None:

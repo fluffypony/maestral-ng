@@ -88,7 +88,9 @@ class DropboxContentHasher:
         c = DropboxContentHasher.__new__(DropboxContentHasher)
         c._overall_hasher = self._overall_hasher.copy()
         c._block_hasher = self._block_hasher.copy()
+        c._digested = self._digested
         c._block_pos = self._block_pos
+        c.digest_size = self.digest_size
         return c
 
 

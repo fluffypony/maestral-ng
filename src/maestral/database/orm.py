@@ -395,6 +395,7 @@ class Manager(Generic[M]):
         if self.has(pk_sql):
             sql_vals = (col.py_to_sql(getattr(obj, col.name)) for col in self._columns)
             self.db.execute(self._sql_update_template, *(list(sql_vals) + [pk_sql]))
+            self._cache[pk_sql] = obj
         else:
             self.save(obj)
 

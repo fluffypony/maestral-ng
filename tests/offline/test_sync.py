@@ -107,6 +107,18 @@ def test_activity_tree_failed_replaced() -> None:
     assert_tree_integrity(tree)
 
 
+def test_activity_tree_get_events_returns_snapshot() -> None:
+    tree = ActivityTree()
+    tree.add(EVENT1)
+
+    events = tree.get_events("/d0")
+    tree.add(EVENT2)
+
+    assert events == (EVENT1,)
+    assert set(tree.get_events("/d0")) == {EVENT1, EVENT2}
+    assert tree.get_events("/missing") == ()
+
+
 def assert_in_tree(tree: ActivityTree, event: SyncEvent) -> None:
     assert event in tree.sync_events
     assert tree.has_path(event.dbx_path)

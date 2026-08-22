@@ -1146,7 +1146,7 @@ def test_local_permission_error(m: Maestral) -> None:
 def test_long_path_error(m: Maestral) -> None:
     """Tests error handling on trying to download an item with a too long path."""
 
-    max_path_length, _ = fs_max_lengths_for_path()
+    _, max_path_length = fs_max_lengths_for_path()
 
     # Create a remote file with a path name longer than locally allowed.
     test_path = "/nested" * (max_path_length // 6)

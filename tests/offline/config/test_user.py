@@ -1,4 +1,6 @@
 import configparser as cp
+import os
+from unittest import mock
 
 import pytest
 from packaging.version import Version
@@ -6,6 +8,13 @@ from packaging.version import Version
 from maestral.config.user import UserConfig
 
 from .conftest import CONF_VERSION, DEFAULTS_CONFIG
+
+
+def fresh_defaults():
+    return {
+        "auth": {"account_id": "default", "keyring": "automatic"},
+        "sync": {"path": "", "excluded_items": [], "upload": True},
+    }
 
 
 def test_config_creation(config):
@@ -84,3 +93,100 @@ def test_update(config):
 
         with pytest.raises(cp.NoOptionError):
             conf.get("sync", "path")
+
+
+def test_save_is_atomic_when_replace_fails(tmp_path):
+    config_path = tmp_path / "atomic.ini"
+    config = UserConfig(
+        str(config_path),
+        defaults=fresh_defaults(),
+        version=CONF_VERSION,
+        backup=True,
+    )
+    original_contents = config_path.read_bytes()
+
+    with mock.patch(
+        "maestral.config.user.os.replace", side_effect=OSError("replace failed")
+    ):
+        with pytest.raises(OSError, match="replace failed"):
+            config.set("auth", "account_id", "new value")
+
+    assert config_path.read_bytes() == original_contents
+    assert list(tmp_path.glob(".atomic.ini.*")) == []
+
+
+@pytest.mark.parametrize(
+    "corrupt_contents",
+    [
+        "[main]\nversion = invalid-version\n",
+        "[main]\nversion = 1.0.0\n[auth]\naccount_id = first\n"
+        "[auth]\naccount_id = second\n",
+    ],
+)
+def test_load_recovers_from_backup(tmp_path, corrupt_contents):
+    config_path = tmp_path / "recover.ini"
+    defaults = fresh_defaults()
+    config = UserConfig(
+        str(config_path),
+        defaults=defaults,
+        version=CONF_VERSION,
+        backup=True,
+    )
+    config.set("auth", "account_id", "from backup")
+
+    UserConfig(
+        str(config_path),
+        defaults=defaults,
+        version=CONF_VERSION,
+        backup=True,
+    )
+    config_path.write_text(corrupt_contents, encoding="utf-8")
+
+    recovered = UserConfig(
+        str(config_path),
+        defaults=defaults,
+        version=CONF_VERSION,
+        backup=True,
+    )
+
+    assert recovered.get("auth", "account_id") == "from backup"
+    assert recovered.get_version() == CONF_VERSION
+
+
+def test_load_corrupt_config_without_backup_uses_defaults(tmp_path):
+    config_path = tmp_path / "defaults.ini"
+    config_path.write_text("[main]\nversion = invalid-version\n", encoding="utf-8")
+
+    config = UserConfig(
+        str(config_path),
+        defaults=fresh_defaults(),
+        version=CONF_VERSION,
+        backup=True,
+    )
+
+    assert config.get("auth", "account_id") == "default"
+    assert config.get_version() == CONF_VERSION
+
+
+def test_cleanup_preserves_other_config_backups(tmp_path):
+    work_path = tmp_path / "work.ini"
+    work2_path = tmp_path / "work2.ini"
+    defaults = fresh_defaults()
+
+    work = UserConfig(
+        str(work_path), defaults=defaults, version=CONF_VERSION, backup=True
+    )
+    UserConfig(str(work2_path), defaults=defaults, version=CONF_VERSION, backup=True)
+
+    UserConfig(str(work_path), defaults=defaults, version=CONF_VERSION, backup=True)
+    work2_reloaded = UserConfig(
+        str(work2_path), defaults=defaults, version=CONF_VERSION, backup=True
+    )
+    work2_backup = work2_reloaded.backup_path_for_version(None)
+
+    work.cleanup()
+
+    assert work2_path.exists()
+    assert os.path.exists(work2_backup)
+
+    work2_reloaded.cleanup()

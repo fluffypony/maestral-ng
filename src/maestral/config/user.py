@@ -17,10 +17,11 @@ import logging
 import os
 import os.path as osp
 import shutil
+import tempfile
 from threading import RLock
-from typing import Any, Dict, Iterator, MutableSet, TypeVar, Iterable
+from typing import Any, Dict, Iterable, Iterator, MutableSet, TypeVar
 
-from packaging.version import Version
+from packaging.version import InvalidVersion, Version
 
 logger = logging.getLogger(__name__)
 
@@ -70,8 +71,28 @@ class DefaultsConfig(cp.ConfigParser):
         """Save config into the associated file."""
         os.makedirs(self._dirname, exist_ok=True)
 
-        with open(self.config_path, "w", encoding="utf-8") as configfile:
-            self.write(configfile)
+        temp_path = ""
+
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=self._dirname,
+                prefix=f".{osp.basename(self.config_path)}.",
+                delete=False,
+            ) as configfile:
+                temp_path = configfile.name
+                self.write(configfile)
+                configfile.flush()
+                os.fsync(configfile.fileno())
+
+            os.replace(temp_path, self.config_path)
+        finally:
+            if temp_path:
+                try:
+                    os.unlink(temp_path)
+                except FileNotFoundError:
+                    pass
 
     @property
     def config_path(self) -> str:
@@ -128,22 +149,25 @@ class UserConfig(DefaultsConfig):
         self._backup_folder = "backups"
         self._backup_suffix = "bak"
 
-        if backup:
-            self._make_backup()
-
         if load:
             # If config file already exists, it overrides Default options.
-            self._load_from_ini(self.config_path)
+            loaded_from_primary = self._load_from_ini(self.config_path)
 
-            try:
-                old_version = self.get_version()
-            except cp.NoOptionError:
-                old_version = version
+            if not loaded_from_primary:
+                backup_path = self.backup_path_for_version(None)
+                loaded_from_backup = self._load_from_ini(backup_path)
+
+                if loaded_from_backup:
+                    logger.warning("Restored config from backup: %s", backup_path)
+            elif backup:
+                self._make_backup()
+
+            old_version = self.get_version()
 
             # Updating defaults only if major/minor version is different.
 
             if version != old_version:
-                if backup:
+                if backup and loaded_from_primary:
                     self._make_backup(old_version)
 
                 self.apply_configuration_patches(old_version)
@@ -189,26 +213,41 @@ class UserConfig(DefaultsConfig):
         :param version: If a version is provided, it will be appended to the backup
             file name.
         """
-        os.makedirs(self._dirname, exist_ok=True)
         backup_path = self.backup_path_for_version(version)
+        os.makedirs(osp.dirname(backup_path), exist_ok=True)
 
         try:
             shutil.copyfile(self.config_path, backup_path)
         except OSError:
             pass
 
-    def _load_from_ini(self, path: str) -> None:
+    def _load_from_ini(self, path: str) -> bool:
         """
         Loads the configuration from the given path. Overwrites any current values
         stored in memory.
 
         :param path: Path of config file to load.
+        :returns: Whether a valid config file was loaded.
         """
         with self._lock:
             try:
-                self.read(path, encoding="utf-8")
-            except cp.MissingSectionHeaderError:
-                logger.error("File contains no section headers.")
+                loaded_paths = self.read(path, encoding="utf-8")
+                if not loaded_paths:
+                    return False
+
+                self.get_version()
+            except (cp.Error, InvalidVersion, UnicodeError):
+                logger.error("Could not load config file: %s", path, exc_info=True)
+                super().clear()
+                self.reset_to_defaults(save=False)
+                return False
+
+            return True
+
+    def save(self) -> None:
+        """Atomically save the config into its associated file."""
+        with self._lock:
+            super().save()
 
     def remove_deprecated_options(self, save: bool = True) -> None:
         """
@@ -448,7 +487,23 @@ class UserConfig(DefaultsConfig):
             # remove saved backups
             if osp.isdir(backup_path):
                 for file in os.scandir(backup_path):
-                    if file.name.startswith(self._filename):
+                    backup_ending = f".{self._suffix}.{self._backup_suffix}"
+                    unversioned_name = f"{self._filename}{backup_ending}"
+                    version_prefix = f"{self._filename}-"
+                    version_str = file.name[len(version_prefix) : -len(backup_ending)]
+
+                    is_unversioned = file.name == unversioned_name
+                    is_versioned = file.name.startswith(
+                        version_prefix
+                    ) and file.name.endswith(backup_ending)
+
+                    if is_versioned:
+                        try:
+                            Version(version_str)
+                        except InvalidVersion:
+                            is_versioned = False
+
+                    if is_unversioned or is_versioned:
                         try:
                             os.remove(file.path)
                         except FileNotFoundError:

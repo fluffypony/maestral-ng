@@ -40,6 +40,7 @@ from typing import (
 # external imports
 import click
 from pathspec import PathSpec
+from pathspec.pattern import Pattern
 from typing_extensions import ParamSpec, TypeGuard
 from watchdog.events import (
     EVENT_TYPE_CREATED,
@@ -337,9 +338,6 @@ class FSEventHandler(FileSystemEventHandler):
             # events, source and destination path most both be children of the
             # respective paths of the event to ignore.
             elif recursive:
-                if not event.event_type == ignore_event.event_type:
-                    continue
-
                 if not is_equal_or_child(event.src_path, ignore_event.src_path):
                     continue
 
@@ -509,6 +507,12 @@ class ActivityTree(ActivityNode):
     def has_path(self, dbx_path: str) -> bool:
         return self.get_node(dbx_path) is not None
 
+    def get_events(self, dbx_path: str = "/") -> tuple[SyncEvent, ...]:
+        """Return a stable snapshot of activity at *dbx_path*."""
+        with self._lock:
+            node = self.get_node(dbx_path)
+            return tuple(node.sync_events) if node else ()
+
     def get_node(self, dbx_path: str) -> ActivityNode | None:
         if dbx_path == "/":
             return self
@@ -557,7 +561,7 @@ class SyncEngine:
         self.sync_lock = RLock()  # Upload and download cycles.
         self._db_lock = RLock()  # DB access.
         self._tree_traversal = RLock()  # Sync activity across multiple levels.
-        max_parallel_downloads = self._conf.get("app", "max_parallel_uploads")
+        max_parallel_downloads = self._conf.get("app", "max_parallel_downloads")
         self._parallel_down_semaphore = threading.Semaphore(max_parallel_downloads)
         max_parallel_uploads = self._conf.get("app", "max_parallel_uploads")
         self._parallel_up_semaphore = threading.Semaphore(max_parallel_uploads)
@@ -628,7 +632,7 @@ class SyncEngine:
     def _check_fs_case_sensitive(self) -> bool:
         try:
             return is_fs_case_sensitive(self._dropbox_path)
-        except (FileNotFoundError, NotADirectoryError):
+        except (FileNotFoundError, NotADirectoryError, ValueError):
             # Fall back to the assumption of a case-sensitive file system.
             return True
 
@@ -1145,7 +1149,7 @@ class SyncEngine:
         return self._mignore_path
 
     @property
-    def mignore_rules(self) -> PathSpec:
+    def mignore_rules(self) -> PathSpec[Pattern]:
         """List of mignore rules following git wildmatch syntax (read only)."""
         return self._mignore_rules
 
@@ -2028,7 +2032,8 @@ class SyncEngine:
                 # and dest paths, to be recombined later.
                 if event in moved_from_to:
                     dest_path = moved_from_to[event].src_path
-                    if len(events_for_path[dest_path]) == 1:
+                    dest_events = events_for_path.get(dest_path)
+                    if dest_events is not None and len(dest_events) == 1:
                         moved_events_to_recombine.append(event)
 
             else:
@@ -2226,7 +2231,9 @@ class SyncEngine:
             # Check if we have a case conflict or a unicode conflict.
             if normalize_case(event.local_path) == normalize_case(conflict_path):
                 suffix = "case conflict"
-            elif normalize_unicode(event.local_path) == normalize_case(conflict_path):
+            elif normalize_unicode(event.local_path) == normalize_unicode(
+                conflict_path
+            ):
                 suffix = "unicode conflict"
             else:
                 suffix = "normalization conflict"
@@ -2387,13 +2394,18 @@ class SyncEngine:
                 local_path_from.encode(),
                 event.local_path.encode(),
             )
+            return SyncStatus.Skipped
 
         # If a file at the destination should be replaced, remove it first, but only if
         # its rev matches the rev of the local overwritten file.
         # The Dropbox API does not allow overwriting a destination file during a move.
         local_entry = self.get_index_entry(event.dbx_path_lower)
 
-        if local_entry and local_entry.is_file:
+        if (
+            local_entry
+            and local_entry.is_file
+            and event.dbx_path_from_lower != event.dbx_path_lower
+        ):
             try:
                 self.client.remove(
                     local_entry.dbx_path_lower, parent_rev=local_entry.rev
@@ -2837,6 +2849,7 @@ class SyncEngine:
         with self.sync_lock:
             try:
                 idx = 0
+                success = True
 
                 # Iterate over index and download results.
                 list_iter = self.client.list_folder_iterator(dbx_path, recursive=True)
@@ -2855,10 +2868,11 @@ class SyncEngine:
                     ]
                     download_res = self.apply_remote_changes(sync_events)
 
-                    success = all(
+                    page_success = all(
                         e.status in (SyncStatus.Done, SyncStatus.Skipped)
                         for e in download_res
                     )
+                    success = success and page_success
 
                     if self._cancel_requested.is_set():
                         raise CancelledError("Sync cancelled")
@@ -3177,14 +3191,15 @@ class SyncEngine:
         # Notify separately for each sync conflict.
         for event in events_conflict:
 
-            def callback() -> None:
+            def conflict_callback(event: SyncEvent = event) -> None:
                 click.launch(event.local_path, locate=True)
 
+            file_name = osp.basename(event.dbx_path)
             self.desktop_notifier.notify(
                 "Sync conflict",
                 f"Conflicting copy for {file_name}",
-                actions={"Show": callback},
-                on_click=callback,
+                actions={"Show": conflict_callback},
+                on_click=conflict_callback,
             )
 
     def _display_name_for_account(self, dbid: str | None) -> str | None:
@@ -3523,19 +3538,16 @@ class SyncEngine:
         # Ensure that parent folders are synced.
         self._ensure_parent(event)
 
+        tmp_fname = self._new_tmp_file()
+
         if event.symlink_target is not None:
-            # Don't download but reproduce symlink locally.
-            with self.fs_events.ignore(
-                FileCreatedEvent(event.local_path), recursive=False
-            ):
-                with convert_api_errors(dbx_path=event.dbx_path):
-                    os.symlink(event.symlink_target, event.local_path)
-                    stat = os.lstat(event.local_path)
-            status = SyncStatus.Done
+            # Don't download but reproduce the symlink at a temporary path. It can then
+            # atomically replace an existing local item like a regular downloaded file.
+            with convert_api_errors(dbx_path=event.dbx_path):
+                os.unlink(tmp_fname)
+                os.symlink(event.symlink_target, tmp_fname)
         else:
             # We download to a temporary file first (this may take some time).
-            tmp_fname = self._new_tmp_file()
-
             try:
                 with self._parallel_down_semaphore:
                     md = self.client.download(
@@ -3547,60 +3559,63 @@ class SyncEngine:
                 err.dbx_path = event.dbx_path
                 raise err
 
-            # Re-check for conflict and move the conflict
-            # out of the way if anything has changed.
-            if self._check_download_conflict(event) == Conflict.Conflict:
-                cc_local_path = self._local_cc_filename(
-                    event.local_path, event.change_dbid
-                )
-                event_cls = DirMovedEvent if isdir(event.local_path) else FileMovedEvent
-                with self.fs_events.ignore(event_cls(event.local_path, cc_local_path)):
-                    with convert_api_errors():
-                        move(event.local_path, cc_local_path, raise_error=True)
+        # Re-check for conflict and move the conflict out of the way if anything has
+        # changed while the temporary item was prepared.
+        if self._check_download_conflict(event) == Conflict.Conflict:
+            cc_local_path = self._local_cc_filename(event.local_path, event.change_dbid)
+            event_cls = DirMovedEvent if isdir(event.local_path) else FileMovedEvent
+            with self.fs_events.ignore(event_cls(event.local_path, cc_local_path)):
+                with convert_api_errors():
+                    move(event.local_path, cc_local_path, raise_error=True)
 
-                self._logger.debug(
-                    'Download conflict: renamed "%s" to "%s"',
+            self._logger.debug(
+                'Download conflict: renamed "%s" to "%s"',
+                event.local_path,
+                cc_local_path,
+            )
+            self.rescan(cc_local_path)
+            status = SyncStatus.Conflict
+        else:
+            status = SyncStatus.Done
+
+        if isdir(event.local_path):
+            with self.fs_events.ignore(DirDeletedEvent(event.local_path)):
+                delete(
                     event.local_path,
-                    cc_local_path,
+                    force_case_sensitive=not self.is_fs_case_sensitive,
                 )
-                self.rescan(cc_local_path)
-                status = SyncStatus.Conflict
-            else:
-                status = SyncStatus.Done
 
-            if isdir(event.local_path):
-                with self.fs_events.ignore(DirDeletedEvent(event.local_path)):
-                    delete(
-                        event.local_path,
-                        force_case_sensitive=not self.is_fs_case_sensitive,
-                    )
+        ignore_events: list[FileSystemEvent] = [
+            FileMovedEvent(tmp_fname, event.local_path)
+        ]
 
-            ignore_events: list[FileSystemEvent] = [
-                FileMovedEvent(tmp_fname, event.local_path)
-            ]
+        # Preserve permissions of the destination file if we are only syncing an
+        # update to the file content (Dropbox ID of the file remains the same). Do not
+        # apply this to symlinks because chmod may follow the link target.
+        old_entry = self.get_index_entry(event.dbx_path_lower)
+        preserve_metadata = bool(
+            event.symlink_target is None
+            and old_entry
+            and event.dbx_id == old_entry.dbx_id
+        )
 
-            # Preserve permissions of the destination file if we are only syncing an
-            # update to the file content (Dropbox ID of the file remains the same).
-            old_entry = self.get_index_entry(event.dbx_path_lower)
-            preserve_metadata = bool(old_entry and event.dbx_id == old_entry.dbx_id)
+        if isfile(event.local_path):
+            # Ignore FileDeletedEvent when replacing old file.
+            ignore_events.append(FileDeletedEvent(event.local_path))
 
-            if isfile(event.local_path):
-                # Ignore FileDeletedEvent when replacing old file.
-                ignore_events.append(FileDeletedEvent(event.local_path))
-
-            # Move the downloaded file to its destination.
-            with self.fs_events.ignore(*ignore_events, recursive=False):
-                with convert_api_errors(
-                    dbx_path=event.dbx_path, local_path=event.local_path
-                ):
-                    stat = os.lstat(tmp_fname)
-                    move(
-                        tmp_fname,
-                        event.local_path,
-                        keep_target_permissions=preserve_metadata,
-                        keep_target_xattrs=preserve_metadata,
-                        raise_error=True,
-                    )
+        # Move the downloaded file or symlink to its destination.
+        with self.fs_events.ignore(*ignore_events, recursive=False):
+            with convert_api_errors(
+                dbx_path=event.dbx_path, local_path=event.local_path
+            ):
+                stat = os.lstat(tmp_fname)
+                move(
+                    tmp_fname,
+                    event.local_path,
+                    keep_target_permissions=preserve_metadata,
+                    keep_target_xattrs=preserve_metadata,
+                    raise_error=True,
+                )
 
         self.update_index_from_sync_event(event)
         self._save_local_hash(
@@ -3658,8 +3673,13 @@ class SyncEngine:
                 FileModifiedEvent(event.local_path),  # May be emitted on macOS.
                 FileDeletedEvent(event.local_path),
             ):
-                delete(
+                exc = delete(
                     event.local_path, force_case_sensitive=not self.is_fs_case_sensitive
+                )
+
+            if exc and not isinstance(exc, (FileNotFoundError, NotADirectoryError)):
+                raise os_to_maestral_error(
+                    exc, dbx_path=event.dbx_path, local_path=event.local_path
                 )
 
         try:
@@ -3842,7 +3862,7 @@ def do_parallel(
         max_workers=NUM_THREADS, thread_name_prefix=thread_name_prefix
     ) as thread_pool_executor:
         futures = [
-            thread_pool_executor.submit(func, *args)  # type:ignore[call-arg]
+            thread_pool_executor.submit(func, *args)  # type: ignore[call-arg]
             for args in zip(*iterables)
         ]
 

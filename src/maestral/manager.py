@@ -23,7 +23,17 @@ from . import __url__, notify
 from .client import API_HOST
 from .config import MaestralConfig, MaestralState, PersistentMutableSet
 from .config.user import UserConfig
-from .constants import CONNECTED, CONNECTING, DISCONNECTED, IDLE, PAUSED, SYNCING
+from .constants import (
+    CONNECTED,
+    CONNECTING,
+    DISCONNECTED,
+    FILE_CACHE,
+    IDLE,
+    MIGNORE_FILE,
+    OLD_REV_FILE,
+    PAUSED,
+    SYNCING,
+)
 from .core import TeamRootInfo, UserRootInfo
 from .exceptions import (
     CancelledError,
@@ -100,6 +110,12 @@ class PersistentQueue(Generic[T]):
             self._persistent.discard(item)
             self._queue.task_done()
 
+    def requeue(self, item: T) -> None:
+        """Return a dequeued item to the queue without changing persistent state."""
+        with self._lock:
+            self._queue.put(item)
+            self._queue.task_done()
+
     def __contains__(self, entry: Any) -> bool:
         return entry in self._persistent
 
@@ -146,7 +162,7 @@ class SyncManager:
 
         self.local_observer_thread: ObserverType | None = None
 
-    def _with_lock(  # type:ignore[misc]
+    def _with_lock(  # type: ignore[misc]
         fn: Callable[Concatenate[SyncManager, P], T],
     ) -> Callable[Concatenate[SyncManager, P], T]:
         @wraps(fn)
@@ -415,6 +431,10 @@ class SyncManager:
         current_root_type = self._state.get("account", "path_root_type")
         current_user_home_path = self._state.get("account", "home_path")
         current_user_home_path_lower = normalize(current_user_home_path)
+        current_user_home_name_lower = normalize(current_user_home_path.lstrip("/"))
+        maestral_file_names = {
+            normalize(name) for name in (FILE_CACHE, MIGNORE_FILE, OLD_REV_FILE)
+        }
 
         if current_root_type == "team" and current_user_home_path == "":
             raise MaestralApiError(
@@ -451,6 +471,15 @@ class SyncManager:
             )
             raise NoDropboxDirError(title, msg)
 
+        current_user_home_entry = next(
+            (
+                entry
+                for entry in local_dropbox_dirlist
+                if normalize(entry.name) == current_user_home_name_lower
+            ),
+            None,
+        )
+
         with self.sync.sync_lock:
             if new_root_type == "team" and current_root_type == "user":
                 # User joined a team.
@@ -468,7 +497,7 @@ class SyncManager:
                 tmpdir = TemporaryDirectory(dir=self.sync.dropbox_path)
 
                 for entry in local_dropbox_dirlist:
-                    if entry.path != tmpdir.name:
+                    if normalize(entry.name) not in maestral_file_names:
                         new_path = f"{tmpdir.name}/{entry.name}"
                         self._logger.debug(
                             "Moving to personal folder: %r → %r", entry.path, new_path
@@ -495,13 +524,20 @@ class SyncManager:
 
                 # Remove all team folders.
                 for entry in local_dropbox_dirlist:
-                    if entry.name != current_user_home_path.lstrip("/"):
+                    if (
+                        entry is not current_user_home_entry
+                        and normalize(entry.name) not in maestral_file_names
+                    ):
                         delete(entry.path, raise_error=True)
 
                 # Migrate user folders to local Dropbox root. We do this by renaming the
                 # user home to a temporary name and then moving its contents to the
                 # parent folder.
-                old_home_root = self.sync.dropbox_path + current_user_home_path
+                old_home_root = (
+                    current_user_home_entry.path
+                    if current_user_home_entry
+                    else self.sync.dropbox_path + current_user_home_path
+                )
 
                 tmpdir = TemporaryDirectory(dir=self.sync.dropbox_path)
 
@@ -541,7 +577,10 @@ class SyncManager:
 
                 # Remove all team folders, leave user folder alone.
                 for entry in local_dropbox_dirlist:
-                    if entry.name != current_user_home_path.lstrip("/"):
+                    if (
+                        entry is not current_user_home_entry
+                        and normalize(entry.name) not in maestral_file_names
+                    ):
                         delete(entry.path, raise_error=True)
                         self._logger.debug("Deleted team folder: %r", entry.path)
 
@@ -645,11 +684,16 @@ class SyncManager:
                     continue
 
                 if not running.is_set():
-                    self.download_queue.put(dbx_path_lower)
+                    self.download_queue.requeue(dbx_path_lower)
                     return
 
-                with self.sync.sync_lock:
-                    self.sync.get_remote_item(dbx_path_lower)
+                try:
+                    with self.sync.sync_lock:
+                        self.sync.get_remote_item(dbx_path_lower)
+                except CancelledError:
+                    self.download_queue.requeue(dbx_path_lower)
+                    raise
+                else:
                     self.download_queue.task_done(dbx_path_lower)
                     self._logger.info(IDLE)
 
@@ -729,8 +773,13 @@ class SyncManager:
 
             while self.download_queue.has_pending():
                 dbx_path = self.download_queue.get()
-                self.sync.get_remote_item(dbx_path)
-                self.download_queue.task_done(dbx_path)
+                try:
+                    self.sync.get_remote_item(dbx_path)
+                except CancelledError:
+                    self.download_queue.requeue(dbx_path)
+                    raise
+                else:
+                    self.download_queue.task_done(dbx_path)
 
             if not running.is_set():
                 startup_completed.set()

@@ -264,6 +264,7 @@ class Maestral:
         code: str | None = None,
         refresh_token: str | None = None,
         access_token: str | None = None,
+        allow_plaintext_keyring: bool = False,
     ) -> int:
         """
         Links Maestral with a Dropbox account using the given authorization code. The
@@ -275,7 +276,7 @@ class Maestral:
             * Any keyring implementing the SecretService Dbus specification
             * KWallet
             * Gnome Keyring
-            * Plain text storage
+            * Plain text storage, with explicit permission from the caller
 
         For testing, it is also possible to directly provide a long-lived refresh token
         or a short-lived access token. Note that the tokens must be issued for Maestral,
@@ -288,10 +289,15 @@ class Maestral:
         :param access_token: Optionally, instead of an authorization code or a refresh
             token, directly provide an access token. Note that access tokens are
             short-lived.
+        :param allow_plaintext_keyring: Whether to allow storage of a refresh token in
+            plain text when no secure keyring is available.
         :returns: 0 on success, 1 for an invalid token and 2 for connection errors.
         """
         return self.client.link(
-            code=code, refresh_token=refresh_token, access_token=access_token
+            code=code,
+            refresh_token=refresh_token,
+            access_token=access_token,
+            allow_plaintext_keyring=allow_plaintext_keyring,
         )
 
     def unlink(self) -> None:
@@ -668,9 +674,9 @@ class Maestral:
             return FileStatus.Unwatched.value
 
         # Find any sync activity for the local path.
-        node = self.sync.activity.get_node(dbx_path_cased)
+        sync_events = self.sync.activity.get_events(dbx_path_cased)
 
-        if not node:
+        if not sync_events:
             # Always return synced for the root folder in the absense of sync activity.
             if dbx_path_cased == "/":
                 return FileStatus.Synced.value
@@ -687,7 +693,7 @@ class Maestral:
         # Down are mutually exclusive because they are performed in alternating cycles.
         file_status = FileStatus.Synced
 
-        for event in node.sync_events:
+        for event in sync_events:
             if event.status is SyncStatus.Syncing:
                 if event.direction is SyncDirection.Up:
                     return FileStatus.Uploading.value
@@ -709,7 +715,7 @@ class Maestral:
         :raises NotLinkedError: if no Dropbox account is linked.
         """
         self._check_linked()
-        return list(self.sync.activity.sync_events)[:limit]
+        return list(self.sync.activity.get_events())[:limit]
 
     def get_history(
         self, dbx_path: str | None = None, limit: int | None = 100

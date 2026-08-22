@@ -1,4 +1,5 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -6,6 +7,7 @@ import requests
 from dropbox import common, files, sharing, team_common, users, users_common
 from dropbox.oauth import DropboxOAuth2FlowNoRedirect
 
+import maestral.client as client_module
 from maestral import core
 from maestral.client import (
     DropboxClient,
@@ -15,7 +17,7 @@ from maestral.client import (
     convert_shared_link_metadata,
     convert_space_usage,
 )
-from maestral.exceptions import NotLinkedError
+from maestral.exceptions import NotLinkedError, SyncError
 from maestral.keyring import CredentialStorage
 
 # ==== DropboxClient tests =============================================================
@@ -32,14 +34,18 @@ def test_link():
     client = DropboxClient("test-config", cred_storage)
 
     client._auth_flow = Mock(spec_set=DropboxOAuth2FlowNoRedirect)
-    client.get_account_info = Mock()
+    client._auth_flow.finish.return_value = Mock(refresh_token="refresh-token")
+    account_info = Mock(account_id="account-id")
+    client.get_account_info = Mock(return_value=account_info)
     client.update_path_root = Mock()
 
-    res = client.link("code")
+    res = client.link("code", allow_plaintext_keyring=True)
 
     assert res == 0
-    client.update_path_root.assert_called_once()
-    cred_storage.save_creds.assert_called_once()
+    client.update_path_root.assert_called_once_with(account_info.root_info)
+    cred_storage.save_creds.assert_called_once_with(
+        "account-id", "refresh-token", allow_plaintext=True
+    )
 
 
 def test_link_error():
@@ -88,6 +94,164 @@ def test_unlink_error():
 
     with pytest.raises(NotLinkedError):
         client.unlink()
+
+
+def test_retry_regex_reraises_errors_without_string_messages(client):
+    calls = 0
+
+    @DropboxClient._retry_on_error(ValueError, max_retries=2, msg_regex="retry")
+    def operation(self):
+        nonlocal calls
+        calls += 1
+        raise ValueError()
+
+    with pytest.raises(ValueError):
+        operation(client)
+
+    assert calls == 1
+
+
+def test_throttled_iterators_guard_zero_transfer_count(client, monkeypatch):
+    monkeypatch.setattr(client_module.time, "sleep", Mock())
+    client.bandwidth_limit_down = 4096
+    client.bandwidth_limit_up = 4096
+    client.download_chunk_size = 1
+    client.upload_chunk_size = 1
+
+    assert list(client._throttled_download_iter(iter([b"a"]))) == [b"a"]
+    assert b"".join(client._throttled_upload_iter(b"a")) == b"a"
+
+
+@pytest.mark.parametrize(
+    "allocation",
+    [
+        users.SpaceAllocation.individual(users.IndividualSpaceAllocation(allocated=0)),
+        users.SpaceAllocation.other,
+    ],
+)
+def test_get_space_usage_handles_zero_allocation(client, allocation):
+    client._dbx_base = Mock()
+    client._dbx_base.users_get_space_usage.return_value = users.SpaceUsage(
+        used=10, allocation=allocation
+    )
+
+    usage = client.get_space_usage()
+
+    assert usage.used == 10
+    assert usage.allocated == 0
+    assert "%" not in client._state.get("account", "usage")
+
+
+def test_create_shared_link_converts_aware_expiry_to_utc(client, monkeypatch):
+    result = object()
+    client._dbx = Mock()
+    client._dbx.sharing_create_shared_link_with_settings.return_value = result
+    monkeypatch.setattr(
+        client_module, "convert_shared_link_metadata", lambda value: value
+    )
+
+    expires = datetime(2026, 1, 2, 12, tzinfo=timezone(timedelta(hours=2)))
+
+    assert client.create_shared_link("/file", expires=expires) is result
+
+    settings = client._dbx.sharing_create_shared_link_with_settings.call_args.args[1]
+    assert settings.expires == datetime(2026, 1, 2, 10, tzinfo=timezone.utc)
+
+
+def _complete_batch(*metadata):
+    entries = []
+
+    for value in metadata:
+        entry = Mock()
+        entry.is_success.return_value = True
+        entry.get_success.return_value = SimpleNamespace(metadata=value)
+        entries.append(entry)
+
+    result = SimpleNamespace(entries=entries)
+    launch = Mock()
+    launch.is_complete.return_value = True
+    launch.is_async_job_id.return_value = False
+    launch.get_complete.return_value = result
+    return launch
+
+
+def _async_batch(job_id="job"):
+    launch = Mock()
+    launch.is_complete.return_value = False
+    launch.is_async_job_id.return_value = True
+    launch.get_async_job_id.return_value = job_id
+    return launch
+
+
+def _failed_batch(error):
+    status = Mock()
+    status.is_in_progress.return_value = False
+    status.is_complete.return_value = False
+    status.is_failed.return_value = True
+    status.get_failed.return_value = error
+    return status
+
+
+def test_remove_batch_keeps_results_aligned_after_failed_chunk(client, monkeypatch):
+    client._dbx = Mock()
+    client._dbx.files_delete_batch.side_effect = [
+        _async_batch(),
+        _complete_batch("three", "four"),
+    ]
+    error = Mock()
+    error.is_too_many_write_operations.return_value = False
+    client._dbx.files_delete_batch_check.return_value = _failed_batch(error)
+    monkeypatch.setattr(client_module, "convert_metadata", lambda value: value)
+    monkeypatch.setattr(client_module.time, "sleep", Mock())
+
+    result = client.remove_batch(
+        [("/one", None), ("/two", None), ("/three", None), ("/four", None)],
+        batch_size=2,
+    )
+
+    assert len(result) == 4
+    assert [entry.dbx_path for entry in result[:2] if isinstance(entry, SyncError)] == [
+        "/one",
+        "/two",
+    ]
+    assert result[2:] == ["three", "four"]
+
+
+def test_remove_batch_uses_nonzero_poll_interval(client, monkeypatch):
+    client._dbx = Mock()
+    client._dbx.files_delete_batch.return_value = _async_batch()
+    in_progress = Mock()
+    in_progress.is_in_progress.return_value = True
+    complete = Mock()
+    complete.is_in_progress.return_value = False
+    complete.is_complete.return_value = True
+    complete.get_complete.return_value = _complete_batch("one").get_complete()
+    client._dbx.files_delete_batch_check.side_effect = [in_progress, complete]
+    sleep = Mock()
+    monkeypatch.setattr(client_module, "convert_metadata", lambda value: value)
+    monkeypatch.setattr(client_module.time, "sleep", sleep)
+
+    assert client.remove_batch([("/one", None)]) == ["one"]
+    assert [args.args[0] for args in sleep.call_args_list] == [0.5, 0.1]
+
+
+def test_make_dir_batch_preserves_order_when_retrying_chunk(client, monkeypatch):
+    client._dbx = Mock()
+    client._dbx.files_create_folder_batch.side_effect = [
+        _async_batch(),
+        _complete_batch("one"),
+        _complete_batch("two"),
+        _complete_batch("three", "four"),
+    ]
+    error = Mock()
+    error.is_too_many_files.return_value = True
+    client._dbx.files_create_folder_batch_check.return_value = _failed_batch(error)
+    monkeypatch.setattr(client_module, "convert_metadata", lambda value: value)
+    monkeypatch.setattr(client_module.time, "sleep", Mock())
+
+    result = client.make_dir_batch(["/one", "/two", "/three", "/four"], batch_size=2)
+
+    assert result == ["one", "two", "three", "four"]
 
 
 # ==== type conversion tests ===========================================================

@@ -1,9 +1,16 @@
+import inspect
 import logging
+from types import SimpleNamespace
+from unittest.mock import Mock
 
+import click
 from click.testing import CliRunner
 
+import maestral.cli.cli_info as cli_info_module
+import maestral.daemon as daemon_module
 from maestral.autostart import AutoStart
 from maestral.cli import main
+from maestral.cli.core import OrderedGroup
 from maestral.daemon import MaestralProxy, Start, start_maestral_daemon_process
 from maestral.logging import scoped_logger
 from maestral.main import Maestral
@@ -25,6 +32,16 @@ def test_help() -> None:
     assert result_no_arg.output.startswith("Usage: main [OPTIONS] COMMAND [ARGS]")
 
     assert result_no_arg.output == result_help_arg.output
+
+
+def test_ordered_group_sections_are_per_instance() -> None:
+    first = OrderedGroup("first")
+    second = OrderedGroup("second")
+
+    first.add_command(click.Command("one"), section="Commands")
+
+    assert list(first.sections) == ["Commands"]
+    assert second.sections == {}
 
 
 def test_invalid_config() -> None:
@@ -82,6 +99,65 @@ def test_start_already_running(config_name: str) -> None:
 
     assert result.exit_code == 0, result.output
     assert "already running" in result.output
+
+
+def test_start_failure_exits_without_startup_dialog(monkeypatch) -> None:
+    wait_for_startup = Mock()
+    monkeypatch.setattr(daemon_module, "is_running", Mock(return_value=False))
+    monkeypatch.setattr(
+        daemon_module,
+        "start_maestral_daemon_process",
+        Mock(return_value=Start.Failed),
+    )
+    monkeypatch.setattr(daemon_module, "wait_for_startup", wait_for_startup)
+
+    result = CliRunner().invoke(main, ["start", "-c", "failed-start"])
+
+    assert result.exit_code == 1
+    assert "[FAILED]" in result.output
+    assert "Please check logs" in result.output
+    wait_for_startup.assert_not_called()
+
+
+def test_ls_prints_collected_entries_when_piped(monkeypatch) -> None:
+    m = Mock()
+    m.list_folder_iterator.return_value = iter(
+        [
+            [SimpleNamespace(name="zeta")],
+            [SimpleNamespace(name="alpha")],
+        ]
+    )
+    console = Mock()
+
+    monkeypatch.setattr(cli_info_module, "Console", Mock(return_value=console))
+    monkeypatch.setattr(
+        cli_info_module,
+        "sys",
+        SimpleNamespace(stdout=SimpleNamespace(isatty=lambda: False)),
+    )
+
+    callback = inspect.unwrap(cli_info_module.ls.callback)
+    callback(m, long=False, dropbox_path="/", include_deleted=False)
+
+    console.print.assert_called_once_with("alpha\nzeta")
+
+
+def test_ls_handles_empty_terminal_listing(monkeypatch) -> None:
+    m = Mock()
+    m.list_folder_iterator.return_value = iter([[]])
+    console = Mock()
+
+    monkeypatch.setattr(cli_info_module, "Console", Mock(return_value=console))
+    monkeypatch.setattr(
+        cli_info_module,
+        "sys",
+        SimpleNamespace(stdout=SimpleNamespace(isatty=lambda: True)),
+    )
+
+    callback = inspect.unwrap(cli_info_module.ls.callback)
+    callback(m, long=False, dropbox_path="/", include_deleted=False)
+
+    console.print.assert_called_once_with()
 
 
 def test_stop(config_name: str) -> None:

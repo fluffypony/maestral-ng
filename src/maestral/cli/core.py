@@ -26,7 +26,7 @@ from .output import warn
 #   when the object is used with prompt inputs.
 
 
-class DropboxPath(click.ParamType):
+class DropboxPath(click.ParamType[str | None]):
     """A command line parameter representing a Dropbox path
 
     This parameter type provides custom shell completion for items inside the local
@@ -111,7 +111,7 @@ class DropboxPath(click.ParamType):
         return completions
 
 
-class ConfigKey(click.ParamType):
+class ConfigKey(click.ParamType[str]):
     """A command line parameter representing a config key
 
     This parameter type provides custom shell completion for existing config keys.
@@ -132,7 +132,7 @@ class ConfigKey(click.ParamType):
         return [CompletionItem(key) for key in KEYS if key.startswith(incomplete)]
 
 
-class ConfigName(click.ParamType):
+class ConfigName(click.ParamType[str | None]):
     """A command line parameter representing a Dropbox path
 
     This parameter type provides custom shell completion for existing config names.
@@ -161,8 +161,8 @@ class ConfigName(click.ParamType):
             # accept all valid config names
             try:
                 return validate_config_name(value)
-            except ValueError:
-                raise CliException("Configuration name may not contain any whitespace")
+            except ValueError as exc:
+                raise CliException(str(exc))
 
         else:
             # accept only existing config names
@@ -194,7 +194,9 @@ class ConfigName(click.ParamType):
 class OrderedGroup(click.Group):
     """Click command group with customizable sections of help output."""
 
-    sections: dict[str, list[tuple[str, click.Command]]] = {}
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        self.sections: dict[str, list[tuple[str, click.Command]]] = {}
+        super().__init__(*args, **kwargs)
 
     def add_command(
         self, cmd: click.Command, name: str | None = None, section: str = ""

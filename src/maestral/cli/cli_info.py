@@ -261,7 +261,7 @@ def ls(m: Maestral, long: bool, dropbox_path: str, include_deleted: bool) -> Non
         console.print(table)
 
     elif not sys.stdout.isatty():
-        names = [entry.name for entries in entries_iter for entry in entries]
+        names = [entry.name for entry in entries]
         console.print("\n".join(names))
 
     else:
@@ -270,6 +270,10 @@ def ls(m: Maestral, long: bool, dropbox_path: str, include_deleted: bool) -> Non
         for entry in entries:
             color = "blue" if isinstance(entry, DeletedMetadata) else ""
             fields.append(Text(entry.name, style=color))
+
+        if not fields:
+            console.print()
+            return
 
         max_len = max(len(f) for f in fields)
         console.print(Columns(fields, width=max_len, column_first=True))

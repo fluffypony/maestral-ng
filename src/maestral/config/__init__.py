@@ -1,4 +1,5 @@
 import os
+import re
 from typing import List, TypeVar
 
 from ..utils.appdirs import get_conf_path, get_data_path
@@ -47,7 +48,8 @@ def remove_configuration(config_name: str) -> None:
     files = []
 
     for file_name in os.listdir(data_path):
-        if file_name.startswith(config_name):
+        stem, extension = os.path.splitext(file_name)
+        if extension and stem == config_name:
             files.append(os.path.join(data_path, file_name))
 
     for file in files:
@@ -59,13 +61,16 @@ def remove_configuration(config_name: str) -> None:
 
 def validate_config_name(string: _C) -> _C:
     """
-    Validates that the config name does not contain any whitespace.
+    Validates that the config name contains only safe filename characters.
 
     :param string: String to validate.
     :returns: The input value.
-    :raises ValueError: if the config name contains whitespace.
+    :raises ValueError: if the config name contains unsupported characters.
     """
-    if len(string.split()) > 1:
-        raise ValueError("Config name may not contain any whitespace")
+    if re.fullmatch(r"[A-Za-z0-9._-]+", string) is None or not string.strip("."):
+        raise ValueError(
+            "Config name may contain only letters, numbers, periods, underscores, "
+            "and hyphens"
+        )
 
     return string

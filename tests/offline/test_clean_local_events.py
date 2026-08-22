@@ -110,6 +110,25 @@ def test_move_events(sync: SyncEngine) -> None:
     assert cleaned_events == res
 
 
+def test_recombine_does_not_recreate_empty_event_history(
+    sync: SyncEngine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    destination = ipath(2)
+    rescanned_paths = []
+    monkeypatch.setattr(sync, "rescan", rescanned_paths.append)
+
+    file_events = [
+        FileModifiedEvent(destination),
+        FileMovedEvent(ipath(1), destination),
+        FileDeletedEvent(destination),
+    ]
+
+    cleaned_events = sync._clean_local_events(file_events)
+
+    assert cleaned_events == [FileDeletedEvent(ipath(1))]
+    assert rescanned_paths == [destination]
+
+
 def test_gedit_save(sync: SyncEngine) -> None:
     file_events = [
         FileCreatedEvent("/.gedit-save-UR4EC0"),  # save new version to tmp file

@@ -7,11 +7,14 @@ import xattr
 from maestral.constants import IS_LINUX
 from maestral.utils.appdirs import get_home_dir
 from maestral.utils.path import (
+    delete,
+    fs_max_lengths_for_path,
     get_existing_equivalent_paths,
     is_child,
     is_fs_case_sensitive,
     move,
     normalized_path_exists,
+    walk,
 )
 
 
@@ -89,6 +92,46 @@ def test_is_child():
     assert is_child("/parent/path/child/", "/parent/path")
     assert not is_child("/parent/path", "/parent/path")
     assert not is_child("/path1", "/path2")
+
+
+def test_is_fs_case_sensitive_rejects_root():
+    with pytest.raises(ValueError):
+        is_fs_case_sensitive(os.path.sep)
+
+
+def test_delete_missing_case_sensitive_path_honours_raise_error(tmp_path):
+    missing_path = str(tmp_path / "missing")
+
+    err = delete(missing_path, force_case_sensitive=True, raise_error=False)
+
+    assert isinstance(err, FileNotFoundError)
+
+    with pytest.raises(FileNotFoundError):
+        delete(missing_path, force_case_sensitive=True, raise_error=True)
+
+
+def test_walk_continues_after_entry_disappears(tmp_path):
+    vanished_path = tmp_path / "a-vanished"
+    remaining_path = tmp_path / "b-remaining"
+    touch(str(vanished_path))
+    touch(str(remaining_path))
+
+    entries = {entry.name: entry for entry in os.scandir(tmp_path)}
+    vanished_path.unlink()
+
+    def listdir(path):
+        return [entries["a-vanished"], entries["b-remaining"]]
+
+    assert list(walk(str(tmp_path), listdir=listdir)) == [
+        (str(remaining_path), os.lstat(remaining_path))
+    ]
+
+
+def test_fs_max_lengths_returns_name_before_path(monkeypatch, tmp_path):
+    limits = {"PC_NAME_MAX": 255, "PC_PATH_MAX": 4096}
+    monkeypatch.setattr(os, "pathconf", lambda path, name: limits[name])
+
+    assert fs_max_lengths_for_path(str(tmp_path)) == (255, 4096)
 
 
 def test_move_preserves_permissions(tmp_path):

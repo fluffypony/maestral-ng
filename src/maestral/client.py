@@ -10,6 +10,7 @@ import functools
 # system imports
 import os
 import re
+import threading
 import time
 from contextlib import closing, contextmanager
 from datetime import datetime, timezone
@@ -250,22 +251,27 @@ class DropboxClient:
 
         self._num_downloads = 0
         self._num_uploads = 0
+        self._transfer_counter_lock = threading.Lock()
 
     @contextmanager
     def _register_download(self) -> Iterator[None]:
-        self._num_downloads += 1
+        with self._transfer_counter_lock:
+            self._num_downloads += 1
         try:
             yield
         finally:
-            self._num_downloads -= 1
+            with self._transfer_counter_lock:
+                self._num_downloads -= 1
 
     @contextmanager
     def _register_upload(self) -> Iterator[None]:
-        self._num_uploads += 1
+        with self._transfer_counter_lock:
+            self._num_uploads += 1
         try:
             yield
         finally:
-            self._num_uploads -= 1
+            with self._transfer_counter_lock:
+                self._num_uploads -= 1
 
     def _throttled_download_iter(self, iterator: Iterator[T]) -> Iterator[T]:
         for i in iterator:
@@ -276,7 +282,10 @@ class DropboxClient:
                 yield i
                 tock = time.monotonic()
 
-                speed_per_download = self.bandwidth_limit_down / self._num_downloads
+                with self._transfer_counter_lock:
+                    num_downloads = max(1, self._num_downloads)
+
+                speed_per_download = self.bandwidth_limit_down / num_downloads
                 target_tock = tick + self.download_chunk_size / speed_per_download
 
                 wait_time = target_tock - tock
@@ -293,7 +302,10 @@ class DropboxClient:
             pos += self.upload_chunk_size
 
             if self.bandwidth_limit_up > 0:
-                speed_per_upload = self.bandwidth_limit_up / self._num_uploads
+                with self._transfer_counter_lock:
+                    num_uploads = max(1, self._num_uploads)
+
+                speed_per_upload = self.bandwidth_limit_up / num_uploads
                 target_tock = tick + self.upload_chunk_size / speed_per_upload
 
                 wait_time = target_tock - tock
@@ -332,13 +344,12 @@ class DropboxClient:
                     except error_cls as exc:
                         if msg_regex is not None:
                             # Raise if there is no error message to match.
-                            if len(exc.args[0]) == 0 or not isinstance(
-                                exc.args[0], str
-                            ):
-                                raise exc
+                            message = exc.args[0] if exc.args else None
+                            if not isinstance(message, str) or not message:
+                                raise
                             # Raise if regex does not match message.
-                            if not re.search(msg_regex, exc.args[0]):
-                                raise exc
+                            if not re.search(msg_regex, message):
+                                raise
 
                         if tries < max_retries:
                             tries += 1
@@ -352,7 +363,7 @@ class DropboxClient:
                                 max_retries,
                             )
                         else:
-                            raise exc
+                            raise
 
             return wrapper
 
@@ -404,6 +415,7 @@ class DropboxClient:
         code: str | None = None,
         refresh_token: str | None = None,
         access_token: str | None = None,
+        allow_plaintext_keyring: bool = False,
     ) -> int:
         """
         Links Maestral with a Dropbox account using the given authorization code. The
@@ -417,6 +429,8 @@ class DropboxClient:
         :param access_token: Optionally, instead of an authorization code or a refresh
             token, directly provide an access token. Note that access tokens are
             short-lived.
+        :param allow_plaintext_keyring: Whether to allow storage of a refresh token in
+            plain text when no secure keyring is available.
         :returns: 0 on success, 1 for an invalid token and 2 for connection errors.
         """
         if code is None and access_token is None and refresh_token is None:
@@ -445,7 +459,11 @@ class DropboxClient:
 
         # Only save long-lived refresh token in storage.
         if refresh_token:
-            self._cred_storage.save_creds(account_info.account_id, refresh_token)
+            self._cred_storage.save_creds(
+                account_info.account_id,
+                refresh_token,
+                allow_plaintext=allow_plaintext_keyring,
+            )
 
         self._auth_flow = None
 
@@ -662,30 +680,35 @@ class DropboxClient:
         with convert_api_errors():
             res = self.dbx_base.users_get_space_usage()
 
-        # Query space usage type.
+        converted_usage = convert_space_usage(res)
+
         if res.allocation.is_team():
             usage_type = "team"
+            team_usage = converted_usage.team_usage
+            used = team_usage.used if team_usage else converted_usage.used
+            allocated = (
+                team_usage.allocated if team_usage else converted_usage.allocated
+            )
         elif res.allocation.is_individual():
             usage_type = "individual"
+            used = converted_usage.used
+            allocated = converted_usage.allocated
         else:
             usage_type = ""
+            used = converted_usage.used
+            allocated = 0
 
-        # Generate space usage string.
-        if res.allocation.is_team():
-            used = res.allocation.get_team().used
-            allocated = res.allocation.get_team().allocated
+        if allocated > 0:
+            percent = used / allocated
+            space_usage = f"{percent:.1%} of {natural_size(allocated)} used"
         else:
-            used = res.used
-            allocated = res.allocation.get_individual().allocated
-
-        percent = used / allocated
-        space_usage = f"{percent:.1%} of {natural_size(allocated)} used"
+            space_usage = f"{natural_size(used)} used"
 
         # Save results to config.
         self._state.set("account", "usage", space_usage)
         self._state.set("account", "usage_type", usage_type)
 
-        return convert_space_usage(res)
+        return converted_usage
 
     def get_metadata(
         self, dbx_path: str, include_deleted: bool = False
@@ -1097,20 +1120,21 @@ class DropboxClient:
         """
         batch_size = clamp(batch_size, 1, 1000)
 
-        res_entries = []
+        entries = list(entries)
         result_list: list[FileMetadata | FolderMetadata | MaestralApiError] = []
 
-        # Up two ~ 1,000 entries allowed per batch:
+        # Up to 1,000 entries are allowed per batch:
         # https://www.dropbox.com/developers/reference/data-ingress-guide
-        for chunk in chunks(list(entries), n=batch_size):
+        for chunk in chunks(entries, n=batch_size):
             arg = [files.DeleteArg(e[0], e[1]) for e in chunk]
+            batch_entries = None
+            batch_error = None
 
             with convert_api_errors():
                 res = self.dbx.files_delete_batch(arg)
 
             if res.is_complete():
-                batch_res = res.get_complete()
-                res_entries.extend(batch_res.entries)
+                batch_entries = res.get_complete().entries
 
             elif res.is_async_job_id():
                 async_job_id = res.get_async_job_id()
@@ -1120,7 +1144,7 @@ class DropboxClient:
                 with convert_api_errors():
                     res = self.dbx.files_delete_batch_check(async_job_id)
 
-                check_interval = round(len(chunk) / 100, 1)
+                check_interval = max(0.1, round(len(chunk) / 100, 1))
 
                 while res.is_in_progress():
                     time.sleep(check_interval)
@@ -1128,30 +1152,62 @@ class DropboxClient:
                         res = self.dbx.files_delete_batch_check(async_job_id)
 
                 if res.is_complete():
-                    batch_res = res.get_complete()
-                    res_entries.extend(batch_res.entries)
+                    batch_entries = res.get_complete().entries
 
                 elif res.is_failed():
                     error = res.get_failed()
                     if error.is_too_many_write_operations():
-                        title = "Could not delete items"
-                        text = (
+                        batch_error = (
                             "There are too many write operations happening in your "
                             "Dropbox. Please try again later."
                         )
-                        raise SyncError(title, text)
+                    else:
+                        batch_error = (
+                            "Dropbox could not complete the batch operation. "
+                            "Please try again later."
+                        )
+                else:
+                    batch_error = (
+                        "Dropbox returned an unknown batch status. Please try again "
+                        "later."
+                    )
+            else:
+                batch_error = (
+                    "Dropbox returned an unknown batch status. Please try again later."
+                )
 
-        for i, entry in enumerate(res_entries):
-            if entry.is_success():
-                result_list.append(convert_metadata(entry.get_success().metadata))
-            elif entry.is_failure():
+            if batch_entries is None:
+                text = batch_error or "Dropbox returned an incomplete batch result."
+                result_list.extend(
+                    SyncError("Could not delete item", text, dbx_path=path)
+                    for path, _ in chunk
+                )
+                continue
+
+            for index, (path, _) in enumerate(chunk):
+                if index >= len(batch_entries):
+                    result_list.append(
+                        SyncError(
+                            "Could not delete item",
+                            "Dropbox returned an incomplete batch result.",
+                            dbx_path=path,
+                        )
+                    )
+                    continue
+
+                entry = batch_entries[index]
+
+                if entry.is_success():
+                    result_list.append(convert_metadata(entry.get_success().metadata))
+                    continue
+
                 exc = exceptions.ApiError(
                     error=entry.get_failure(),
                     user_message_text="",
                     user_message_locale="",
                     request_id="",
                 )
-                sync_err = dropbox_to_maestral_error(exc, dbx_path=entries[i][0])
+                sync_err = dropbox_to_maestral_error(exc, dbx_path=path)
                 result_list.append(sync_err)
 
         return result_list
@@ -1214,52 +1270,104 @@ class DropboxClient:
         """
         batch_size = clamp(batch_size, 1, 1000)
 
-        entries = []
         result_list: list[FolderMetadata | MaestralApiError] = []
 
-        with convert_api_errors():
-            # Up two ~ 1,000 entries allowed per batch:
-            # https://www.dropbox.com/developers/reference/data-ingress-guide
-            for chunk in chunks(dbx_paths, n=batch_size):
-                res = self.dbx.files_create_folder_batch(chunk, autorename, force_async)
-                if res.is_complete():
-                    batch_res = res.get_complete()
-                    entries.extend(batch_res.entries)
-                elif res.is_async_job_id():
-                    async_job_id = res.get_async_job_id()
+        # Up to 1,000 entries are allowed per batch:
+        # https://www.dropbox.com/developers/reference/data-ingress-guide
+        for chunk in chunks(dbx_paths, n=batch_size):
+            batch_entries = None
+            batch_error = None
 
-                    time.sleep(0.5)
+            with convert_api_errors():
+                res = self.dbx.files_create_folder_batch(chunk, autorename, force_async)
+
+            if res.is_complete():
+                batch_entries = res.get_complete().entries
+
+            elif res.is_async_job_id():
+                async_job_id = res.get_async_job_id()
+
+                time.sleep(0.5)
+                with convert_api_errors():
                     res = self.dbx.files_create_folder_batch_check(async_job_id)
 
-                    check_interval = round(len(chunk) / 100, 1)
+                check_interval = max(0.1, round(len(chunk) / 100, 1))
 
-                    while res.is_in_progress():
-                        time.sleep(check_interval)
+                while res.is_in_progress():
+                    time.sleep(check_interval)
+                    with convert_api_errors():
                         res = self.dbx.files_create_folder_batch_check(async_job_id)
 
-                    if res.is_complete():
-                        batch_res = res.get_complete()
-                        entries.extend(batch_res.entries)
+                if res.is_complete():
+                    batch_entries = res.get_complete().entries
 
-                    elif res.is_failed():
-                        error = res.get_failed()
-                        if error.is_too_many_files():
-                            res_list = self.make_dir_batch(
-                                chunk, round(batch_size / 2), autorename, force_async
+                elif res.is_failed():
+                    error = res.get_failed()
+
+                    if error.is_too_many_files() and len(chunk) > 1:
+                        retry_batch_size = max(1, len(chunk) // 2)
+                        result_list.extend(
+                            self.make_dir_batch(
+                                chunk,
+                                retry_batch_size,
+                                autorename,
+                                force_async,
                             )
-                            result_list.extend(res_list)
+                        )
+                        continue
 
-        for i, entry in enumerate(entries):
-            if entry.is_success():
-                result_list.append(convert_metadata(entry.get_success().metadata))
-            elif entry.is_failure():
+                    if error.is_too_many_files():
+                        batch_error = (
+                            "Dropbox rejected a batch containing one folder. "
+                            "Please try again later."
+                        )
+                    else:
+                        batch_error = (
+                            "Dropbox could not complete the batch operation. "
+                            "Please try again later."
+                        )
+                else:
+                    batch_error = (
+                        "Dropbox returned an unknown batch status. Please try again "
+                        "later."
+                    )
+            else:
+                batch_error = (
+                    "Dropbox returned an unknown batch status. Please try again later."
+                )
+
+            if batch_entries is None:
+                text = batch_error or "Dropbox returned an incomplete batch result."
+                result_list.extend(
+                    SyncError("Could not create folder", text, dbx_path=path)
+                    for path in chunk
+                )
+                continue
+
+            for index, path in enumerate(chunk):
+                if index >= len(batch_entries):
+                    result_list.append(
+                        SyncError(
+                            "Could not create folder",
+                            "Dropbox returned an incomplete batch result.",
+                            dbx_path=path,
+                        )
+                    )
+                    continue
+
+                entry = batch_entries[index]
+
+                if entry.is_success():
+                    result_list.append(convert_metadata(entry.get_success().metadata))
+                    continue
+
                 exc = exceptions.ApiError(
                     error=entry.get_failure(),
                     user_message_text="",
                     user_message_locale="",
                     request_id="",
                 )
-                sync_err = dropbox_to_maestral_error(exc, dbx_path=dbx_paths[i])
+                sync_err = dropbox_to_maestral_error(exc, dbx_path=path)
                 result_list.append(sync_err)
 
         return result_list
@@ -1539,9 +1647,11 @@ class DropboxClient:
         """
         # Convert timestamp to utc time if not naive.
         if expires is not None:
-            has_timezone = expires.tzinfo and expires.tzinfo.utcoffset(expires)
+            has_timezone = (
+                expires.tzinfo is not None and expires.utcoffset() is not None
+            )
             if has_timezone:
-                expires.astimezone(timezone.utc)
+                expires = expires.astimezone(timezone.utc)
 
         settings = sharing.SharedLinkSettings(
             require_password=password is not None,
@@ -1680,7 +1790,7 @@ def convert_space_usage(res: users.SpaceUsage) -> PersonalSpaceUsage:
         return PersonalSpaceUsage(res.used, 0, None)
 
 
-def convert_metadata(res):  # type:ignore[no-untyped-def]
+def convert_metadata(res):  # type: ignore[no-untyped-def]
     if isinstance(res, files.FileMetadata):
         symlink_target = res.symlink_info.target if res.symlink_info else None
         shared = res.sharing_info is not None or res.has_explicit_shared_members

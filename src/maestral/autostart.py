@@ -23,10 +23,9 @@ import stat
 import subprocess
 import sys
 from enum import Enum
+from importlib.metadata import PackageNotFoundError, files
 from pathlib import Path
 from typing import Any
-
-from importlib.metadata import PackageNotFoundError, files
 
 from .constants import BUNDLE_ID, ENV, FROZEN, IS_LINUX, IS_MACOS
 from .exceptions import MaestralApiError
@@ -115,16 +114,24 @@ class AutoStartSystemd(AutoStartBase):
             self.service_config.write(f)
 
     def enable(self) -> None:
-        res = subprocess.run(["systemctl", "--user", "enable", self.service_name])
+        res = subprocess.run(
+            ["systemctl", "--user", "enable", self.service_name],
+            capture_output=True,
+            text=True,
+        )
 
         if res.returncode != 0:
-            raise MaestralApiError("Could not enable autostart", str(res.stderr))
+            raise MaestralApiError("Could not enable autostart", res.stderr.strip())
 
     def disable(self) -> None:
-        res = subprocess.run(["systemctl", "--user", "disable", self.service_name])
+        res = subprocess.run(
+            ["systemctl", "--user", "disable", self.service_name],
+            capture_output=True,
+            text=True,
+        )
 
         if res.returncode != 0:
-            raise MaestralApiError("Could not disable autostart", str(res.stderr))
+            raise MaestralApiError("Could not disable autostart", res.stderr.strip())
 
     @property
     def enabled(self) -> bool:
@@ -303,9 +310,11 @@ class AutoStart:
     def __init__(self, config_name: str) -> None:
         self.implementation = get_available_implementation()
 
-        # When using systemd, infer the config name from service name.
-        if self.implementation == SupportedImplementations.systemd:
-            config_name = "%i"
+        command_config_name = (
+            "%i"
+            if self.implementation == SupportedImplementations.systemd
+            else config_name
+        )
 
         if FROZEN:
             start_cmd = [
@@ -314,9 +323,15 @@ class AutoStart:
                 "start",
                 "--foreground",
                 "--config-name",
-                config_name,
+                command_config_name,
             ]
-            stop_cmd = [sys.executable, "--cli", "stop", "--config-name", config_name]
+            stop_cmd = [
+                sys.executable,
+                "--cli",
+                "stop",
+                "--config-name",
+                command_config_name,
+            ]
         else:
             command_location = get_command_path("maestral", "maestral")
             start_cmd = [
@@ -324,9 +339,14 @@ class AutoStart:
                 "start",
                 "--foreground",
                 "--config-name",
-                config_name,
+                command_config_name,
             ]
-            stop_cmd = [command_location, "stop", "--config-name", config_name]
+            stop_cmd = [
+                command_location,
+                "stop",
+                "--config-name",
+                command_config_name,
+            ]
 
         if self.implementation == SupportedImplementations.launchd:
             self._impl = AutoStartLaunchd(
@@ -344,7 +364,7 @@ class AutoStart:
             )
 
             self._impl = AutoStartSystemd(
-                service_name="maestral-daemon@maestral.service",
+                service_name=f"maestral-daemon@{config_name}.service",
                 start_cmd=" ".join(start_cmd),
                 unit_dict={"Description": "Maestral daemon for the config %i"},
                 service_dict={

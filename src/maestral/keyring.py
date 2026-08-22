@@ -17,7 +17,12 @@ import keyrings.alt.file
 import requests
 from keyring.backend import KeyringBackend
 from keyring.core import load_keyring
-from keyring.errors import InitError, KeyringLocked, PasswordDeleteError
+from keyring.errors import (
+    InitError,
+    KeyringLocked,
+    NoKeyringError,
+    PasswordDeleteError,
+)
 
 from .cli import output
 
@@ -72,7 +77,7 @@ class CredentialStorage:
 
     def __init__(self, config_name: str) -> None:
         self._config_name = config_name
-        self._logger = scoped_logger(config_name, __name__)
+        self._logger = scoped_logger(__name__, config_name)
 
         self._conf = MaestralConfig(config_name)
 
@@ -139,6 +144,9 @@ class CredentialStorage:
             k for k in available_rings if isinstance(k, supported_keyring_backends)
         ]
 
+        if not supported_rings:
+            raise NoKeyringError("No supported keyring backend found")
+
         ring = max(supported_rings, key=lambda x: x.priority)
 
         return ring
@@ -197,7 +205,7 @@ class CredentialStorage:
             raise new_exc
         except Exception as e:
             title = "Could not load auth token"
-            new_exc = KeyringAccessError(title, e.args[0])
+            new_exc = KeyringAccessError(title, str(e))
             self._logger.error(title, exc_info=exc_info_tuple(new_exc))
             raise new_exc
 
@@ -205,28 +213,78 @@ class CredentialStorage:
             self._token = token
             self._loaded = True
 
-    def save_creds(self, account_id: str, token: str) -> None:
+    def save_creds(
+        self, account_id: str, token: str, allow_plaintext: bool = False
+    ) -> None:
         """
-        Saves the auth token to system keyring. Falls back to plain text storage if the
-        user denies access to keyring.
+        Saves the auth token to the system keyring. Falls back to plain text storage
+        only if no keyring is available and the caller has explicitly allowed it.
 
         :param account_id: The account ID.
         :param token: The access token.
+        :param allow_plaintext: Whether to allow plain text credential storage when no
+            secure keyring is available.
+        :raises KeyringAccessError: if the keyring cannot be accessed or plain text
+            storage is required but has not been allowed.
         """
         with self._lock:
-            if self._keyring:
-                keyring = self._keyring
-            else:
-                keyring = self._best_keyring_backend()
+            try:
+                if self._keyring:
+                    keyring = self._keyring
+                else:
+                    keyring = self._best_keyring_backend()
+            except NoKeyringError as exc:
+                if not allow_plaintext:
+                    raise KeyringAccessError(
+                        "No secure keyring available",
+                        "Relink with explicit permission to store the auth token "
+                        "in plain text.",
+                    ) from exc
+
+                keyring = keyrings.alt.file.PlaintextKeyring()
+            except (KeyringLocked, InitError) as exc:
+                raise KeyringAccessError(
+                    "Could not save auth token",
+                    "The system keyring is locked or unavailable. Please try again.",
+                ) from exc
+            except Exception as exc:
+                raise KeyringAccessError("Could not save auth token", str(exc)) from exc
 
             accessor = self._get_accessor(account_id)
 
+            if isinstance(keyring, keyrings.alt.file.PlaintextKeyring):
+                if not allow_plaintext:
+                    raise KeyringAccessError(
+                        "No secure keyring available",
+                        "Relink with explicit permission to store the auth token "
+                        "in plain text.",
+                    )
+
             try:
                 keyring.set_password("Maestral", accessor, token)
-            except Exception:
-                # switch to plain text keyring if we cannot access preferred backend
+            except NoKeyringError as exc:
+                if not allow_plaintext:
+                    raise KeyringAccessError(
+                        "No secure keyring available",
+                        "Relink with explicit permission to store the auth token "
+                        "in plain text.",
+                    ) from exc
+
                 keyring = keyrings.alt.file.PlaintextKeyring()
-                keyring.set_password("Maestral", accessor, token)
+                try:
+                    keyring.set_password("Maestral", accessor, token)
+                except Exception as fallback_exc:
+                    raise KeyringAccessError(
+                        "Could not save auth token", str(fallback_exc)
+                    ) from fallback_exc
+            except (KeyringLocked, InitError) as exc:
+                name = getattr(keyring, "name", keyring.__class__.__name__)
+                raise KeyringAccessError(
+                    "Could not save auth token",
+                    f"{name} is locked or unavailable. Please try again.",
+                ) from exc
+            except Exception as exc:
+                raise KeyringAccessError("Could not save auth token", str(exc)) from exc
 
             self.set_keyring_backend(keyring)
 
@@ -264,10 +322,10 @@ class CredentialStorage:
                     raise exc
                 except PasswordDeleteError as exc:
                     # password does not exist in keyring
-                    self._logger.info(exc.args[0])
+                    self._logger.info(str(exc))
                 except Exception as e:
                     title = "Could not delete auth token"
-                    new_exc = KeyringAccessError(title, e.args[0])
+                    new_exc = KeyringAccessError(title, str(e))
                     self._logger.error(title, exc_info=exc_info_tuple(new_exc))
                     raise new_exc
                 else:

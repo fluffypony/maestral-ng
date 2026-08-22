@@ -13,14 +13,13 @@ import fcntl
 import inspect
 import os
 import pickle
-import re
 import signal
 import struct
+import subprocess
 import sys
 import threading
 import time
 from pprint import pformat
-from shlex import quote
 from types import TracebackType
 from typing import TYPE_CHECKING, Any, ContextManager, Iterable
 
@@ -78,6 +77,11 @@ IS_WATCHDOG = WATCHDOG_PID is None or WATCHDOG_PID == str(os.getpid())
 URI = "PYRO:maestral.{0}@{1}"
 Pyro5.config.THREADPOOL_SIZE_MIN = 2
 
+_DAEMON_START_SCRIPT = (
+    "from maestral.daemon import start_maestral_daemon; "
+    "import sys; start_maestral_daemon(sys.argv[1])"
+)
+
 
 def freeze_support() -> None:
     """
@@ -87,15 +91,12 @@ def freeze_support() -> None:
     """
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("-c")
+    parser.add_argument("config_name", nargs="?")
     parsed_args, _ = parser.parse_known_args()
 
-    if parsed_args.c:
-        template = r'.*start_maestral_daemon\("(?P<config_name>\S+)"\).*'
-        match = re.match(template, parsed_args.c)
-
-        if match:
-            start_maestral_daemon(match["config_name"])
-            sys.exit()
+    if parsed_args.c == _DAEMON_START_SCRIPT and parsed_args.config_name:
+        start_maestral_daemon(parsed_args.config_name)
+        sys.exit()
 
 
 class Stop(enum.Enum):
@@ -113,6 +114,7 @@ class Start(enum.Enum):
     Ok = 0
     AlreadyRunning = 1
     Failed = 2
+    Uninitialized = 3
 
 
 # ==== error serialization =============================================================
@@ -218,17 +220,12 @@ class Lock:
 
         :returns: Whether the lock is acquired.
         """
-        with self._lock:
-            gotten = self.acquire()
-            if gotten:
-                self.release()
-            return not gotten
+        return self.locking_pid() is not None
 
     def locking_pid(self) -> int | None:
         """
         Returns the PID of the process which currently holds the lock or ``None``. This
-        should work on macOS, OpenBSD and Linux but may fail on some platforms. Always
-        use :meth:`locked` to check if the lock is held by any process.
+        uses a read-only ``F_GETLK`` query and should work on macOS, OpenBSD and Linux.
 
         :returns: The PID of the process which currently holds the lock or ``None``.
         """
@@ -250,7 +247,8 @@ class Lock:
                 pid_index = 4
                 flock = struct.pack(fmt, fcntl.F_WRLCK, 0, 0, 0, 0, 0)
 
-            lockdata = fcntl.fcntl(fh.fileno(), fcntl.F_GETLK, flock)
+            with fh:
+                lockdata = fcntl.fcntl(fh.fileno(), fcntl.F_GETLK, flock)
             lockdata_list = struct.unpack(fmt, lockdata)
             pid = lockdata_list[pid_index]
 
@@ -326,12 +324,17 @@ def is_running(config_name: str) -> bool:
     return maestral_lock(config_name).locked()
 
 
-def wait_for_startup(config_name: str, timeout: float = 30) -> None:
+def wait_for_startup(
+    config_name: str,
+    timeout: float = 30,
+    process: subprocess.Popen[bytes] | None = None,
+) -> None:
     """
     Waits until we can communicate with the maestral daemon for ``config_name``.
 
     :param config_name: Configuration to connect to.
     :param timeout: Timeout it seconds until we raise an error.
+    :param process: Daemon process to monitor for an early exit.
     :raises CommunicationError: if we cannot communicate with the daemon within the
         given timeout.
     """
@@ -345,6 +348,10 @@ def wait_for_startup(config_name: str, timeout: float = 30) -> None:
             maestral_daemon._pyroBind()
             return
         except Exception as exc:
+            if process is not None and process.poll() is not None:
+                raise ChildProcessError(
+                    f"Daemon exited with status {process.returncode}"
+                ) from exc
             if time.time() - t0 > timeout:
                 raise exc
             else:
@@ -377,8 +384,11 @@ def start_maestral_daemon(
 
     import asyncio
 
+    from .config import validate_config_name
     from .logging import scoped_logger, setup_logging
     from .main import Maestral
+
+    config_name = validate_config_name(config_name)
 
     setup_logging(config_name, stderr=log_to_stderr)
     dlogger = scoped_logger(__name__, config_name)
@@ -410,6 +420,10 @@ def start_maestral_daemon(
         if IS_MACOS:
             dlogger.debug("Integrating with CFEventLoop")
 
+            from rubicon.objc.runtime import load_library
+
+            load_library("AppKit")
+
             from rubicon.objc.eventloop import EventLoopPolicy
 
             event_loop_policy = EventLoopPolicy()
@@ -429,6 +443,7 @@ def start_maestral_daemon(
 
         # Notify systemd periodically if alive.
         if IS_WATCHDOG and WATCHDOG_USEC:
+
             async def periodic_watchdog() -> None:
                 if WATCHDOG_USEC:
                     sleep = int(WATCHDOG_USEC)
@@ -490,7 +505,7 @@ def start_maestral_daemon(
             daemon.transportServer.housekeeper = None
 
     except Exception as exc:
-        dlogger.error(exc.args[0], exc_info=True)
+        dlogger.error(str(exc), exc_info=True)
     finally:
         # Notify systemd that we are shutting down.
         sd_notifier.notify("STOPPING=1")
@@ -518,21 +533,22 @@ def start_maestral_daemon_process(
         that :attr:`Start.Ok` may be returned instead of :attr:`Start.AlreadyRunning`
         in case of a race but the daemon is nevertheless started only once.
     """
+    from .config import validate_config_name
+
+    config_name = validate_config_name(config_name)
+
     if is_running(config_name):
         return Start.AlreadyRunning
-
-    # Protect against injection.
-    cc = quote(config_name).strip("'")
-
-    script = f'import maestral.daemon; maestral.daemon.start_maestral_daemon("{cc}")'
 
     env = os.environ.copy()
     env.update(ENV)
 
-    pid = os.spawnve(os.P_NOWAIT, sys.executable, [sys.executable, "-c", script], env)
+    process = subprocess.Popen(
+        [sys.executable, "-c", _DAEMON_START_SCRIPT, config_name], env=env
+    )
 
     try:
-        wait_for_startup(config_name, timeout)
+        wait_for_startup(config_name, timeout, process)
     except Exception as exc:
         from .logging import scoped_logger, setup_logging
 
@@ -541,17 +557,25 @@ def start_maestral_daemon_process(
 
         clogger.error("Could not communicate with daemon", exc_info=exc_info_tuple(exc))
 
-        # Let's check if the daemon is running
-        try:
-            os.kill(pid, 0)
+        if process.poll() is None:
             clogger.error("Daemon is running but not responsive, killing now")
-        except OSError:
-            clogger.error("Daemon quit unexpectedly")
+            process.terminate()
+
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
         else:
-            os.kill(pid, signal.SIGTERM)
+            clogger.error("Daemon quit unexpectedly with status %s", process.returncode)
 
         return Start.Failed
     else:
+        threading.Thread(
+            target=process.wait,
+            name=f"maestral-daemon-reaper-{config_name}",
+            daemon=True,
+        ).start()
         return Start.Ok
 
 
