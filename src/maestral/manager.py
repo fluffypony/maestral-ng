@@ -29,6 +29,7 @@ from .constants import (
     DISCONNECTED,
     FILE_CACHE,
     IDLE,
+    IS_LINUX,
     MIGNORE_FILE,
     OLD_REV_FILE,
     PAUSED,
@@ -284,7 +285,7 @@ class SyncManager:
         try:
             local_observer_thread.start()
         except OSError as exc:
-            if exc.errno in (errno.ENOSPC, errno.EMFILE):
+            if IS_LINUX and exc.errno in (errno.ENOSPC, errno.EMFILE):
                 try:
                     max_user_watches, max_user_instances, _ = get_inotify_limits()
                 except OSError:
@@ -315,7 +316,8 @@ class SyncManager:
                     )
 
             elif exc.errno in (errno.EPERM, errno.EACCES):
-                raise InotifyError(
+                error_cls = InotifyError if IS_LINUX else MaestralApiError
+                raise error_cls(
                     "Insufficient permissions to monitor local changes",
                     "Please check the permissions for your local Dropbox folder",
                 )
@@ -489,7 +491,7 @@ class SyncManager:
 
                 for entry in local_dropbox_dirlist:
                     if normalize(entry.name) not in maestral_file_names:
-                        new_path = f"{tmpdir.name}/{entry.name}"
+                        new_path = os.path.join(tmpdir.name, entry.name)
                         self._logger.debug(
                             "Moving to personal folder: %r → %r", entry.path, new_path
                         )
@@ -522,19 +524,20 @@ class SyncManager:
                 old_home_root = (
                     current_user_home_entry.path
                     if current_user_home_entry
-                    else self.sync.dropbox_path + current_user_home_path
+                    else self.sync.to_local_path_from_cased(current_user_home_path)
                 )
 
                 tmpdir = TemporaryDirectory(dir=self.sync.dropbox_path)
+                tmp_home_root = os.path.join(tmpdir.name, "home")
 
                 try:
-                    os.rename(old_home_root, tmpdir.name)
+                    os.rename(old_home_root, tmp_home_root)
                 except (FileNotFoundError, NotADirectoryError):
                     # User folder does not (yet) exist.
                     pass
                 else:
-                    for entry in list(os.scandir(tmpdir.name)):
-                        new_path = f"{self.sync.dropbox_path}/{entry.name}"
+                    for entry in list(os.scandir(tmp_home_root)):
+                        new_path = os.path.join(self.sync.dropbox_path, entry.name)
                         move(entry.path, new_path, raise_error=True)
                         self._logger.debug(
                             "Moved to root folder: %r → %r", entry.path, new_path

@@ -1,4 +1,5 @@
 import os
+import platform
 import re
 from typing import List, TypeVar
 
@@ -17,6 +18,15 @@ __all__ = [
 
 
 _C = TypeVar("_C", bound=str)
+
+_WINDOWS_RESERVED_NAMES = {
+    "CON",
+    "PRN",
+    "AUX",
+    "NUL",
+    *(f"COM{i}" for i in range(1, 10)),
+    *(f"LPT{i}" for i in range(1, 10)),
+}
 
 
 def list_configs() -> List[str]:
@@ -72,5 +82,11 @@ def validate_config_name(string: _C) -> _C:
             "Config name may contain only letters, numbers, periods, underscores, "
             "and hyphens"
         )
+
+    if platform.system() == "Windows" and (
+        string.endswith(".")
+        or string.split(".", 1)[0].upper() in _WINDOWS_RESERVED_NAMES
+    ):
+        raise ValueError("Config name is reserved on Windows")
 
     return string

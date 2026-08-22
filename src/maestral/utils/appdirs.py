@@ -1,6 +1,6 @@
 """
 This module contains functions to retrieve platform dependent locations to store app
-data. It supports macOS and Linux.
+data. It supports macOS, Linux and Windows.
 """
 
 # system imports
@@ -46,7 +46,15 @@ def get_home_dir() -> str:
     )
 
 
-home_dir = get_home_dir()
+def _windows_appdata(local: bool) -> str:
+    """Return the per-user Windows application-data directory."""
+    variable = "LOCALAPPDATA" if local else "APPDATA"
+    appdata = os.environ.get(variable)
+    if appdata:
+        return appdata
+
+    kind = "Local" if local else "Roaming"
+    return osp.join(get_home_dir(), "AppData", kind)
 
 
 def get_conf_path(
@@ -57,7 +65,7 @@ def get_conf_path(
 
         - macOS: "~/Library/Application Support/<subfolder>/<filename>."
         - Linux: "XDG_CONFIG_HOME/<subfolder>/<filename>"
-        - other: "~/.config/<subfolder>/<filename>"
+        - Windows: ``%APPDATA%/<subfolder>/<filename>``
 
     :param subfolder: The subfolder for the app.
     :param filename: The filename to append for the app.
@@ -68,6 +76,8 @@ def get_conf_path(
     elif platform.system() == "Linux":
         fallback = osp.join(get_home_dir(), ".config")
         conf_path = os.environ.get("XDG_CONFIG_HOME", fallback)
+    elif platform.system() == "Windows":
+        conf_path = _windows_appdata(local=False)
     else:
         raise RuntimeError("Platform not supported")
 
@@ -82,7 +92,7 @@ def get_data_path(
 
         - macOS: "~/Library/Application Support/SUBFOLDER/FILENAME"
         - Linux: "$XDG_DATA_DIR/SUBFOLDER/FILENAME"
-        - fallback: "$HOME/.local/share/SUBFOLDER/FILENAME"
+        - Windows: ``%LOCALAPPDATA%/SUBFOLDER/FILENAME``
 
     Note: We do not use "~/Library/Saved Application State" on macOS since this folder
     is reserved for user interface state and can be cleared by the user / system.
@@ -96,6 +106,8 @@ def get_data_path(
     elif platform.system() == "Linux":
         fallback = osp.join(get_home_dir(), ".local", "share")
         state_path = os.environ.get("XDG_DATA_HOME", fallback)
+    elif platform.system() == "Windows":
+        state_path = _windows_appdata(local=True)
     else:
         raise RuntimeError("Platform not supported")
 
@@ -110,17 +122,19 @@ def get_cache_path(
 
         - macOS: "~/Library/Caches/SUBFOLDER/FILENAME"
         - Linux: "$XDG_CACHE_HOME/SUBFOLDER/FILENAME"
-        - fallback: "$HOME/.cache/SUBFOLDER/FILENAME"
+        - Windows: ``%LOCALAPPDATA%/SUBFOLDER/FILENAME``
 
     :param subfolder: The subfolder for the app.
     :param filename: The filename to append for the app.
     :param create: If ``True``, the folder ``subfolder`` will be created on-demand.
     """
     if platform.system() == "Darwin":
-        cache_path = osp.join(home_dir, "Library", "Caches")
+        cache_path = osp.join(get_home_dir(), "Library", "Caches")
     elif platform.system() == "Linux":
-        fallback = osp.join(home_dir, ".cache")
+        fallback = osp.join(get_home_dir(), ".cache")
         cache_path = os.environ.get("XDG_CACHE_HOME", fallback)
+    elif platform.system() == "Windows":
+        cache_path = _windows_appdata(local=True)
     else:
         raise RuntimeError("Platform not supported")
 
@@ -135,16 +149,18 @@ def get_log_path(
 
         - macOS: "~/Library/Logs/SUBFOLDER/FILENAME"
         - Linux: "$XDG_CACHE_HOME/SUBFOLDER/FILENAME"
-        - fallback: "$HOME/.cache/SUBFOLDER/FILENAME"
+        - Windows: ``%LOCALAPPDATA%/SUBFOLDER/FILENAME``
 
     :param subfolder: The subfolder for the app.
     :param filename: The filename to append for the app.
     :param create: If ``True``, the folder ``subfolder`` will be created on-demand.
     """
     if platform.system() == "Darwin":
-        log_path = osp.join(home_dir, "Library", "Logs")
+        log_path = osp.join(get_home_dir(), "Library", "Logs")
     elif platform.system() == "Linux":
         log_path = get_cache_path(create=False)
+    elif platform.system() == "Windows":
+        log_path = _windows_appdata(local=True)
     else:
         raise RuntimeError("Platform not supported")
 
@@ -157,15 +173,26 @@ def get_autostart_path(filename: Optional[str] = None, create: bool = True) -> s
 
         - macOS: "~/Library/LaunchAgents/FILENAME"
         - Linux: "$XDG_CONFIG_HOME/autostart/FILENAME"
-        - fallback: "$HOME/.config/autostart/FILENAME"
+        - Windows: ``%APPDATA%/Microsoft/Windows/Start Menu/Programs/Startup/FILENAME``
 
     :param filename: The filename to append for the app.
     :param create: If ``True``, the folder ``subfolder`` will be created on-demand.
     """
     if platform.system() == "Darwin":
-        autostart_path = osp.join(home_dir, "Library", "LaunchAgents")
+        autostart_path = osp.join(get_home_dir(), "Library", "LaunchAgents")
     elif platform.system() == "Linux":
         autostart_path = get_conf_path("autostart", create=create)
+    elif platform.system() == "Windows":
+        autostart_path = osp.join(
+            _windows_appdata(local=False),
+            "Microsoft",
+            "Windows",
+            "Start Menu",
+            "Programs",
+            "Startup",
+        )
+        if create:
+            os.makedirs(autostart_path, exist_ok=True)
     else:
         raise RuntimeError("Platform not supported")
 
@@ -183,7 +210,7 @@ def get_runtime_path(
 
         - macOS: "~/Library/Application Support/SUBFOLDER/FILENAME"
         - Linux: "$XDG_RUNTIME_DIR/SUBFOLDER/FILENAME"
-        - fallback: "$HOME/.cache/SUBFOLDER/FILENAME"
+        - Windows: ``%LOCALAPPDATA%/SUBFOLDER/FILENAME``
 
     :param subfolder: The subfolder for the app.
     :param filename: The filename to append for the app.
@@ -194,6 +221,8 @@ def get_runtime_path(
     elif platform.system() == "Linux":
         fallback = get_cache_path(create=False)
         runtime_path = os.environ.get("XDG_RUNTIME_DIR", fallback)
+    elif platform.system() == "Windows":
+        runtime_path = _windows_appdata(local=True)
     else:
         raise RuntimeError("Platform not supported")
 

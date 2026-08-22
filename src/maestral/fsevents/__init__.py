@@ -16,11 +16,17 @@ from watchdog.utils import platform
 if TYPE_CHECKING:
     from watchdog.observers.fsevents import FSEventsObserver
     from watchdog.observers.inotify import InotifyObserver
+    from watchdog.observers.read_directory_changes import WindowsApiObserver
 
     from .polling import OrderedPollingObserver
 
 
-ObserverType = Union["InotifyObserver", "FSEventsObserver", "OrderedPollingObserver"]
+ObserverType = Union[
+    "InotifyObserver",
+    "FSEventsObserver",
+    "WindowsApiObserver",
+    "OrderedPollingObserver",
+]
 Observer: Type[ObserverType]
 
 
@@ -28,6 +34,8 @@ if platform.is_linux():
     from watchdog.observers.inotify import InotifyObserver as Observer
 elif platform.is_darwin():
     from watchdog.observers.fsevents import FSEventsObserver as Observer
+elif platform.is_windows():
+    from watchdog.observers.read_directory_changes import WindowsApiObserver as Observer
 else:
     from .polling import OrderedPollingObserver as Observer
 

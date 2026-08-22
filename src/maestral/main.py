@@ -43,6 +43,7 @@ from .constants import (
     IDLE,
     IS_LINUX,
     IS_MACOS,
+    IS_WINDOWS,
     PAUSED,
     FileStatus,
 )
@@ -210,8 +211,8 @@ class Maestral:
 
     @staticmethod
     def _check_system_compatibility() -> None:
-        if not (IS_MACOS or IS_LINUX):
-            raise RuntimeError("Only macOS and Linux are supported")
+        if not (IS_MACOS or IS_LINUX or IS_WINDOWS):
+            raise RuntimeError("Only macOS, Linux, and Windows are supported")
 
     def _setup_logging_external(self) -> None:
         """

@@ -7,9 +7,10 @@ name = "maestral"
 version = "1.9.7.dev0"
 authors = [{ name = "Sam Schott", email = "sam.schott@outlook.com" }]
 license = { text = "MIT" }
-description = "Open-source Dropbox client for macOS and Linux."
+description = "Open-source Dropbox client for macOS, Linux, and Windows."
 classifiers = [
     "License :: OSI Approved :: MIT License",
+    "Operating System :: Microsoft :: Windows :: Windows 11",
     "Operating System :: Unix",
     "Programming Language :: Python",
     "Programming Language :: Python :: 3",
@@ -33,7 +34,7 @@ dependencies = [
     "rich",
     "typing_extensions",
     "watchdog>=2.0.1",
-    "xattr",
+    "xattr; platform_system != 'Windows'",
 ]
 
 [project.readme]

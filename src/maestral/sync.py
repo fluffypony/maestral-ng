@@ -9,6 +9,7 @@ import errno
 import gc
 import os
 import os.path as osp
+import posixpath
 import random
 import sqlite3
 import sys
@@ -107,7 +108,7 @@ from .models import (
     SyncEvent,
     SyncStatus,
 )
-from .utils import exc_info_tuple, removeprefix, sanitize_string
+from .utils import exc_info_tuple, sanitize_string
 from .utils.appdirs import get_data_path
 from .utils.caches import LRUCache
 from .utils.integration import CPU_CORE_COUNT, cpu_usage_percent
@@ -118,6 +119,7 @@ from .utils.path import (
     exists,
     generate_cc_name,
     get_existing_equivalent_paths,
+    get_local_change_time,
     get_symlink_target,
     getsize,
     is_child,
@@ -1006,7 +1008,7 @@ class SyncEngine:
                     dbx_path_lower=dbx_path_lower,
                     dbx_id=event.dbx_id,
                     item_type=event.item_type,
-                    last_sync=self._get_ctime(event.local_path),
+                    last_sync=self._get_change_time(event.local_path),
                     rev=event.rev,
                     content_hash=event.content_hash,
                     symlink_target=event.symlink_target,
@@ -1348,11 +1350,11 @@ class SyncEngine:
         """
         dbx_path_lower = normalize(dbx_path_basename_cased)
 
-        dirname, basename = osp.split(dbx_path_basename_cased)
-        dirname_lower = osp.dirname(dbx_path_lower)
+        dirname, basename = posixpath.split(dbx_path_basename_cased)
+        dirname_lower = posixpath.dirname(dbx_path_lower)
 
         dirname_cased = self._correct_case_helper(dirname, dirname_lower)
-        path_cased = osp.join(dirname_cased, basename)
+        path_cased = posixpath.join(dirname_cased, basename)
 
         # Add our result to the cache.
         self._case_conversion_cache.put(dbx_path_lower, path_cased)
@@ -1409,9 +1411,12 @@ class SyncEngine:
 
         if not is_equal_or_child(path, self.dropbox_path, self.is_fs_case_sensitive):
             raise ValueError(f'"{path}" is not in "{self.dropbox_path}"')
-        return "/" + removeprefix(
-            path, self.dropbox_path, self.is_fs_case_sensitive
-        ).lstrip("/")
+        relative_path = osp.relpath(path, self.dropbox_path)
+        if relative_path == osp.curdir:
+            return "/"
+        if osp.sep != "/":
+            relative_path = relative_path.replace(osp.sep, "/")
+        return "/" + relative_path
 
     def to_dbx_path_lower(self, local_path: str | bytes) -> str:
         """
@@ -1433,7 +1438,16 @@ class SyncEngine:
         :param dbx_path_cased: Path relative to Dropbox folder, correctly cased.
         :returns: Corresponding local path on drive.
         """
-        return f"{self.dropbox_path}{dbx_path_cased}"
+        if dbx_path_cased in ("", "/"):
+            return self.dropbox_path
+        if not dbx_path_cased.startswith("/"):
+            raise ValueError(f"Invalid Dropbox path: {dbx_path_cased!r}")
+
+        parts = dbx_path_cased[1:].split("/")
+        if any(part in ("", ".", "..") or osp.basename(part) != part for part in parts):
+            raise ValueError(f"Invalid Dropbox path: {dbx_path_cased!r}")
+
+        return osp.join(self.dropbox_path, *parts)
 
     def to_local_path(self, dbx_path: str) -> str:
         """
@@ -1597,7 +1611,7 @@ class SyncEngine:
         if not err.dbx_path:
             raise ValueError("Sync error has an unknown path")
 
-        printable_file_name = sanitize_string(osp.basename(err.dbx_path))
+        printable_file_name = sanitize_string(posixpath.basename(err.dbx_path))
 
         self._logger.info("Could not sync %s", printable_file_name, exc_info=True)
 
@@ -2840,7 +2854,7 @@ class SyncEngine:
                 cased_path = index_entry.dbx_path_cased if index_entry else dbx_path
 
                 md = DeletedMetadata(
-                    name=osp.basename(dbx_path),
+                    name=posixpath.basename(dbx_path),
                     path_lower=dbx_path_lower,
                     path_display=cased_path,
                 )
@@ -3151,7 +3165,8 @@ class SyncEngine:
            for deleted or not present items.
         2) Local vs remote content hash: 'folder' for folders, actual hash for files and
            None for deletions.
-        3) Local ctime vs last sync time: This is calculated recursively for folders.
+        3) Local change time vs last sync time: This is calculated recursively for
+           folders. We use mtime on Windows and ctime on Unix.
 
         :param event: Download SyncEvent.
         :returns: Conflict check result.
@@ -3195,7 +3210,7 @@ class SyncEngine:
                 'Unresolved upload error for "%s": conflict', event.dbx_path
             )
             return Conflict.Conflict
-        elif not self._ctime_newer_than_last_sync(event.local_path):
+        elif not self._change_time_newer_than_last_sync(event.local_path):
             # Last change time of local item (recursive for folders) is older than
             # the last time the item was synced. Remote must be newer.
             self._logger.debug(
@@ -3219,11 +3234,10 @@ class SyncEngine:
             )
             return Conflict.Conflict
 
-    def _ctime_newer_than_last_sync(self, local_path: str) -> bool:
+    def _change_time_newer_than_last_sync(self, local_path: str) -> bool:
         """
-        Checks if a local item has any unsynced changes. This is by comparing its ctime
-        to the ``last_sync`` time saved in our index. In case of folders, we recursively
-        check the ctime of children.
+        Checks if a local item has any unsynced changes. This compares the platform
+        change time to ``last_sync`` in our index. For folders, it checks all children.
 
         :param local_path: Local path of item to check.
         :returns: Whether the local item has unsynced changes.
@@ -3239,12 +3253,12 @@ class SyncEngine:
             try:
                 stat = os.lstat(local_path)
             except (FileNotFoundError, NotADirectoryError):
-                # Don't check ctime for deleted items (os won't give stat info)
+                # Don't check the timestamp for deleted items (os won't give stat info)
                 # but confirm absence from index.
                 return index_entry is not None
 
             if S_ISDIR(stat.st_mode):
-                # Don't check ctime for folders but compare to index entry type.
+                # Don't check the directory time but compare to the index entry type.
                 if index_entry is None or index_entry.is_file:
                     return True
 
@@ -3252,47 +3266,50 @@ class SyncEngine:
                 with os.scandir(local_path) as it:
                     for entry in it:
                         if entry.is_dir(follow_symlinks=False):
-                            if self._ctime_newer_than_last_sync(entry.path):
+                            if self._change_time_newer_than_last_sync(entry.path):
                                 return True
                         elif not self.is_excluded(entry.name):
                             child_dbx_path_lower = self.to_dbx_path_lower(entry.path)
-                            ctime = entry.stat(follow_symlinks=False).st_ctime
-                            if ctime > self.get_last_sync(child_dbx_path_lower):
+                            change_time = get_local_change_time(
+                                entry.stat(follow_symlinks=False)
+                            )
+                            if change_time > self.get_last_sync(child_dbx_path_lower):
                                 return True
 
                 return False
 
             else:
-                # Check our ctime against index.
-                return stat.st_ctime > self.get_last_sync(dbx_path_lower)
+                # Check the platform change time against the index.
+                return get_local_change_time(stat) > self.get_last_sync(dbx_path_lower)
 
-    def _get_ctime(self, local_path: str) -> float:
+    def _get_change_time(self, local_path: str) -> float:
         """
-        Returns the ctime of a local item or -1.0 if there is nothing at the path. If
-        the item is a directory, return the largest ctime of it and its children. Items
-        which are excluded from syncing (e.g., .DS_Store files) are ignored.
+        Returns a local item's platform change time, or -1.0 if it does not exist. For
+        a directory, returns the latest child change time and ignores excluded items.
 
         :param local_path: Absolute path on local drive.
-        :returns: Ctime or -1.0.
+        :returns: Change time or -1.0.
         """
         try:
             stat = os.lstat(local_path)
             if S_ISDIR(stat.st_mode):
-                ctime = stat.st_ctime
+                change_time = get_local_change_time(stat)
                 with os.scandir(local_path) as it:
                     for entry in it:
                         if entry.is_dir(follow_symlinks=False):
-                            child_ctime = self._get_ctime(entry.path)
+                            child_change_time = self._get_change_time(entry.path)
                         elif not self.is_excluded(entry.name):
-                            child_ctime = entry.stat(follow_symlinks=False).st_ctime
+                            child_change_time = get_local_change_time(
+                                entry.stat(follow_symlinks=False)
+                            )
                         else:
-                            child_ctime = -1.0
+                            child_change_time = -1.0
 
-                        ctime = max(ctime, child_ctime)
+                        change_time = max(change_time, child_change_time)
 
-                return ctime
+                return change_time
             else:
-                return stat.st_ctime
+                return get_local_change_time(stat)
         except (FileNotFoundError, NotADirectoryError):
             return -1.0
         except OSError as exc:
@@ -3406,7 +3423,7 @@ class SyncEngine:
 
         :param event: SyncEvent for target file.
         """
-        dbx_path_lower_dirname = osp.dirname(event.dbx_path_lower)
+        dbx_path_lower_dirname = posixpath.dirname(event.dbx_path_lower)
 
         if dbx_path_lower_dirname == "/":
             return

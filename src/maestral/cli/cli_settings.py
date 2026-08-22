@@ -16,8 +16,8 @@ if TYPE_CHECKING:
     help="""
 Automatically start the sync daemon on login.
 
-A systemd or launchd service will be created to start a sync daemon for the given
-configuration on user login.
+A systemd or launchd service, or a Windows user-logon entry, will start the sync daemon
+for the given configuration.
 """,
 )
 @click.option("--yes", "-Y", is_flag=True, default=False)
@@ -31,7 +31,7 @@ def autostart(yes: bool, no: bool, config_name: str) -> None:
     if not auto_start.implementation:
         echo(
             "Autostart is currently not supported for your platform.\n"
-            "Autostart requires systemd on Linux or launchd on macOS."
+            "Autostart requires systemd on Linux, launchd on macOS, or Windows."
         )
         return
 

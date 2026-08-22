@@ -437,6 +437,7 @@ class JsonRpcServer:
     def __init__(self, target: object) -> None:
         self.dispatcher = JsonRpcDispatcher(target)
         self._server: asyncio.AbstractServer | None = None
+        self._writers: set[asyncio.StreamWriter] = set()
 
     @property
     def sockets(self) -> tuple[socket.socket, ...]:
@@ -463,13 +464,34 @@ class JsonRpcServer:
     async def close(self) -> None:
         if self._server is None:
             return
-        self._server.close()
-        await self._server.wait_closed()
+        server = self._server
         self._server = None
+        server.close()
+
+        writers = tuple(self._writers)
+        for writer in writers:
+            writer.close()
+        if writers:
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(
+                        *(writer.wait_closed() for writer in writers),
+                        return_exceptions=True,
+                    ),
+                    timeout=1,
+                )
+            except TimeoutError:
+                pass
+
+        try:
+            await asyncio.wait_for(server.wait_closed(), timeout=1)
+        except TimeoutError:
+            pass
 
     async def _handle_client(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
+        self._writers.add(writer)
         try:
             while True:
                 try:
@@ -513,18 +535,20 @@ class JsonRpcServer:
         except (ConnectionError, OSError):
             return
         finally:
+            self._writers.discard(writer)
             writer.close()
             try:
-                await writer.wait_closed()
-            except (ConnectionError, OSError):
+                await asyncio.wait_for(writer.wait_closed(), timeout=1)
+            except (TimeoutError, ConnectionError, OSError):
                 pass
 
 
 class JsonRpcConnection:
     """A blocking client connection to a local JSON-RPC server."""
 
-    def __init__(self, endpoint: RpcEndpoint) -> None:
+    def __init__(self, endpoint: RpcEndpoint, timeout: float | None = None) -> None:
         self.endpoint = endpoint
+        self.timeout = timeout
         self._socket: socket.socket | None = None
         self._reader: Any = None
         self._request_id = 0
@@ -537,11 +561,14 @@ class JsonRpcConnection:
         try:
             if self.endpoint.kind == "unix":
                 sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                sock.settimeout(self.timeout)
                 sock.connect(self.endpoint.address)
             else:
                 if not isinstance(self.endpoint.address, tuple):
                     raise ValueError("Invalid TCP endpoint")
-                sock = socket.create_connection(self.endpoint.address)
+                sock = socket.create_connection(
+                    self.endpoint.address, timeout=self.timeout
+                )
         except (OSError, ValueError) as exc:
             raise CommunicationError(str(exc)) from exc
 

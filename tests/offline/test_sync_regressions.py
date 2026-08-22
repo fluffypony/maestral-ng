@@ -174,6 +174,16 @@ def test_inactive_scan_ignores_unicode_normalization_differences(
 def test_downloaded_symlink_replaces_existing_file(
     sync_engine: SyncEngine, tmp_path: Path
 ) -> None:
+    probe = tmp_path / "symlink-probe"
+    try:
+        probe.symlink_to("target")
+    except OSError as exc:
+        if getattr(exc, "winerror", None) == 1314:
+            pytest.skip("Windows did not grant symlink creation permission")
+        raise
+    else:
+        probe.unlink()
+
     destination = tmp_path / "link"
     destination.write_text("old contents")
     event = make_event(

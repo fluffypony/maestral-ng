@@ -1,6 +1,6 @@
 """
 This module handles starting the maestral daemon on user login and supports multiple
-platform specific backends such as launchd or systemd.
+platform specific backends such as launchd, systemd or the Windows registry.
 
 Note that launchd agents will not show as "login items" in macOS system preferences. As
 a result, the user does not have a convenient UI to remove Maestral autostart entries
@@ -27,12 +27,17 @@ from importlib.metadata import PackageNotFoundError, files
 from pathlib import Path
 from typing import Any
 
-from .constants import BUNDLE_ID, ENV, FROZEN, IS_LINUX, IS_MACOS
+from .constants import BUNDLE_ID, ENV, FROZEN, IS_LINUX, IS_MACOS, IS_WINDOWS
 from .exceptions import MaestralApiError
 
 # local imports
 from .utils.appdirs import get_conf_path, get_data_path, get_home_dir
 from .utils.integration import cat
+
+try:
+    import winreg
+except ImportError:  # pragma: no cover - Windows only
+    winreg = None  # type: ignore[assignment]
 
 
 class SupportedImplementations(Enum):
@@ -41,6 +46,7 @@ class SupportedImplementations(Enum):
     systemd = "systemd"
     launchd = "launchd"
     xdg_desktop = "xdg_desktop"
+    windows_registry = "windows_registry"
 
 
 class AutoStartBase:
@@ -185,6 +191,77 @@ class AutoStartLaunchd(AutoStartBase):
         return os.path.isfile(self.destination)
 
 
+class AutoStartWindows(AutoStartBase):
+    """Autostart backend for the current user's Windows ``Run`` registry key."""
+
+    RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+
+    def __init__(self, value_name: str, start_cmd: list[str]) -> None:
+        super().__init__()
+        self.value_name = value_name
+        self.command = subprocess.list2cmdline(start_cmd)
+
+    @staticmethod
+    def _registry() -> Any:
+        if winreg is None:  # pragma: no cover - guarded by platform detection
+            raise MaestralApiError(
+                "Could not configure autostart", "The Windows registry is unavailable."
+            )
+        return winreg
+
+    def enable(self) -> None:
+        if len(self.command) > 260:
+            raise MaestralApiError(
+                "Could not enable autostart",
+                "The autostart command exceeds the Windows limit of 260 characters.",
+            )
+
+        registry = self._registry()
+        try:
+            with registry.CreateKeyEx(
+                registry.HKEY_CURRENT_USER,
+                self.RUN_KEY,
+                0,
+                registry.KEY_SET_VALUE,
+            ) as key:
+                registry.SetValueEx(
+                    key, self.value_name, 0, registry.REG_SZ, self.command
+                )
+        except OSError as exc:
+            raise MaestralApiError("Could not enable autostart", str(exc)) from exc
+
+    def disable(self) -> None:
+        registry = self._registry()
+        try:
+            with registry.OpenKey(
+                registry.HKEY_CURRENT_USER,
+                self.RUN_KEY,
+                0,
+                registry.KEY_SET_VALUE,
+            ) as key:
+                registry.DeleteValue(key, self.value_name)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            raise MaestralApiError("Could not disable autostart", str(exc)) from exc
+
+    @property
+    def enabled(self) -> bool:
+        registry = self._registry()
+        try:
+            with registry.OpenKey(
+                registry.HKEY_CURRENT_USER,
+                self.RUN_KEY,
+                0,
+                registry.KEY_QUERY_VALUE,
+            ) as key:
+                value, value_type = registry.QueryValueEx(key, self.value_name)
+        except (FileNotFoundError, OSError):
+            return False
+
+        return value_type == registry.REG_SZ and value == self.command
+
+
 class AutoStartXDGDesktop(AutoStartBase):
     """Autostart backend for XDG desktop entries
 
@@ -257,6 +334,8 @@ def get_available_implementation() -> SupportedImplementations | None:
         init_command = cat(Path("/proc/1/comm"))
         if init_command is not None and b"systemd" in init_command:
             return SupportedImplementations.systemd
+    if IS_WINDOWS:
+        return SupportedImplementations.windows_registry
     return None
 
 
@@ -278,7 +357,13 @@ def get_command_path(dist: str, command: str) -> str:
 
     if dist_files:
         try:
-            rel_path = next(p for p in dist_files if p.match(f"**/bin/{command}"))
+            rel_path = next(
+                p
+                for p in dist_files
+                if p.match(f"**/bin/{command}")
+                or p.match(f"**/Scripts/{command}.exe")
+                or p.match(f"**/Scripts/{command}")
+            )
             path = rel_path.locate()
         except StopIteration:
             path = None
@@ -315,13 +400,18 @@ class AutoStart:
             if self.implementation == SupportedImplementations.systemd
             else config_name
         )
+        foreground_args = (
+            []
+            if self.implementation == SupportedImplementations.windows_registry
+            else ["--foreground"]
+        )
 
         if FROZEN:
             start_cmd = [
                 sys.executable,
                 "--cli",
                 "start",
-                "--foreground",
+                *foreground_args,
                 "--config-name",
                 command_config_name,
             ]
@@ -337,7 +427,7 @@ class AutoStart:
             start_cmd = [
                 command_location,
                 "start",
-                "--foreground",
+                *foreground_args,
                 "--config-name",
                 command_config_name,
             ]
@@ -348,7 +438,12 @@ class AutoStart:
                 command_config_name,
             ]
 
-        if self.implementation == SupportedImplementations.launchd:
+        if self.implementation == SupportedImplementations.windows_registry:
+            self._impl = AutoStartWindows(
+                f"{BUNDLE_ID}-daemon.{config_name}", start_cmd
+            )
+
+        elif self.implementation == SupportedImplementations.launchd:
             self._impl = AutoStartLaunchd(
                 f"{BUNDLE_ID}-daemon.{config_name}",
                 start_cmd,

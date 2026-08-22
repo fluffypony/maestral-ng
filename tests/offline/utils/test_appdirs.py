@@ -1,3 +1,4 @@
+import os.path as osp
 import platform
 
 import pytest
@@ -14,13 +15,15 @@ from maestral.utils.appdirs import (
 
 
 def test_get_home_dir(monkeypatch, tmpdir):
-    monkeypatch.setenv("HOME", str(tmpdir))
+    variable = "USERPROFILE" if platform.system() == "Windows" else "HOME"
+    monkeypatch.setenv(variable, str(tmpdir))
 
     assert get_home_dir() == str(tmpdir)
 
 
 def test_home_dir_does_not_exist(monkeypatch, tmpdir):
-    monkeypatch.setenv("HOME", str(tmpdir / "adamsmith"))
+    variable = "USERPROFILE" if platform.system() == "Windows" else "HOME"
+    monkeypatch.setenv(variable, str(tmpdir / "adamsmith"))
 
     with pytest.raises(RuntimeError):
         get_home_dir()
@@ -33,12 +36,14 @@ def test_macos_dirs(monkeypatch):
 
     home = get_home_dir()
 
-    assert get_conf_path(create=False) == home + "/Library/Application Support"
-    assert get_cache_path(create=False) == home + "/Library/Caches"
+    assert get_conf_path(create=False) == osp.join(
+        home, "Library", "Application Support"
+    )
+    assert get_cache_path(create=False) == osp.join(home, "Library", "Caches")
     assert get_data_path(create=False) == get_conf_path(create=False)
     assert get_runtime_path(create=False) == get_conf_path(create=False)
-    assert get_log_path(create=False) == home + "/Library/Logs"
-    assert get_autostart_path(create=False) == home + "/Library/LaunchAgents"
+    assert get_log_path(create=False) == osp.join(home, "Library", "Logs")
+    assert get_autostart_path(create=False) == osp.join(home, "Library", "LaunchAgents")
 
 
 def test_xdg_env_dirs(monkeypatch):
@@ -56,7 +61,7 @@ def test_xdg_env_dirs(monkeypatch):
     assert get_data_path(create=False) == "/xdg_data_dir"
     assert get_runtime_path(create=False) == "/xdg_runtime_dir"
     assert get_log_path(create=False) == "/xdg_cache_home"
-    assert get_autostart_path(create=False) == "/xdg_config_home/autostart"
+    assert get_autostart_path(create=False) == osp.join("/xdg_config_home", "autostart")
 
 
 def test_no_xdg_env_fallback_dirs(monkeypatch):
@@ -71,9 +76,9 @@ def test_no_xdg_env_fallback_dirs(monkeypatch):
 
     home = get_home_dir()
 
-    assert get_conf_path(create=False) == home + "/.config"
-    assert get_cache_path(create=False) == home + "/.cache"
-    assert get_data_path(create=False) == home + "/.local/share"
-    assert get_runtime_path(create=False) == home + "/.cache"
-    assert get_log_path(create=False) == home + "/.cache"
-    assert get_autostart_path(create=False) == home + "/.config/autostart"
+    assert get_conf_path(create=False) == osp.join(home, ".config")
+    assert get_cache_path(create=False) == osp.join(home, ".cache")
+    assert get_data_path(create=False) == osp.join(home, ".local", "share")
+    assert get_runtime_path(create=False) == osp.join(home, ".cache")
+    assert get_log_path(create=False) == osp.join(home, ".cache")
+    assert get_autostart_path(create=False) == osp.join(home, ".config", "autostart")

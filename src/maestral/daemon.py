@@ -161,13 +161,30 @@ class Lock:
                 return False
             acquired = self._external_lock.acquire(blocking=False)
             if acquired and fcntl is None:
-                pid_path = f"{self.path}.pid"
-                fd = os.open(pid_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-                with os.fdopen(fd, "w") as file:
-                    file.write(str(self.pid))
-                    file.flush()
-                    os.fsync(file.fileno())
+                try:
+                    self._write_pid_file()
+                except Exception:
+                    self._external_lock.release()
+                    raise
             return acquired
+
+    def _write_pid_file(self) -> None:
+        pid_path = f"{self.path}.pid"
+        directory = os.path.dirname(pid_path)
+        fd, temporary = tempfile.mkstemp(prefix=".pid-", dir=directory)
+
+        try:
+            os.chmod(temporary, 0o600)
+            with os.fdopen(fd, "w") as file:
+                file.write(str(self.pid))
+                file.flush()
+                os.fsync(file.fileno())
+            os.replace(temporary, pid_path)
+        finally:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
 
     def release(self) -> None:
         """Release the previously acquired lock."""
@@ -177,12 +194,12 @@ class Lock:
                     "Cannot release a lock, it was acquired by a different process"
                 )
 
-            self._external_lock.release()
             if fcntl is None:
                 try:
                     os.unlink(f"{self.path}.pid")
                 except FileNotFoundError:
                     pass
+            self._external_lock.release()
 
     def locked(self) -> bool:
         """
@@ -190,7 +207,17 @@ class Lock:
 
         :returns: Whether the lock is acquired.
         """
-        return self.locking_pid() is not None
+        with self._lock:
+            if self._external_lock.acquired:
+                return True
+            if fcntl is not None:
+                return self.locking_pid() is not None
+
+            probe = InterProcessLock(self.path)
+            if probe.acquire(blocking=False):
+                probe.release()
+                return False
+            return True
 
     def locking_pid(self) -> int | None:
         """
@@ -204,15 +231,14 @@ class Lock:
                 return self.pid
 
             if fcntl is None:
-                probe = InterProcessLock(self.path)
-                if probe.acquire(blocking=False):
-                    probe.release()
+                if not self.locked():
                     return None
                 try:
                     with open(f"{self.path}.pid") as file:
-                        return int(file.read())
+                        pid = int(file.read())
                 except (FileNotFoundError, OSError, ValueError):
-                    return -1
+                    return None
+                return pid if pid > 0 else None
 
             try:
                 fh = open(self._external_lock.path, "a")
@@ -265,15 +291,6 @@ def _is_windows() -> bool:
     return platform.system() == "Windows"
 
 
-def _windows_runtime_path(filename: str) -> str:
-    local_app_data = os.environ.get("LOCALAPPDATA")
-    if not local_app_data:
-        raise RuntimeError("LOCALAPPDATA is not set")
-    directory = os.path.join(local_app_data, "maestral")
-    os.makedirs(directory, exist_ok=True)
-    return os.path.join(directory, filename)
-
-
 def sockpath_for_config(config_name: str) -> str:
     """
     Returns the unix socket location to be used for the config. This should default to
@@ -287,7 +304,7 @@ def sockpath_for_config(config_name: str) -> str:
 
 def endpoint_path_for_config(config_name: str) -> str:
     """Return the Windows TCP endpoint discovery-file path."""
-    return _windows_runtime_path(f"{config_name}.endpoint")
+    return get_runtime_path("maestral", f"{config_name}.endpoint")
 
 
 def _validate_tcp_endpoint(host: Any, port: Any) -> tuple[str, int]:
@@ -350,8 +367,6 @@ def lockpath_for_config(config_name: str) -> str:
     :param config_name: The name of the Maestral configuration.
     :returns: Path of lock file to use.
     """
-    if _is_windows():
-        return _windows_runtime_path(f"{config_name}.lock")
     return get_runtime_path("maestral", f"{config_name}.lock")
 
 
@@ -624,8 +639,19 @@ def start_maestral_daemon_process(
     env = os.environ.copy()
     env.update(ENV)
 
+    popen_kwargs: dict[str, Any] = {}
+    if _is_windows():
+        popen_kwargs.update(
+            creationflags=getattr(subprocess, "DETACHED_PROCESS", 0x00000008),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
     process = subprocess.Popen(
-        [sys.executable, "-c", _DAEMON_START_SCRIPT, config_name], env=env
+        [sys.executable, "-c", _DAEMON_START_SCRIPT, config_name],
+        env=env,
+        **popen_kwargs,
     )
 
     try:
@@ -665,9 +691,9 @@ def stop_maestral_daemon_process(
 ) -> Stop:
     """Stops a maestral daemon process by finding its PID and shutting it down.
 
-    This function first tries to shut down Maestral gracefully. If this fails and we
-    know its PID, it will send SIGTERM. If that fails as well, it will send SIGKILL to
-    the process.
+    This function first tries to shut down Maestral gracefully. On Unix, it then sends
+    SIGTERM and finally SIGKILL. On Windows, it uses ``TerminateProcess`` through
+    :func:`os.kill` if the graceful shutdown fails.
 
     :param config_name: The name of the Maestral configuration to use.
     :param timeout: Number of sec to wait for daemon to shut down before killing it.
@@ -679,22 +705,43 @@ def stop_maestral_daemon_process(
         return Stop.NotRunning
 
     pid = get_maestral_pid(config_name)
+    requested_shutdown = False
+    connection: JsonRpcConnection | None = None
 
-    if not pid:
-        # Cannot send SIGTERM to process if we don't know its pid.
-        return Stop.Failed
+    try:
+        rpc_timeout = max(0.1, min(timeout, 1.0))
+        connection = JsonRpcConnection(
+            endpoint_for_config(config_name), timeout=rpc_timeout
+        )
+        connection.request("shutdown_daemon")
+        requested_shutdown = True
+    except (CommunicationError, ProtocolError):
+        pass
+    finally:
+        if connection is not None:
+            connection.close()
 
-    _send_signal(pid, signal.SIGTERM)
+    if not requested_shutdown and not _is_windows() and pid is not None:
+        _send_signal(pid, signal.SIGTERM)
 
-    while timeout > 0:
+    deadline = time.monotonic() + max(timeout, 0)
+    while time.monotonic() < deadline:
         if not is_running(config_name):
             return Stop.Ok
-        else:
-            time.sleep(0.2)
-            timeout -= 0.2
+        time.sleep(0.2)
 
-    # Kill.
-    _send_signal(pid, signal.SIGKILL)
+    if not is_running(config_name):
+        return Stop.Ok
+
+    if pid is None or pid <= 0:
+        return Stop.Failed
+
+    # Windows os.kill uses TerminateProcess for SIGTERM. Unix has SIGKILL.
+    kill_signal = signal.SIGTERM if _is_windows() else signal.SIGKILL
+    try:
+        _send_signal(pid, kill_signal)
+    except OSError:
+        return Stop.Failed
     return Stop.Killed
 
 

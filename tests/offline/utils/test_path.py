@@ -1,8 +1,13 @@
 import os
+import platform
 import stat
 
 import pytest
-import xattr
+
+try:
+    import xattr
+except ImportError:
+    xattr = None
 
 from maestral.constants import IS_LINUX
 from maestral.utils.appdirs import get_home_dir
@@ -11,6 +16,7 @@ from maestral.utils.path import (
     fs_max_lengths_for_path,
     get_existing_equivalent_paths,
     is_child,
+    is_equal_or_child,
     is_fs_case_sensitive,
     move,
     normalized_path_exists,
@@ -94,6 +100,11 @@ def test_is_child():
     assert not is_child("/path1", "/path2")
 
 
+def test_is_equal_or_child_handles_root_and_trailing_separator():
+    assert is_equal_or_child("/parent/path/", "/parent/path")
+    assert is_equal_or_child("/child", "/")
+
+
 def test_is_fs_case_sensitive_rejects_root():
     with pytest.raises(ValueError):
         is_fs_case_sensitive(os.path.sep)
@@ -129,12 +140,15 @@ def test_walk_continues_after_entry_disappears(tmp_path):
 
 def test_fs_max_lengths_returns_name_before_path(monkeypatch, tmp_path):
     limits = {"PC_NAME_MAX": 255, "PC_PATH_MAX": 4096}
-    monkeypatch.setattr(os, "pathconf", lambda path, name: limits[name])
+    monkeypatch.setattr(os, "pathconf", lambda path, name: limits[name], raising=False)
 
     assert fs_max_lengths_for_path(str(tmp_path)) == (255, 4096)
 
 
 def test_move_preserves_permissions(tmp_path):
+    if platform.system() == "Windows":
+        pytest.skip("Windows does not expose POSIX execute permission bits")
+
     src_path = str(tmp_path / "source.txt")
     dest_path = str(tmp_path / "dest.txt")
 
@@ -149,6 +163,9 @@ def test_move_preserves_permissions(tmp_path):
 
 
 def test_move_preserves_xattrs(tmp_path):
+    if xattr is None:
+        pytest.skip("Xattrs are not supported on this platform")
+
     src_path = str(tmp_path / "source.txt")
     dest_path = str(tmp_path / "dest.txt")
 

@@ -5,7 +5,6 @@ This module contains functions for common path operations.
 from __future__ import annotations
 
 import errno
-import fcntl
 import itertools
 
 # system imports
@@ -14,13 +13,21 @@ import os.path as osp
 import platform
 import shutil
 import unicodedata
-from stat import S_ISDIR
+from stat import S_ISDIR, S_ISLNK
 from typing import Callable, Iterable, Iterator, List, Optional, Tuple, Union
 
 # third party imports
-import xattr
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows only
+    fcntl = None  # type: ignore[assignment]
 
-from ..constants import IS_LINUX
+try:
+    import xattr
+except ImportError:  # pragma: no cover - Windows only
+    xattr = None
+
+from ..constants import IS_LINUX, IS_WINDOWS
 
 # local imports
 from .hashing import DropboxContentHasher
@@ -50,15 +57,17 @@ def is_child(
     :param case_sensitive: Whether to do case-sensitive checks.
     :returns: Whether ``path`` semantically lies inside ``parent``.
     """
-    if not case_sensitive:
-        path = normalize(path)
-        parent = normalize(parent)
-    else:
-        path = os.fsdecode(path)
-        parent = os.fsdecode(parent)
+    path = normalize(path) if not case_sensitive else os.fsdecode(path)
+    parent = normalize(parent) if not case_sensitive else os.fsdecode(parent)
 
-    parent = parent.rstrip(osp.sep) + osp.sep
-    path = path.rstrip(osp.sep)
+    separator = "/" if path.startswith("/") and parent.startswith("/") else osp.sep
+
+    if separator == osp.sep:
+        path = osp.normpath(path)
+        parent = osp.normpath(parent)
+
+    parent = parent.rstrip(separator) + separator
+    path = path.rstrip(separator)
 
     return path.startswith(parent)
 
@@ -76,7 +85,18 @@ def is_equal_or_child(
     :returns: ``True`` if ``path`` semantically lies inside ``parent`` or
         ``path == parent``.
     """
-    return is_child(path, parent, case_sensitive) or path == parent
+    path_cmp = normalize(path) if not case_sensitive else os.fsdecode(path)
+    parent_cmp = normalize(parent) if not case_sensitive else os.fsdecode(parent)
+
+    separator = (
+        "/" if path_cmp.startswith("/") and parent_cmp.startswith("/") else osp.sep
+    )
+    if separator == osp.sep:
+        path_cmp = osp.normpath(path_cmp)
+        parent_cmp = osp.normpath(parent_cmp)
+
+    equal = path_cmp.rstrip(separator) == parent_cmp.rstrip(separator)
+    return equal or is_child(path_cmp, parent_cmp)
 
 
 # ==== case sensitivity and normalization ==============================================
@@ -172,7 +192,22 @@ def get_existing_equivalent_paths(
     :param norm_func: Normalization function to use. Defaults to :func:`normalize`.
     :returns: List of existing paths for which `normalized(local_path) == normalized(path)`.
     """
-    path = path.lstrip(osp.sep)
+    path_drive, _ = osp.splitdrive(path)
+    root_drive, _ = osp.splitdrive(root)
+
+    if path_drive and not root_drive:
+        root = path_drive + osp.sep
+
+    if osp.isabs(path):
+        try:
+            path = osp.relpath(path, root)
+        except ValueError:
+            return []
+
+        if path == osp.pardir or path.startswith(osp.pardir + osp.sep):
+            return []
+    else:
+        path = path.lstrip(osp.sep)
 
     if path == "":
         return [root]
@@ -224,6 +259,8 @@ def get_existing_equivalent_paths(
 
 def _macos_get_canonically_cased_path(path: str) -> str:
     # Use fcntl to get FS path, there can only be one.
+    if fcntl is None:  # pragma: no cover - guarded by the platform check
+        raise OSError("fcntl is unavailable")
     with open(path, opener=opener_no_symlink) as fd:
         fs_path = fcntl.fcntl(fd.fileno(), F_GETPATH, b"\x00" * 1024)
     return os.fsdecode(fs_path.strip(b"\x00"))
@@ -402,7 +439,7 @@ def move(
         except (FileNotFoundError, NotADirectoryError):
             pass
 
-    if keep_target_xattrs:
+    if keep_target_xattrs and xattr is not None:
         try:
             dest_attrs = xattr.xattr(dest_path)
             for key, value in dest_attrs.iteritems():
@@ -447,7 +484,9 @@ def walk(
     for entry in entries:
         try:
             path = entry.path
-            stat = entry.stat(follow_symlinks=False)
+            # DirEntry may cache stale stat data on Windows. Query the path again so
+            # that files removed after directory enumeration are not yielded.
+            stat = os.lstat(path)
 
             yield path, stat
 
@@ -525,6 +564,9 @@ def fs_max_lengths_for_path(path: str = "/") -> Tuple[int, int]:
     path = osp.abspath(path)
     dirname = osp.dirname(path)
 
+    if not hasattr(os, "pathconf"):
+        raise RuntimeError("Cannot get file length limits.")
+
     while True:
         try:
             max_char_name = os.pathconf(dirname, "PC_NAME_MAX")
@@ -552,8 +594,26 @@ def opener_no_symlink(path: _AnyPath, flags: int) -> int:
     :param flags: Flags passed to :meth:`os.open`. O_NOFOLLOW will be added.
     :return: Open file descriptor.
     """
-    flags |= os.O_NOFOLLOW
+    no_follow = getattr(os, "O_NOFOLLOW", 0)
+    if no_follow:
+        flags |= no_follow
+    else:
+        try:
+            if S_ISLNK(os.lstat(path).st_mode):
+                raise OSError(errno.ELOOP, os.strerror(errno.ELOOP), path)
+        except FileNotFoundError:
+            pass
     return os.open(path, flags=flags)
+
+
+def get_local_change_time(stat: os.stat_result) -> float:
+    """Return the platform timestamp used to detect a local file change."""
+    return stat.st_mtime if IS_WINDOWS else stat.st_ctime
+
+
+def get_local_change_time_ns(stat: os.stat_result) -> int:
+    """Return the nanosecond platform timestamp used during file transfers."""
+    return stat.st_mtime_ns if IS_WINDOWS else stat.st_ctime_ns
 
 
 def exists(path: _AnyPath) -> bool:

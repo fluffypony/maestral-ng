@@ -1,5 +1,6 @@
 import asyncio
 import os
+import signal
 import stat
 import subprocess
 import sys
@@ -120,7 +121,10 @@ def test_locking_multiprocess(tmp_path):
 
     p = subprocess.Popen([sys.executable, "-c", cmd])
 
-    time.sleep(1)
+    deadline = time.monotonic() + 10
+    while not lock.locked() and time.monotonic() < deadline:
+        assert p.poll() is None
+        time.sleep(0.05)
 
     # check that lock is acquired
     assert lock.locked()
@@ -134,16 +138,26 @@ def test_locking_multiprocess(tmp_path):
     with pytest.raises(RuntimeError):
         lock.release()
 
-    # check pid of locking process
-    assert lock.locking_pid() == p.pid
+    # A Windows virtual-environment launcher can start the base interpreter in a
+    # second process. The PID sidecar identifies that interpreter, not the launcher.
+    locking_pid = lock.locking_pid()
+    if daemon_module._is_windows():
+        assert locking_pid is not None and locking_pid > 0
+    else:
+        assert locking_pid == p.pid
 
-    # release lock by terminating process
+    # Release lock by terminating the process.
+    if locking_pid is not None and locking_pid != p.pid:
+        os.kill(locking_pid, signal.SIGTERM)
     p.terminate()
     p.wait()
     assert not lock.locked()
 
 
 def test_locked_uses_read_only_probe(tmp_path, monkeypatch):
+    if daemon_module._is_windows():
+        pytest.skip("Windows must probe the file lock to read its state")
+
     lock = Lock.singleton(str(tmp_path / f"test-lock-{uuid.uuid4()}"))
     acquire = Mock(side_effect=AssertionError("locked() must not acquire the lock"))
 
@@ -287,6 +301,16 @@ def test_connection(config_name: str) -> None:
     # stop daemon
     res_stop = stop_maestral_daemon_process(config_name)
     assert res_stop is Stop.Ok
+
+
+def test_shutdown_closes_existing_clients(config_name: str) -> None:
+    assert start_maestral_daemon_process(config_name, timeout=20) is Start.Ok
+    client = MaestralClient(config_name)
+
+    try:
+        assert stop_maestral_daemon_process(config_name, timeout=5) is Stop.Ok
+    finally:
+        client._disconnect()
 
 
 def test_fallback(config_name: str) -> None:

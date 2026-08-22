@@ -139,6 +139,13 @@ def os_to_maestral_error(
         err_cls = NotAFolderError  # subclass of SyncError
         title = "Could not create local folder"
         text = "The given path refers to a file."
+    elif getattr(exc, "winerror", None) == 1314:
+        err_cls = SymlinkError  # subclass of SyncError
+        title = "Could not create local symlink"
+        text = (
+            "Windows did not grant permission to create a symlink. Enable Developer "
+            "Mode or run Maestral with the required permission."
+        )
     elif exc.errno == errno.ENAMETOOLONG:
         err_cls = PathError  # subclass of SyncError
         title = "Could not create local file"

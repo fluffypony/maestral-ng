@@ -6,6 +6,7 @@ queries.
 from __future__ import annotations
 
 import os
+import posixpath
 from typing import TYPE_CHECKING, Any, Iterator, Sequence
 
 from .types import SqlPath
@@ -55,7 +56,7 @@ class PathTreeQuery(Query):
 
         self.column = column
         self.file_blob = os.fsencode(path)
-        self.dir_blob = os.path.join(self.file_blob, b"")
+        self.dir_blob = posixpath.join(self.file_blob, b"")
 
     def clause(self) -> tuple[str, Sequence[Any]]:
         query_part = f"({self.column.name} = ? OR substr({self.column.name}, 1, ?) = ?)"

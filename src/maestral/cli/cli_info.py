@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import os
+import posixpath
 import sys
 import time
 from datetime import datetime
@@ -141,7 +141,7 @@ def activity(m: Maestral) -> None:
                                 info,
                                 total=event.size,
                                 completed=event.completed,
-                                filename=os.path.basename(event.dbx_path),
+                                filename=posixpath.basename(event.dbx_path),
                             )
                             progressbar_for_path[_event_key(event)] = task_id
                         else:

@@ -1,14 +1,15 @@
 import inspect
 import logging
+import os
 from types import SimpleNamespace
 from unittest.mock import Mock
 
 import click
 from click.testing import CliRunner
 
+import maestral.cli.cli_core as cli_core_module
 import maestral.cli.cli_info as cli_info_module
 import maestral.cli.cli_maintenance as cli_maintenance_module
-import maestral.cli.cli_core as cli_core_module
 import maestral.daemon as daemon_module
 from maestral.autostart import AutoStart
 from maestral.cli import main
@@ -213,17 +214,21 @@ def test_stop(config_name: str) -> None:
 
 def test_filestatus(m: Maestral) -> None:
     runner = CliRunner()
-    result = runner.invoke(main, ["filestatus", "/usr", "-c", m.config_name])
+    result = runner.invoke(
+        main, ["filestatus", os.path.expanduser("~"), "-c", m.config_name]
+    )
 
     assert result.exit_code == 0, result.output
     assert result.output == "unwatched\n"
 
-    result = runner.invoke(main, ["filestatus", "/invalid-dir", "-c", m.config_name])
+    invalid_path = os.path.join(os.path.expanduser("~"), "invalid-dir")
+    result = runner.invoke(main, ["filestatus", invalid_path, "-c", m.config_name])
 
     # the exception will be already raised by click's argument check
     assert result.exit_code == 2
     assert isinstance(result.exception, SystemExit)
-    assert "'/invalid-dir' does not exist" in result.output
+    assert "invalid-dir" in result.output
+    assert "does not exist" in result.output
 
 
 def test_autostart(m: Maestral) -> None:

@@ -84,7 +84,7 @@ from .keyring import CredentialStorage
 from .logging import scoped_logger
 from .utils import chunks, clamp, natural_size
 from .utils.hashing import DropboxContentHasher, StreamHasher
-from .utils.path import delete, opener_no_symlink
+from .utils.path import delete, get_local_change_time_ns, opener_no_symlink
 
 if TYPE_CHECKING:
     from .models import SyncEvent
@@ -1926,4 +1926,4 @@ def file_was_modified(news_stat: os.stat_result, old_stat: os.stat_result) -> bo
 
     :raises DataChangedError: if there were changes to the file.
     """
-    return news_stat.st_ctime_ns != old_stat.st_ctime_ns
+    return get_local_change_time_ns(news_stat) != get_local_change_time_ns(old_stat)

@@ -30,7 +30,7 @@ from .core import DeletedMetadata, FileMetadata, FolderMetadata, Metadata
 from .database.orm import Column, Model, NonNullColumn
 from .database.types import SqlEnum, SqlFloat, SqlInt, SqlLargeInt, SqlPath, SqlString
 from .exceptions import NotLinkedError, SyncError
-from .utils.path import normalize
+from .utils.path import get_local_change_time, normalize
 
 if TYPE_CHECKING:
     from .sync import SyncEngine
@@ -200,9 +200,9 @@ class SyncEvent(Model):
     """
     Timestamp in Unix epoch seconds when the file was last modified.
 
-    Local ctime or remote ``client_modified`` time for files. ``None`` for folders or
-    for remote deletions. Note that ``client_modified`` may not be reliable as it is set
-    by other clients and not verified.
+    Local mtime on Windows, local ctime on Unix, or remote ``client_modified`` time for
+    files. ``None`` for folders or for remote deletions. Note that ``client_modified``
+    may not be reliable as it is set by other clients and not verified.
     """
 
     change_dbid = Column(SqlString())
@@ -412,7 +412,20 @@ class SyncEvent(Model):
         except SyncError:
             content_hash = None
 
-        if event.is_directory:
+        dbx_path = sync_engine.to_dbx_path(to_path)
+        dbx_path_lower = normalize(dbx_path)
+
+        dbx_path_from = sync_engine.to_dbx_path(from_path) if from_path else None
+        dbx_path_from_lower = normalize(dbx_path_from) if dbx_path_from else None
+
+        index_entry = sync_engine.get_index_entry(dbx_path_lower)
+        is_directory = event.is_directory or (
+            change_type is ChangeType.Removed
+            and index_entry is not None
+            and index_entry.is_directory
+        )
+
+        if is_directory:
             item_type = ItemType.Folder
             size = 0
             try:
@@ -422,18 +435,12 @@ class SyncEvent(Model):
             symlink_target = None
         else:
             item_type = ItemType.File
-            change_time = stat.st_ctime if stat else None
+            change_time = get_local_change_time(stat) if stat else None
             size = stat.st_size if stat else 0
             try:
                 symlink_target = os.readlink(os.fsdecode(event.src_path))
             except OSError:
                 symlink_target = None
-
-        dbx_path = sync_engine.to_dbx_path(to_path)
-        dbx_path_lower = normalize(dbx_path)
-
-        dbx_path_from = sync_engine.to_dbx_path(from_path) if from_path else None
-        dbx_path_from_lower = normalize(dbx_path_from) if dbx_path_from else None
 
         # For file changes, update the change type based on our index. Local file system
         # events of created vs modified can be misleading for some safe save mechanisms.
@@ -442,11 +449,10 @@ class SyncEvent(Model):
             ChangeType.Added,
             ChangeType.Modified,
         }:
-            entry = sync_engine.get_index_entry(dbx_path_lower)
-            if entry is None:
+            if index_entry is None:
                 # Item is new to us.
                 change_type = ChangeType.Added
-            elif entry.item_type is ItemType.File:
+            elif index_entry.item_type is ItemType.File:
                 # Item already existed.
                 change_type = ChangeType.Modified
 
@@ -497,7 +503,7 @@ class IndexEntry(Model):
 
     last_sync = Column(SqlFloat())
     """
-    The last time a local change was uploaded. Should be the ctime of the local item.
+    The last time a local change was uploaded. Uses mtime on Windows and ctime on Unix.
     """
 
     rev = NonNullColumn(SqlString())

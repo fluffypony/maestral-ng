@@ -73,6 +73,7 @@ class FileStatus(Enum):
 # platform detection
 IS_MACOS = platform.system() == "Darwin"
 IS_LINUX = platform.system() == "Linux"
+IS_WINDOWS = platform.system() == "Windows"
 
 # keys
 DROPBOX_APP_KEY = "2jmbq42w7vof78h"

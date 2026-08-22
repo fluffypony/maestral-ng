@@ -1,3 +1,6 @@
+import os.path as osp
+import platform
+
 import pytest
 from watchdog.events import (
     DirCreatedEvent,
@@ -18,7 +21,7 @@ from maestral.sync import SyncEngine
 @pytest.fixture
 def sync():
     sync = SyncEngine(DropboxClient("test-config", CredentialStorage("test-config")))
-    sync.dropbox_path = "/"
+    sync.dropbox_path = osp.abspath(osp.sep)
 
     yield sync
 
@@ -26,8 +29,19 @@ def sync():
 
 
 def ipath(i):
-    """Returns path names '/test 1', '/test 2', ..."""
-    return f"/test {i}"
+    """Returns local path names for 'test 1', 'test 2', ..."""
+    return osp.join(osp.abspath(osp.sep), f"test {i}")
+
+
+def nested(path: str, *parts: str) -> str:
+    """Returns a child path using the platform path separator."""
+    return osp.join(path, *parts)
+
+
+def repeated_path(i: int, count: int) -> str:
+    """Returns a local path with the same segment repeated."""
+    segment = f"test {i}"
+    return osp.abspath(osp.sep) + segment + (osp.sep + segment) * (count - 1)
 
 
 def test_single_file_events(sync: SyncEngine) -> None:
@@ -130,11 +144,12 @@ def test_recombine_does_not_recreate_empty_event_history(
 
 
 def test_gedit_save(sync: SyncEngine) -> None:
+    tmp_path = nested(osp.abspath(osp.sep), ".gedit-save-UR4EC0")
     file_events = [
-        FileCreatedEvent("/.gedit-save-UR4EC0"),  # save new version to tmp file
-        FileModifiedEvent("/.gedit-save-UR4EC0"),  # modify tmp file
+        FileCreatedEvent(tmp_path),  # save new version to tmp file
+        FileModifiedEvent(tmp_path),  # modify tmp file
         FileMovedEvent(ipath(1), ipath(1) + "~"),  # move old version to backup
-        FileMovedEvent("/.gedit-save-UR4EC0", ipath(1)),  # replace old version with tmp
+        FileMovedEvent(tmp_path, ipath(1)),  # replace old version with tmp
     ]
 
     res = [
@@ -162,16 +177,17 @@ def test_macos_safe_save(sync: SyncEngine) -> None:
 
 
 def test_msoffice_created(sync: SyncEngine) -> None:
+    tmp_path = nested(osp.abspath(osp.sep), "~$", "test 1")
     file_events = [
         FileCreatedEvent(ipath(1)),
         FileDeletedEvent(ipath(1)),
         FileCreatedEvent(ipath(1)),
-        FileCreatedEvent("/~$" + ipath(1)),
+        FileCreatedEvent(tmp_path),
     ]
 
     res = [
         FileCreatedEvent(ipath(1)),  # created file
-        FileCreatedEvent("/~$" + ipath(1)),  # backup
+        FileCreatedEvent(tmp_path),  # backup
     ]
 
     cleaned_events = sync._clean_local_events(file_events)
@@ -233,16 +249,19 @@ def test_nested_events(sync: SyncEngine) -> None:
     file_events = [
         # convert to a single DirDeleted
         DirDeletedEvent(ipath(1)),
-        FileDeletedEvent(ipath(1) + "/file1.txt"),
-        FileDeletedEvent(ipath(1) + "/file2.txt"),
-        DirDeletedEvent(ipath(1) + "/sub"),
-        FileDeletedEvent(ipath(1) + "/sub/file3.txt"),
+        FileDeletedEvent(nested(ipath(1), "file1.txt")),
+        FileDeletedEvent(nested(ipath(1), "file2.txt")),
+        DirDeletedEvent(nested(ipath(1), "sub")),
+        FileDeletedEvent(nested(ipath(1), "sub", "file3.txt")),
         # convert to a single DirMoved
         DirMovedEvent(ipath(2), ipath(3)),
-        FileMovedEvent(ipath(2) + "/file1.txt", ipath(3) + "/file1.txt"),
-        FileMovedEvent(ipath(2) + "/file2.txt", ipath(3) + "/file2.txt"),
-        DirMovedEvent(ipath(2) + "/sub", ipath(3) + "/sub"),
-        FileMovedEvent(ipath(2) + "/sub/file3.txt", ipath(3) + "/sub/file3.txt"),
+        FileMovedEvent(nested(ipath(2), "file1.txt"), nested(ipath(3), "file1.txt")),
+        FileMovedEvent(nested(ipath(2), "file2.txt"), nested(ipath(3), "file2.txt")),
+        DirMovedEvent(nested(ipath(2), "sub"), nested(ipath(3), "sub")),
+        FileMovedEvent(
+            nested(ipath(2), "sub", "file3.txt"),
+            nested(ipath(3), "sub", "file3.txt"),
+        ),
     ]
 
     res = [
@@ -259,15 +278,23 @@ def test_nested_events(sync: SyncEngine) -> None:
     min_time=0.1,
     max_time=5,
 )
+@pytest.mark.skipif(
+    platform.system() == "Windows",
+    reason="benchmark paths exceed the Windows maximum path length",
+)
 def test_performance(sync: SyncEngine, benchmark) -> None:
     # 10,000 nested deleted events (5,000 folders, 5,000 files)
-    file_events = [DirDeletedEvent(n * ipath(1)) for n in range(1, 5001)]
-    file_events += [FileDeletedEvent(n * ipath(1) + ".txt") for n in range(1, 5001)]
+    file_events = [DirDeletedEvent(repeated_path(1, n)) for n in range(1, 5001)]
+    file_events += [
+        FileDeletedEvent(repeated_path(1, n) + ".txt") for n in range(1, 5001)
+    ]
 
     # 10,000 nested moved events (5,000 folders, 5,000 files)
-    file_events += [DirMovedEvent(n * ipath(2), n * ipath(3)) for n in range(1, 5001)]
     file_events += [
-        FileMovedEvent(n * ipath(2) + ".txt", n * ipath(3) + ".txt")
+        DirMovedEvent(repeated_path(2, n), repeated_path(3, n)) for n in range(1, 5001)
+    ]
+    file_events += [
+        FileMovedEvent(repeated_path(2, n) + ".txt", repeated_path(3, n) + ".txt")
         for n in range(1, 5001)
     ]
 

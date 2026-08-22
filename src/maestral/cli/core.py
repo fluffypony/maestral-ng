@@ -64,7 +64,6 @@ class DropboxPath(click.ParamType[str | None]):
         from click.shell_completion import CompletionItem
 
         from ..config import MaestralConfig
-        from ..utils import removeprefix
 
         matches: list[str] = []
         completions: list[CompletionItem] = []
@@ -81,7 +80,7 @@ class DropboxPath(click.ParamType[str | None]):
 
         config = MaestralConfig(config_name)
         dropbox_dir = config.get("sync", "path")
-        local_incomplete = osp.join(dropbox_dir, incomplete)
+        local_incomplete = osp.join(dropbox_dir, *incomplete.split("/"))
         local_dirname = osp.dirname(local_incomplete)
 
         try:
@@ -89,10 +88,16 @@ class DropboxPath(click.ParamType[str | None]):
                 for entry in it:
                     if entry.path.startswith(local_incomplete):
                         if self.file_okay and entry.is_file():
-                            dbx_path = removeprefix(entry.path, dropbox_dir)
+                            dbx_path = osp.relpath(entry.path, dropbox_dir)
+                            if osp.sep != "/":
+                                dbx_path = dbx_path.replace(osp.sep, "/")
+                            dbx_path = "/" + dbx_path
                             matches.append(dbx_path)
                         if self.dir_okay and entry.is_dir():
-                            dbx_path = removeprefix(entry.path, dropbox_dir)
+                            dbx_path = osp.relpath(entry.path, dropbox_dir)
+                            if osp.sep != "/":
+                                dbx_path = dbx_path.replace(osp.sep, "/")
+                            dbx_path = "/" + dbx_path
                             matches.append(dbx_path)
         except OSError:
             pass

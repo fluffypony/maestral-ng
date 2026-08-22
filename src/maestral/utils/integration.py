@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import logging
 import os
-import resource
 import socket
 import time
 from pathlib import Path
@@ -88,24 +87,20 @@ def cpu_usage_percent(interval: float = 0.1) -> float:
     if interval <= 0:
         raise ValueError(f"interval is not positive (got {interval!r})")
 
-    def timer() -> float:
-        return time.monotonic() * CPU_CORE_COUNT
-
-    st1 = timer()
-    rt1 = resource.getrusage(resource.RUSAGE_SELF)
+    st1 = time.monotonic()
+    rt1 = time.process_time()
     time.sleep(interval)
-    st2 = timer()
-    rt2 = resource.getrusage(resource.RUSAGE_SELF)
+    st2 = time.monotonic()
+    rt2 = time.process_time()
 
-    delta_proc = (rt2.ru_utime - rt1.ru_utime) + (rt2.ru_stime - rt1.ru_stime)
+    delta_proc = rt2 - rt1
     delta_time = st2 - st1
 
     try:
-        overall_cpus_percent = (delta_proc / delta_time) * 100
+        single_cpu_percent = (delta_proc / delta_time) * 100
     except ZeroDivisionError:
         return 0.0
     else:
-        single_cpu_percent = overall_cpus_percent * CPU_CORE_COUNT
         return round(single_cpu_percent, 1)
 
 
