@@ -1,0 +1,119 @@
+{
+  "fixture_version": 1,
+  "generated_by": "Official org.cryptomator:cryptofs:2.10.0",
+  "cryptolib_version": "2.2.2",
+  "official_desktop_verification": {
+    "version": "1.19.3",
+    "cryptofs_jar_sha256": "bca4f7bf7dd8e16f4c21ea96f15d4d2205ce35240c5f6ff09d28418470d4c82f",
+    "cryptolib_jar_sha256": "8deac22a954c2058d5ad325168b73c1b4d245eeba178e70b2b78a3947f37188f",
+    "result": "Both bundled jars are byte-identical to the Maven build inputs."
+  },
+  "official_cli_verification": {
+    "version": "0.6.2",
+    "cryptofs_version": "2.8.0",
+    "result": "Opened the vault and read names, content, directories, the moved file, and the shortened long name.",
+    "webdav_link_note": "The old WebDAV adapter omits symbolic links; CryptoFS 2.10.0 readLink tests cover the link fixture."
+  },
+  "vault_format": 8,
+  "shortening_threshold": 220,
+  "key_id": "masterkeyfile:masterkey.cryptomator",
+  "password": "maestral-official-fixture",
+  "logical_snapshot": [
+    {
+      "path": "/content",
+      "type": "directory",
+      "size": 0
+    },
+    {
+      "path": "/content/binary.bin",
+      "type": "file",
+      "size": 16385,
+      "sha256": "eecf6791a50c40a4787858652724894ce28ec00160023debc83df4312b331742"
+    },
+    {
+      "path": "/corruption",
+      "type": "directory",
+      "size": 0
+    },
+    {
+      "path": "/corruption/authenticated.bin",
+      "type": "file",
+      "size": 131072,
+      "sha256": "854f391cb3028c1dc277359ad81e2483583e23c454f7d69a6f3db27d6d84300f"
+    },
+    {
+      "path": "/directories",
+      "type": "directory",
+      "size": 0
+    },
+    {
+      "path": "/directories/nested",
+      "type": "directory",
+      "size": 0
+    },
+    {
+      "path": "/directories/nested/child.txt",
+      "type": "file",
+      "size": 17,
+      "sha256": "e2ac531a045eb949d63dde1d5926ac556bdc6a0422145c4355e23e0fc79dbd9b"
+    },
+    {
+      "path": "/links",
+      "type": "directory",
+      "size": 0
+    },
+    {
+      "path": "/links/relative",
+      "type": "symlink",
+      "link_target": "../moves/final.txt",
+      "size": 18
+    },
+    {
+      "path": "/long-names",
+      "type": "directory",
+      "size": 0
+    },
+    {
+      "path": "/long-names/long-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx.txt",
+      "type": "file",
+      "size": 26,
+      "sha256": "0cd1b24b85533d0c5e3ea48c118044ad027d849286e505e3c14c6b4c8622606e"
+    },
+    {
+      "path": "/moves",
+      "type": "directory",
+      "size": 0
+    },
+    {
+      "path": "/moves/final.txt",
+      "type": "file",
+      "size": 28,
+      "sha256": "7ba0ca8a693d940e3f431849ec4e13e16396715452b51ade3b99b9df8051ef0a"
+    },
+    {
+      "path": "/names",
+      "type": "directory",
+      "size": 0
+    },
+    {
+      "path": "/names/Grüße 東京.txt",
+      "type": "file",
+      "size": 12,
+      "sha256": "46da622564da29e0c6b36e259e15b6f358bdf261d16af18878b9771615945346"
+    },
+    {
+      "path": "/names/é.txt",
+      "type": "file",
+      "size": 9,
+      "sha256": "3467e33978a897b2df2162efb52d96a4b12a9378dd6be49fa8f5d090143ca09f"
+    }
+  ],
+  "long_name": "long-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx.txt",
+  "moved_from": "/moves/source.txt",
+  "moved_to": "/moves/final.txt",
+  "link_path": "/links/relative",
+  "link_target": "../moves/final.txt",
+  "corrupt_logical_path": "/corruption/authenticated.bin",
+  "corrupt_ciphertext_path": "d/OC/N4VCIMVESARCZ3CADLUBYN44RLJANN/EHs1SZmow_jhQA21-oPVPYys4FPkf3wNVk0fYuc02Fq2.c9r",
+  "valid_zip_sha256": "973bf8bfba7c44c9d476fa84e960517e24f1079a5ef65d86b0bab667d1bb1abc"
+}
