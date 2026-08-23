@@ -72,7 +72,7 @@ def add_index_entry(
             IndexEntry(
                 dbx_path_lower=dbx_path.lower(),
                 dbx_path_cased=dbx_path,
-                dbx_id=f"id:{dbx_path}",
+                provider_id=f"id:{dbx_path}",
                 item_type=item_type,
                 last_sync=last_sync,
                 rev="folder" if item_type is ItemType.Folder else "source-rev",

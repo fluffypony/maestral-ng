@@ -167,7 +167,7 @@ def test_windows_older_mtime_with_changed_content_conflicts(
             IndexEntry(
                 dbx_path_lower="/changed.txt",
                 dbx_path_cased="/changed.txt",
-                dbx_id="id:changed",
+                provider_id="id:changed",
                 item_type=ItemType.File,
                 last_sync=10,
                 rev="indexed-rev",
@@ -334,7 +334,7 @@ def test_windows_invalid_deleted_name_removes_legacy_index(
             IndexEntry(
                 dbx_path_lower=invalid_path,
                 dbx_path_cased=invalid_path,
-                dbx_id="id:invalid",
+                provider_id="id:invalid",
                 item_type=ItemType.File,
                 last_sync=0,
                 rev="legacy-rev",
@@ -372,7 +372,7 @@ def test_windows_inactive_scan_removes_invalid_legacy_index(
             IndexEntry(
                 dbx_path_lower=invalid_path,
                 dbx_path_cased=invalid_path,
-                dbx_id="id:invalid",
+                provider_id="id:invalid",
                 item_type=ItemType.File,
                 last_sync=0,
                 rev="legacy-rev",
@@ -401,7 +401,7 @@ def test_windows_selective_exclusion_unindexes_invalid_legacy_path(m, monkeypatc
             IndexEntry(
                 dbx_path_lower=invalid_path,
                 dbx_path_cased=invalid_path,
-                dbx_id="id:invalid",
+                provider_id="id:invalid",
                 item_type=ItemType.File,
                 last_sync=0,
                 rev="legacy-rev",

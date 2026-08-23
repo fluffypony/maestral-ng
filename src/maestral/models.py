@@ -494,11 +494,14 @@ class IndexEntry(Model):
 
     __tablename__ = "'index'"
 
-    dbx_path_lower = NonNullColumn(SqlPath(), primary_key=True)
+    provider_id = NonNullColumn(SqlString(), primary_key=True)
+    """The provider's stable ID for the item."""
+
+    dbx_path_lower = NonNullColumn(SqlPath(), unique=True)
     """
-    Dropbox path of the item in lower case. This acts as a primary key for the SQLites
-    database since there can only be one entry per case-insensitive Dropbox path.
-    Corresponds to the path_lower field of Dropbox metadata.
+    Dropbox path of the item in lower case. There can only be one entry per
+    case-insensitive Dropbox path. Corresponds to the path_lower field of Dropbox
+    metadata.
     """
 
     dbx_path_cased = NonNullColumn(SqlPath(), index=True)
@@ -506,9 +509,6 @@ class IndexEntry(Model):
     Dropbox path of the item, correctly cased. Corresponds to the path_display field of
     Dropbox metadata.
     """
-
-    dbx_id = NonNullColumn(SqlString())
-    """The unique dropbox ID for the item."""
 
     item_type = NonNullColumn(SqlEnum(ItemType))
     """The :class:`ItemType`."""

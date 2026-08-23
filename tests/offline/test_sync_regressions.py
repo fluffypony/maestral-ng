@@ -123,7 +123,7 @@ def add_move_file_index_entry(
             IndexEntry(
                 dbx_path_lower=dbx_path.lower(),
                 dbx_path_cased=dbx_path,
-                dbx_id=dbx_id,
+                provider_id=dbx_id,
                 item_type=ItemType.File,
                 last_sync=1,
                 rev=rev,
@@ -131,6 +131,31 @@ def add_move_file_index_entry(
                 symlink_target=None,
             )
         )
+
+
+def make_index_entry(
+    dbx_path: str,
+    provider_id: str,
+    *,
+    item_type: ItemType = ItemType.File,
+) -> IndexEntry:
+    is_folder = item_type is ItemType.Folder
+    return IndexEntry(
+        provider_id=provider_id,
+        dbx_path_lower=dbx_path.lower(),
+        dbx_path_cased=dbx_path,
+        item_type=item_type,
+        last_sync=1,
+        rev="folder" if is_folder else "rev",
+        content_hash="folder" if is_folder else "hash",
+        symlink_target=None,
+    )
+
+
+def store_index_entries(sync: SyncEngine, *entries: IndexEntry) -> None:
+    with sync._database_access():
+        for entry in entries:
+            sync._index_table.update(entry)
 
 
 def make_moved_file_metadata(
@@ -156,6 +181,123 @@ def make_moved_file_metadata(
         is_downloadable=True,
         content_hash=content_hash,
     )
+
+
+def test_index_identity_move_replaces_old_identity_and_destination(
+    sync_engine: SyncEngine,
+) -> None:
+    old_entry = make_index_entry("/old.txt", "id:stable")
+    destination_entry = make_index_entry("/new.txt", "id:destination")
+    store_index_entries(sync_engine, old_entry, destination_entry)
+    with sync_engine._database_access():
+        assert sync_engine._index_table.get("id:stable") is old_entry
+    moved_metadata = make_moved_file_metadata(
+        "/new.txt", "hash", dbx_id="id:stable", rev="rev"
+    )
+
+    sync_engine.update_index_from_dbx_metadata(moved_metadata)
+
+    with sync_engine._database_access():
+        moved_entry = sync_engine._index_table.get("id:stable")
+        assert moved_entry is not None
+        assert moved_entry is not old_entry
+        assert moved_entry.dbx_path_lower == "/new.txt"
+        assert sync_engine._index_table.get("id:destination") is None
+
+    assert sync_engine.get_index_entry("/old.txt") is None
+    assert sync_engine.get_index_entry("/new.txt").provider_id == "id:stable"  # type: ignore[union-attr]
+    assert sync_engine.index_count() == 1
+
+
+def test_index_path_replacement_removes_stale_identity_cache(
+    sync_engine: SyncEngine,
+) -> None:
+    old_entry = make_index_entry("/same.txt", "id:old")
+    store_index_entries(sync_engine, old_entry)
+    with sync_engine._database_access():
+        assert sync_engine._index_table.get("id:old") is old_entry
+    new_metadata = make_moved_file_metadata(
+        "/same.txt", "hash", dbx_id="id:new", rev="rev"
+    )
+
+    sync_engine.update_index_from_dbx_metadata(new_metadata)
+
+    with sync_engine._database_access():
+        assert sync_engine._index_table.get("id:old") is None
+        new_entry = sync_engine._index_table.get("id:new")
+        assert new_entry is not None
+        assert new_entry.dbx_path_lower == "/same.txt"
+
+    assert sync_engine.get_index_entry("/same.txt").provider_id == "id:new"  # type: ignore[union-attr]
+    assert sync_engine.index_count() == 1
+
+
+@pytest.mark.parametrize("replacement_type", [ItemType.File, ItemType.Folder])
+def test_index_path_replacement_removes_old_subtree(
+    sync_engine: SyncEngine, replacement_type: ItemType
+) -> None:
+    root = make_index_entry("/node", "id:old-root", item_type=ItemType.Folder)
+    child = make_index_entry("/node/child.txt", "id:old-child")
+    unrelated = make_index_entry("/other.txt", "id:other")
+    store_index_entries(sync_engine, root, child, unrelated)
+
+    replacement = make_index_entry("/node", "id:new-root", item_type=replacement_type)
+    with sync_engine._database_access():
+        sync_engine._replace_index_entry(replacement)
+
+    assert sync_engine.get_index_entry("/node").provider_id == "id:new-root"  # type: ignore[union-attr]
+    assert sync_engine.get_index_entry("/node/child.txt") is None
+    assert sync_engine.get_index_entry("/other.txt").provider_id == "id:other"  # type: ignore[union-attr]
+
+
+def test_index_folder_refresh_preserves_existing_subtree(
+    sync_engine: SyncEngine,
+) -> None:
+    root = make_index_entry("/folder", "id:folder", item_type=ItemType.Folder)
+    child = make_index_entry("/folder/child.txt", "id:child")
+    store_index_entries(sync_engine, root, child)
+
+    refreshed_root = make_index_entry("/folder", "id:folder", item_type=ItemType.Folder)
+    refreshed_root.last_sync = 2
+    with sync_engine._database_access():
+        sync_engine._replace_index_entry(refreshed_root)
+
+    assert sync_engine.get_index_entry("/folder").last_sync == 2  # type: ignore[union-attr]
+    assert (
+        sync_engine.get_index_entry("/folder/child.txt").provider_id  # type: ignore[union-attr]
+        == "id:child"
+    )
+
+
+def test_remove_exact_index_path_preserves_descendants(
+    sync_engine: SyncEngine,
+) -> None:
+    root = make_index_entry("/folder", "id:folder", item_type=ItemType.Folder)
+    child = make_index_entry("/folder/child.txt", "id:child")
+    store_index_entries(sync_engine, root, child)
+
+    sync_engine.remove_index_entry("/folder")
+
+    assert sync_engine.get_index_entry("/folder") is None
+    assert (
+        sync_engine.get_index_entry("/folder/child.txt").provider_id  # type: ignore[union-attr]
+        == "id:child"
+    )
+
+
+def test_remove_index_subtree_uses_paths_with_unrelated_provider_ids(
+    sync_engine: SyncEngine,
+) -> None:
+    root = make_index_entry("/folder", "id:folder", item_type=ItemType.Folder)
+    child = make_index_entry("/folder/child.txt", "unrelated:id")
+    sibling = make_index_entry("/sibling.txt", "id:sibling")
+    store_index_entries(sync_engine, root, child, sibling)
+
+    sync_engine.remove_node_from_index("/folder")
+
+    assert sync_engine.get_index_entry("/folder") is None
+    assert sync_engine.get_index_entry("/folder/child.txt") is None
+    assert sync_engine.get_index_entry("/sibling.txt").provider_id == "id:sibling"  # type: ignore[union-attr]
 
 
 def test_case_only_move_does_not_remove_remote_destination(
@@ -316,7 +458,7 @@ def test_local_folder_deletion_always_queues_durable_restore(
             IndexEntry(
                 dbx_path_lower="/folder",
                 dbx_path_cased="/folder",
-                dbx_id="id:folder",
+                provider_id="id:folder",
                 item_type=ItemType.Folder,
                 last_sync=1,
                 rev="folder",
@@ -328,7 +470,7 @@ def test_local_folder_deletion_always_queues_durable_restore(
             IndexEntry(
                 dbx_path_lower="/folder/child.txt",
                 dbx_path_cased="/folder/child.txt",
-                dbx_id="id:child",
+                provider_id="id:child",
                 item_type=ItemType.File,
                 last_sync=1,
                 rev="indexed-rev",

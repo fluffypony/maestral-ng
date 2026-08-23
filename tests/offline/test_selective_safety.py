@@ -81,7 +81,7 @@ def add_index_entry(
     entry = IndexEntry(
         dbx_path_lower=dbx_path.lower(),
         dbx_path_cased=dbx_path,
-        dbx_id=f"id:{dbx_path}",
+        provider_id=f"id:{dbx_path}",
         item_type=item_type,
         last_sync=datetime.now(tz=timezone.utc).timestamp() + 60,
         rev="folder" if is_folder else "rev",
@@ -2469,6 +2469,11 @@ def test_folder_case_change_updates_descendant_index_rows(
     assert (
         sync_engine.get_index_entry("/folder/child.txt").dbx_path_cased  # type: ignore[union-attr]
         == "/folder/Child.txt"
+    )
+    assert sync_engine.get_index_entry("/folder").provider_id == "id:/Folder"  # type: ignore[union-attr]
+    assert (
+        sync_engine.get_index_entry("/folder/child.txt").provider_id  # type: ignore[union-attr]
+        == "id:/Folder/Child.txt"
     )
 
 

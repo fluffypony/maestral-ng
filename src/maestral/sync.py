@@ -91,8 +91,16 @@ from .core import (
     WriteMode,
 )
 from .database.core import Database
+from .database.migrations import migrate_index_table
 from .database.orm import Manager
-from .database.query import AllQuery, AndQuery, MatchQuery, PathTreeQuery, Query
+from .database.query import (
+    AllQuery,
+    AndQuery,
+    MatchQuery,
+    OrQuery,
+    PathTreeQuery,
+    Query,
+)
 from .errorhandling import convert_api_errors, os_to_maestral_error
 from .exceptions import (
     CacheDirError,
@@ -688,6 +696,12 @@ class SyncEngine:
 
         self._connection = sqlite3.connect(self._db_path, check_same_thread=False)
         self._db = Database(self._connection)
+
+        try:
+            migrate_index_table(self._connection)
+        except BaseException:
+            self._connection.close()
+            raise
 
         try:
             self._create_or_load_db()
@@ -1958,12 +1972,12 @@ class SyncEngine:
             )
             entry = index_entries[source_path]
             if isinstance(md, FolderMetadata):
-                if not entry.is_directory or entry.dbx_id != md.id:
+                if not entry.is_directory or entry.provider_id != md.id:
                     return False
             elif isinstance(md, FileMetadata):
                 if (
                     not entry.is_file
-                    or entry.dbx_id != md.id
+                    or entry.provider_id != md.id
                     or entry.rev != md.rev
                     or entry.content_hash != md.content_hash
                     or entry.symlink_target != md.symlink_target
@@ -2820,7 +2834,9 @@ class SyncEngine:
         :returns: Index entry or ``None`` if no entry exists for the given path.
         """
         with self._database_access():
-            return self._index_table.get(dbx_path_lower)
+            query = MatchQuery(IndexEntry.dbx_path_lower, dbx_path_lower)
+            entries = self._index_table.select(query)
+            return entries[0] if entries else None
 
     def get_index_entry_for_local_path(self, local_path: str) -> IndexEntry | None:
         """
@@ -2924,7 +2940,7 @@ class SyncEngine:
                 entry = IndexEntry(
                     dbx_path_cased=event.dbx_path,
                     dbx_path_lower=dbx_path_lower,
-                    dbx_id=event.dbx_id,
+                    provider_id=event.dbx_id,
                     item_type=event.item_type,
                     last_sync=(
                         self._get_change_time(event.local_path)
@@ -2936,13 +2952,7 @@ class SyncEngine:
                     symlink_target=event.symlink_target,
                 )
 
-                if event.is_file:
-                    query = PathTreeQuery(
-                        IndexEntry.dbx_path_lower, event.dbx_path_lower
-                    )
-                    self._index_table.replace_matching(query, entry)
-                else:
-                    self._index_table.update(entry)
+                self._replace_index_entry(entry)
 
     def update_index_from_dbx_metadata(self, md: Metadata) -> None:
         """
@@ -2976,7 +2986,7 @@ class SyncEngine:
             entry = IndexEntry(
                 dbx_path_cased=dbx_path_cased,
                 dbx_path_lower=md.path_lower,
-                dbx_id=md_id,
+                provider_id=md_id,
                 item_type=item_type,
                 last_sync=None,
                 rev=rev,
@@ -2984,11 +2994,29 @@ class SyncEngine:
                 symlink_target=symlink_target,
             )
 
-            if isinstance(md, FileMetadata):
-                query = PathTreeQuery(IndexEntry.dbx_path_lower, md.path_lower)
-                self._index_table.replace_matching(query, entry)
-            else:
-                self._index_table.update(entry)
+            self._replace_index_entry(entry)
+
+    def _replace_index_entry(self, entry: IndexEntry) -> None:
+        """Replace an index row by stable identity and destination path."""
+        destination_entry = self.get_index_entry(entry.dbx_path_lower)
+        replaces_destination_tree = entry.is_file or (
+            destination_entry is not None
+            and destination_entry.provider_id != entry.provider_id
+        )
+        if replaces_destination_tree:
+            destination_query: Query = PathTreeQuery(
+                IndexEntry.dbx_path_lower, entry.dbx_path_lower
+            )
+        else:
+            destination_query = MatchQuery(
+                IndexEntry.dbx_path_lower, entry.dbx_path_lower
+            )
+
+        query = OrQuery(
+            MatchQuery(IndexEntry.provider_id, entry.provider_id),
+            destination_query,
+        )
+        self._index_table.replace_matching(query, entry)
 
     def remove_node_from_index(self, dbx_path_lower: str) -> None:
         """
@@ -3003,7 +3031,8 @@ class SyncEngine:
     def remove_index_entry(self, dbx_path_lower: str) -> None:
         """Remove only the exact path from the local index."""
         with self._database_access():
-            self._index_table.delete_primary_key(dbx_path_lower)
+            query = MatchQuery(IndexEntry.dbx_path_lower, dbx_path_lower)
+            self._index_table.delete(query)
 
     # ==== Content hashing =============================================================
 
@@ -6198,7 +6227,7 @@ class SyncEngine:
                 index_entry is None
                 or not index_entry.is_file
                 or index_entry.rev != md.rev
-                or index_entry.dbx_id != md.id
+                or index_entry.provider_id != md.id
             ):
                 self._logger.warning(
                     'Keeping remote file "%s": its revision is not bound to the '
@@ -7820,7 +7849,7 @@ class SyncEngine:
         preserve_metadata = bool(
             event.symlink_target is None
             and old_entry
-            and event.dbx_id == old_entry.dbx_id
+            and event.dbx_id == old_entry.provider_id
         )
 
         if isfile(event.local_path):
