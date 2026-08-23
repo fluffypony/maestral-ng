@@ -12,6 +12,7 @@ from maestral.constants import GITHUB_RELEASES_API
 from maestral.exceptions import (
     MaestralApiError,
     NotLinkedError,
+    VirtualFileBusyError,
     VirtualFilesUnsupportedError,
 )
 from maestral.main import Maestral
@@ -136,6 +137,49 @@ def test_mirror_only_operations_reject_virtual_mode(
 
     rebuild.assert_not_called()
     selective.assert_not_called()
+
+
+def test_stopped_virtual_root_validates_native_registration(
+    m: Maestral, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    marker_id = "a" * 32
+    root = tmp_path / "visible-root"
+    root.mkdir()
+    m._sync_mode = "virtual"
+    m._conf.set("sync", "mode", "virtual")
+    m._conf.set("sync", "root_marker_id", marker_id)
+    m.sync._publish_dropbox_path(str(root))
+    validate_root = Mock()
+    monkeypatch.setattr(m.virtual_files, "validate_root", validate_root)
+
+    m._check_dropbox_dir()
+
+    validate_root.assert_called_once_with(str(root), marker_id)
+
+
+def test_stopped_virtual_root_propagates_inactive_registration(
+    m: Maestral, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    marker_id = "b" * 32
+    root = tmp_path / "visible-root"
+    root.mkdir()
+    m._sync_mode = "virtual"
+    m._conf.set("sync", "mode", "virtual")
+    m._conf.set("sync", "root_marker_id", marker_id)
+    m.sync._publish_dropbox_path(str(root))
+    monkeypatch.setattr(
+        m.virtual_files,
+        "validate_root",
+        Mock(
+            side_effect=VirtualFileBusyError(
+                "Native virtual root is inactive",
+                "The File Provider domain is unavailable.",
+            )
+        ),
+    )
+
+    with pytest.raises(VirtualFileBusyError, match="domain is unavailable"):
+        m._check_dropbox_dir()
 
 
 def test_shutdown_retries_an_engine_before_shared_resource_close(

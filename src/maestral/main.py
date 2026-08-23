@@ -3184,14 +3184,7 @@ class Maestral:
             return
 
         marker_id = self._conf.get("sync", "root_marker_id")
-        if self.virtual_files.running:
-            self.virtual_files.validate_root(self.sync.dropbox_path, marker_id)
-            return
-
-        try:
-            self.sync.ensure_dropbox_folder_present()
-        except NoDropboxDirError:
-            self.virtual_files.validate_root(self.sync.dropbox_path, marker_id)
+        self.virtual_files.validate_root(self.sync.dropbox_path, marker_id)
 
     # ==== Housekeeping on update  =====================================================
 
