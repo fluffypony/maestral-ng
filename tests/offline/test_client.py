@@ -1,6 +1,6 @@
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, call
 
 import pytest
 import requests
@@ -17,7 +17,7 @@ from maestral.client import (
     convert_shared_link_metadata,
     convert_space_usage,
 )
-from maestral.exceptions import NotLinkedError, SyncError
+from maestral.exceptions import DataCorruptionError, NotLinkedError, SyncError
 from maestral.keyring import CredentialStorage
 
 # ==== DropboxClient tests =============================================================
@@ -96,6 +96,65 @@ def test_unlink_error():
         client.unlink()
 
 
+def test_unlink_clears_sdk_handles() -> None:
+    cred_storage = Mock(spec_set=CredentialStorage)
+    client = DropboxClient("test-config", cred_storage)
+    client._dbx_base = Mock()
+    client._dbx = Mock()
+
+    client.unlink()
+
+    cred_storage.delete_creds.assert_called_once_with()
+    assert client._dbx_base is None
+    assert client._dbx is None
+
+
+def test_unlink_clears_sdk_handles_after_credential_interrupt() -> None:
+    cred_storage = Mock(spec_set=CredentialStorage)
+    cred_storage.delete_creds.side_effect = KeyboardInterrupt("after credential clear")
+    client = DropboxClient("test-config", cred_storage)
+    client._dbx_base = Mock()
+    client._dbx = Mock()
+
+    with pytest.raises(KeyboardInterrupt, match="after credential clear"):
+        client.unlink()
+
+    assert client._dbx_base is None
+    assert client._dbx is None
+
+
+def test_corrupt_download_cleanup_preserves_concurrent_replacement(
+    client: DropboxClient,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    destination = tmp_path / "download.txt"
+    displaced_download = tmp_path / "displaced-download.txt"
+    response = Mock()
+    response.iter_content.return_value = [b"corrupt download"]
+    metadata = SimpleNamespace(content_hash="different hash")
+    client._dbx = Mock()
+    client._dbx.files_download.return_value = (metadata, response)
+    rooted_delete = client_module.delete
+
+    def replace_before_cleanup(path: str, **kwargs: object):
+        destination.rename(displaced_download)
+        destination.write_text("local replacement")
+        return rooted_delete(path, **kwargs)
+
+    monkeypatch.setattr(client_module, "delete", replace_before_cleanup)
+
+    with pytest.raises(DataCorruptionError):
+        DropboxClient.download.__wrapped__(
+            client,
+            "/download.txt",
+            str(destination),
+        )
+
+    assert destination.read_text() == "local replacement"
+    assert displaced_download.read_bytes() == b"corrupt download"
+
+
 def test_retry_regex_reraises_errors_without_string_messages(client):
     calls = 0
 
@@ -120,6 +179,106 @@ def test_throttled_iterators_guard_zero_transfer_count(client, monkeypatch):
 
     assert list(client._throttled_download_iter(iter([b"a"]))) == [b"a"]
     assert b"".join(client._throttled_upload_iter(b"a")) == b"a"
+
+
+def test_update_path_root_publishes_client_after_state_save(client, monkeypatch):
+    old_dbx = Mock()
+    new_dbx = Mock()
+    client._dbx = old_dbx
+    client._dbx_base = Mock()
+    client._dbx_base.with_path_root.return_value = new_dbx
+    client._namespace_id = "old-root"
+    client._is_team_space = False
+
+    def save_state():
+        assert client._dbx is old_dbx
+        assert client.namespace_id == "old-root"
+        assert client.is_team_space is False
+
+    monkeypatch.setattr(client._state, "save", save_state)
+
+    client.update_path_root(
+        core.TeamRootInfo(
+            root_namespace_id="new-root",
+            home_namespace_id="home",
+            home_path="/Home",
+        )
+    )
+
+    assert client._dbx is new_dbx
+    assert client.namespace_id == "new-root"
+    assert client.is_team_space is True
+
+
+def test_update_path_root_restores_state_after_save_failure(client, monkeypatch):
+    client._state.set("account", "path_root_nsid", "old-root", save=False)
+    client._state.set("account", "path_root_type", "user", save=False)
+    client._state.set("account", "home_path", "", save=False)
+    old_dbx = Mock()
+    client._dbx = old_dbx
+    client._dbx_base = Mock()
+    client._dbx_base.with_path_root.return_value = Mock()
+    client._namespace_id = "old-root"
+    client._is_team_space = False
+    monkeypatch.setattr(
+        client._state,
+        "save",
+        Mock(side_effect=OSError("cannot save")),
+    )
+
+    with pytest.raises(OSError, match="cannot save"):
+        client.update_path_root(
+            core.TeamRootInfo(
+                root_namespace_id="new-root",
+                home_namespace_id="home",
+                home_path="/Home",
+            )
+        )
+
+    assert client._dbx is old_dbx
+    assert client.namespace_id == "old-root"
+    assert client.is_team_space is False
+    assert client._state.get("account", "path_root_nsid") == "old-root"
+    assert client._state.get("account", "path_root_type") == "user"
+    assert client._state.get("account", "home_path") == ""
+
+
+def test_update_path_root_postcommit_base_exception_keeps_parser_and_cache(
+    client, monkeypatch
+):
+    client._state.set("account", "path_root_nsid", "old-root", save=False)
+    client._state.set("account", "path_root_type", "user", save=False)
+    client._state.set("account", "home_path", "", save=False)
+    old_dbx = Mock()
+    new_dbx = Mock()
+    client._dbx = old_dbx
+    client._dbx_base = Mock()
+    client._dbx_base.with_path_root.return_value = new_dbx
+    client._namespace_id = "old-root"
+    client._is_team_space = False
+    original_save = client._state.save
+
+    def save_then_interrupt():
+        original_save()
+        raise KeyboardInterrupt("after state commit")
+
+    monkeypatch.setattr(client._state, "save", save_then_interrupt)
+
+    with pytest.raises(KeyboardInterrupt, match="after state commit"):
+        client.update_path_root(
+            core.TeamRootInfo(
+                root_namespace_id="new-root",
+                home_namespace_id="home",
+                home_path="/Home",
+            )
+        )
+
+    assert client._state.get("account", "path_root_nsid") == "new-root"
+    assert client._state.get("account", "path_root_type") == "team"
+    assert client._state.get("account", "home_path") == "/Home"
+    assert client._dbx is new_dbx
+    assert client.namespace_id == "new-root"
+    assert client.is_team_space is True
 
 
 def test_upload_body_can_be_reused_after_sdk_retry(client):
@@ -203,6 +362,19 @@ def test_create_shared_link_converts_aware_expiry_to_utc(client, monkeypatch):
 
     settings = client._dbx.sharing_create_shared_link_with_settings.call_args.args[1]
     assert settings.expires == datetime(2026, 1, 2, 10, tzinfo=timezone.utc)
+
+
+def test_list_shared_links_forwards_direct_only_on_every_page(client):
+    first_page = SimpleNamespace(links=[], has_more=True, cursor="first")
+    second_page = SimpleNamespace(links=[], has_more=False, cursor="second")
+    client._dbx = Mock()
+    client._dbx.sharing_list_shared_links.side_effect = [first_page, second_page]
+
+    assert client.list_shared_links("/file", direct_only=True) == []
+    assert client._dbx.sharing_list_shared_links.call_args_list == [
+        call(path="/file", direct_only=True),
+        call(path="/file", cursor="first", direct_only=True),
+    ]
 
 
 def _complete_batch(*metadata):

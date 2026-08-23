@@ -298,28 +298,52 @@ class CredentialStorage:
 
             output.ok("Credentials written")
 
-    def delete_creds(self) -> None:
+    def delete_creds(
+        self,
+        account_id: str | None = None,
+        keyring_name: str | None = None,
+    ) -> None:
         """
         Deletes auth token from system keyring.
 
+        :param account_id: Account ID to delete. Defaults to the configured account.
+        :param keyring_name: Configured keyring class to use for reset recovery.
         :raises KeyringAccessError: if the system keyring is locked or otherwise cannot
             be accessed (for example if the app bundle signature has been invalidated).
         """
         with self._lock:
-            if self.keyring and self.account_id:
-                accessor = self._get_accessor(self.account_id)
+            configured_account_id = self.account_id
+            target_account_id = account_id or configured_account_id
+            ring = self.keyring
+            if keyring_name and keyring_name != "automatic":
+                current_name = (
+                    f"{ring.__class__.__module__}.{ring.__class__.__name__}"
+                    if ring
+                    else ""
+                )
+                if current_name != keyring_name:
+                    try:
+                        ring = load_keyring(keyring_name)
+                    except Exception as exc:
+                        raise KeyringAccessError(
+                            f"Cannot load keyring {keyring_name}",
+                            "Unlock or restore the configured keyring and try again.",
+                        ) from exc
+
+            if ring and target_account_id:
+                accessor = self._get_accessor(target_account_id)
 
                 try:
-                    self.keyring.delete_password("Maestral", accessor)
+                    ring.delete_password("Maestral", accessor)
                 except (KeyringLocked, InitError):
                     title = "Could not delete auth token"
                     msg = (
-                        f"{self.keyring.name} is locked. Please unlock the keyring "
+                        f"{ring.name} is locked. Please unlock the keyring "
                         "and try again."
                     )
-                    exc = KeyringAccessError(title, msg)
-                    self._logger.error(title, exc_info=exc_info_tuple(exc))
-                    raise exc
+                    error = KeyringAccessError(title, msg)
+                    self._logger.error(title, exc_info=exc_info_tuple(error))
+                    raise error
                 except PasswordDeleteError as exc:
                     # password does not exist in keyring
                     self._logger.info(str(exc))
@@ -331,12 +355,26 @@ class CredentialStorage:
                 else:
                     output.ok("Credentials removed")
 
-            self.set_keyring_backend(None)
-
-            self._conf.set("auth", "account_id", "")
-            self._conf.set("auth", "token_access_type", "")
-            self._token = None
-            self._loaded = False
+            if configured_account_id == target_account_id:
+                with self._conf._lock:
+                    snapshot = self._conf._configuration_snapshot()
+                    save_generation = self._conf.save_generation
+                    try:
+                        self._conf.set("auth", "keyring", "automatic", save=False)
+                        self._conf.set("auth", "account_id", "", save=False)
+                        self._conf.set("auth", "token_access_type", "", save=False)
+                        self._conf.save()
+                    except BaseException:
+                        if self._conf.save_committed_since(save_generation):
+                            self._keyring = None
+                            self._token = None
+                            self._loaded = False
+                        else:
+                            self._conf._restore_configuration_snapshot(snapshot)
+                        raise
+                self._keyring = None
+                self._token = None
+                self._loaded = False
 
     def __repr__(self) -> str:
         return f"<{self.__class__.__name__}(config={self._config_name!r})>"

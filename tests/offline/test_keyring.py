@@ -82,6 +82,51 @@ def test_delete_creds(cred_storage: CredentialStorage) -> None:
     assert conf.get("auth", "keyring") == "automatic"
 
 
+def test_delete_creds_publishes_live_clear_after_config_commit(
+    cred_storage: CredentialStorage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conf = MaestralConfig("test-config")
+    cred_storage.set_keyring_backend(PlaintextKeyring())
+    cred_storage.save_creds("account_id", "token", allow_plaintext=True)
+    original_save = cred_storage._conf.save
+
+    def save_then_interrupt() -> None:
+        original_save()
+        raise KeyboardInterrupt("after auth config commit")
+
+    monkeypatch.setattr(cred_storage._conf, "save", save_then_interrupt)
+
+    with pytest.raises(KeyboardInterrupt, match="after auth config commit"):
+        cred_storage.delete_creds()
+
+    assert not cred_storage.loaded
+    assert cred_storage.token is None
+    assert cred_storage.keyring is None
+    assert conf.get("auth", "account_id") == ""
+
+
+def test_delete_creds_keeps_live_token_before_config_commit(
+    cred_storage: CredentialStorage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cred_storage.set_keyring_backend(PlaintextKeyring())
+    cred_storage.save_creds("account_id", "token", allow_plaintext=True)
+    old_keyring = cred_storage.keyring
+
+    def fail_save() -> None:
+        raise OSError("before auth config commit")
+
+    monkeypatch.setattr(cred_storage._conf, "save", fail_save)
+
+    with pytest.raises(OSError, match="before auth config commit"):
+        cred_storage.delete_creds()
+
+    assert cred_storage.loaded
+    assert cred_storage.token == "token"
+    assert cred_storage.keyring is old_keyring
+
+
 def test_locked_keyring_does_not_fall_back(cred_storage: CredentialStorage) -> None:
     conf = MaestralConfig("test-config")
 

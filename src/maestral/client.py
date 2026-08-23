@@ -12,7 +12,7 @@ import os
 import re
 import threading
 import time
-from contextlib import closing, contextmanager
+from contextlib import AbstractContextManager, closing, contextmanager, nullcontext
 from datetime import datetime, timezone
 from typing import (
     TYPE_CHECKING,
@@ -495,13 +495,14 @@ class DropboxClient:
         :raises KeyringAccessError: if keyring access fails.
         :raises DropboxAuthError: if we cannot authenticate with Dropbox.
         """
-        self._dbx = None
-        self._dbx_base = None
-        self._cached_account_info = None
-
-        with convert_api_errors():
-            self.dbx_base.auth_token_revoke()
-            self._cred_storage.delete_creds()
+        try:
+            with convert_api_errors():
+                self.dbx_base.auth_token_revoke()
+                self._cred_storage.delete_creds()
+        finally:
+            self._dbx = None
+            self._dbx_base = None
+            self._cached_account_info = None
 
     def _init_sdk(
         self,
@@ -617,10 +618,6 @@ class DropboxClient:
         """
         root_nsid = root_info.root_namespace_id
 
-        path_root = common.PathRoot.root(root_nsid)
-        self._dbx = self.dbx_base.with_path_root(path_root)
-        self.dbx._logger = self._dropbox_sdk_logger
-
         if isinstance(root_info, UserRootInfo):
             actual_root_type = "user"
             actual_home_path = ""
@@ -633,12 +630,41 @@ class DropboxClient:
                 f"Got {root_info!r} but expected UserRootInfo or TeamRootInfo.",
             )
 
-        self._namespace_id = root_nsid
-        self._is_team_space = actual_root_type == "team"
+        path_root = common.PathRoot.root(root_nsid)
+        new_dbx = self.dbx_base.with_path_root(path_root)
+        new_dbx._logger = self._dropbox_sdk_logger
 
-        self._state.set("account", "path_root_nsid", root_nsid)
-        self._state.set("account", "path_root_type", actual_root_type)
-        self._state.set("account", "home_path", actual_home_path)
+        with self._state._lock:
+            old_root_nsid = self._state.get("account", "path_root_nsid")
+            old_root_type = self._state.get("account", "path_root_type")
+            old_home_path = self._state.get("account", "home_path")
+            save_generation = self._state.save_generation
+
+            try:
+                self._state.set("account", "path_root_nsid", root_nsid, save=False)
+                self._state.set(
+                    "account", "path_root_type", actual_root_type, save=False
+                )
+                self._state.set("account", "home_path", actual_home_path, save=False)
+                self._state.save()
+            except BaseException:
+                if not self._state.save_committed_since(save_generation):
+                    self._state.set(
+                        "account", "path_root_nsid", old_root_nsid, save=False
+                    )
+                    self._state.set(
+                        "account", "path_root_type", old_root_type, save=False
+                    )
+                    self._state.set("account", "home_path", old_home_path, save=False)
+                else:
+                    self._dbx = new_dbx
+                    self._namespace_id = root_nsid
+                    self._is_team_space = actual_root_type == "team"
+                raise
+            else:
+                self._dbx = new_dbx
+                self._namespace_id = root_nsid
+                self._is_team_space = actual_root_type == "team"
 
         self._logger.debug("Path root type: %s", actual_root_type)
         self._logger.debug("Path root nsid: %s", root_info.root_namespace_id)
@@ -785,14 +811,14 @@ class DropboxClient:
     def download(
         self,
         dbx_path: str,
-        local_path: str,
+        local_path: str | BinaryIO,
         sync_event: SyncEvent | None = None,
     ) -> FileMetadata:
         """
         Downloads a file from Dropbox to given local path.
 
         :param dbx_path: Path to file on Dropbox or rev number.
-        :param local_path: Path to local download destination.
+        :param local_path: Path or open binary file for the download destination.
         :param sync_event: If given, the sync event will be updated with the number of
             downloaded bytes.
         :returns: Metadata of downloaded item.
@@ -802,8 +828,34 @@ class DropboxClient:
         with convert_api_errors(dbx_path=dbx_path):
             md, http_resp = self.dbx.files_download(dbx_path)
 
+            destination_path: str | None
+            destination_identity: tuple[int, ...] | None = None
+            destination_root: str | None = None
+            destination_root_identity: tuple[int, ...] | None = None
+            destination_context: AbstractContextManager[BinaryIO]
+            if isinstance(local_path, str):
+                destination_path = os.path.abspath(local_path)
+                destination_root = os.path.dirname(destination_path)
+                destination_root_stat = os.lstat(destination_root)
+                destination_root_identity = (
+                    destination_root_stat.st_dev,
+                    destination_root_stat.st_ino,
+                    destination_root_stat.st_mode,
+                )
+                destination_context = open(
+                    destination_path,
+                    "wb",
+                    opener=opener_no_symlink,
+                )
+            else:
+                destination_path = None
+                destination_context = nullcontext(local_path)
+            corrupted = False
+
             with closing(http_resp):
-                with open(local_path, "wb", opener=opener_no_symlink) as f:
+                with destination_context as f:
+                    f.seek(0)
+                    f.truncate()
                     hasher = DropboxContentHasher()
                     wrapped_f = StreamHasher(f, hasher)
                     with self._register_download():
@@ -815,36 +867,57 @@ class DropboxClient:
                                 sync_event.completed = wrapped_f.tell()
 
                     local_hash = hasher.hexdigest()
+                    destination_stat = os.fstat(f.fileno())
+                    destination_identity = (
+                        destination_stat.st_dev,
+                        destination_stat.st_ino,
+                        destination_stat.st_mode,
+                        destination_stat.st_size,
+                        destination_stat.st_mtime_ns,
+                        destination_stat.st_ctime_ns,
+                    )
 
                     if md.content_hash != local_hash:
-                        delete(local_path)
-                        raise DataCorruptionError(
-                            "Data corrupted", "Please retry download."
-                        )
+                        corrupted = True
+                    else:
+                        f.flush()
 
-            # Dropbox SDK provides naive datetime in UTC.
-            client_mod = md.client_modified.replace(tzinfo=timezone.utc)
-            server_mod = md.server_modified.replace(tzinfo=timezone.utc)
+                        # Dropbox SDK provides naive datetime in UTC.
+                        client_mod = md.client_modified.replace(tzinfo=timezone.utc)
+                        server_mod = md.server_modified.replace(tzinfo=timezone.utc)
 
-            # Enforce client_modified < server_modified.
-            now = time.time()
-            mtime = min(client_mod.timestamp(), server_mod.timestamp(), now)
-            # Set mtime of downloaded file.
-            if os.utime in os.supports_follow_symlinks:
-                os.utime(local_path, (now, mtime), follow_symlinks=False)
-            else:
-                os.utime(local_path, (now, mtime))
+                        # Enforce client_modified < server_modified.
+                        now = time.time()
+                        mtime = min(client_mod.timestamp(), server_mod.timestamp(), now)
+                        os.utime(f.fileno(), (now, mtime))
+
+            if corrupted:
+                if (
+                    destination_path is not None
+                    and destination_identity is not None
+                    and destination_root is not None
+                    and destination_root_identity is not None
+                ):
+                    delete(
+                        destination_path,
+                        root_path=destination_root,
+                        expected_root_identity=destination_root_identity,
+                        expected_target_identity=destination_identity,
+                    )
+                raise DataCorruptionError("Data corrupted", "Please retry download.")
 
         return convert_metadata(md)
 
     def upload(
         self,
-        local_path: str,
+        local_file: str | os.PathLike[str] | BinaryIO,
         dbx_path: str,
         write_mode: WriteMode = WriteMode.Add,
         update_rev: str | None = None,
         autorename: bool = False,
         sync_event: SyncEvent | None = None,
+        *,
+        local_path: str | None = None,
     ) -> FileMetadata:
         """
         Uploads local file to Dropbox. If the file size is smaller than 4 MB, the file
@@ -852,7 +925,8 @@ class DropboxClient:
         uploaded in chunks of 4 MB. If the file is modified during this chunked upload,
         this will raise a :exc:`DataChangedError`.
 
-        :param local_path: Path of local file to upload.
+        :param local_file: Path or open binary file to upload. An open file is not
+            closed and is read from the start.
         :param dbx_path: Path to save file on Dropbox.
         :param write_mode: Your intent when writing a file to some path. This is used to
             determine what constitutes a conflict and what the autorename strategy is.
@@ -881,6 +955,8 @@ class DropboxClient:
         :param update_rev: Rev to match for :class:`core.WriteMode.Update`.
         :param sync_event: If given, the sync event will be updated with the number of
             downloaded bytes.
+        :param local_path: Local path used for error messages when ``local_file`` is an
+            open file.
         :param autorename: If there's a conflict, as determined by ``mode``, have the
             Dropbox server try to autorename the file to avoid conflict. The default for
             this field is False.
@@ -899,8 +975,18 @@ class DropboxClient:
         else:
             raise RuntimeError("No write mode for uploading file.")
 
-        with convert_api_errors(dbx_path=dbx_path, local_path=local_path):
-            with open(local_path, "rb", opener=opener_no_symlink) as f:
+        error_path: str | None
+        file_context: AbstractContextManager[BinaryIO]
+        if isinstance(local_file, (str, bytes, os.PathLike)):
+            error_path = os.fsdecode(local_file)
+            file_context = open(error_path, "rb", opener=opener_no_symlink)
+        else:
+            error_path = local_path
+            file_context = nullcontext(local_file)
+
+        with convert_api_errors(dbx_path=dbx_path, local_path=error_path):
+            with file_context as f:
+                f.seek(0)
                 stat = os.stat(f.fileno())
 
                 with self._register_upload():
@@ -1697,24 +1783,31 @@ class DropboxClient:
             self.dbx.sharing_revoke_shared_link(url)
 
     def list_shared_links(
-        self, dbx_path: str | None = None
+        self, dbx_path: str | None = None, *, direct_only: bool = False
     ) -> list[SharedLinkMetadata]:
         """
         Lists all shared links for a given Dropbox path (file or folder). If no path is
         given, list all shared links for the account, up to a maximum of 1,000 links.
 
         :param dbx_path: Dropbox path to file or folder.
-        :returns: Shared links for a path, including any shared links for parents
-            through which this path is accessible.
+        :param direct_only: Only return links which point directly to ``dbx_path``.
+        :returns: Shared links for a path. Unless ``direct_only`` is set, this includes
+            links for parents through which the path is accessible.
         """
         results = []
 
         with convert_api_errors(dbx_path=dbx_path):
-            res = self.dbx.sharing_list_shared_links(dbx_path)
+            res = self.dbx.sharing_list_shared_links(
+                path=dbx_path, direct_only=direct_only
+            )
             results.append(convert_list_shared_link_result(res))
 
             while results[-1].has_more:
-                res = self.dbx.sharing_list_shared_links(dbx_path, results[-1].cursor)
+                res = self.dbx.sharing_list_shared_links(
+                    path=dbx_path,
+                    cursor=results[-1].cursor,
+                    direct_only=direct_only,
+                )
                 results.append(convert_list_shared_link_result(res))
 
         return self.flatten_results(results).entries
