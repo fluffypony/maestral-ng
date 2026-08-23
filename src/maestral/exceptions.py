@@ -221,6 +221,22 @@ class UnsupportedProviderOperationError(MaestralApiError):
     """Raised when the selected provider does not implement an optional operation."""
 
 
+class VirtualFilesUnsupportedError(MaestralApiError):
+    """Raised when virtual files have no native backend on this platform."""
+
+
+class VirtualFileNotFoundError(MaestralApiError):
+    """Raised when a virtual file identity is not present in the virtual index."""
+
+
+class VirtualFileBusyError(MaestralApiError):
+    """Raised when an open, dirty, or active virtual file cannot be changed safely."""
+
+
+class VirtualFileRevisionError(MaestralApiError):
+    """Raised when a native placeholder no longer has the expected revision."""
+
+
 class SharedLinkError(MaestralApiError):
     """Raised when creating a shared link fails."""
 

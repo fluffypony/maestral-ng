@@ -70,6 +70,8 @@ from .exceptions import (
     SymlinkError,
     UnsupportedFileTypeForDiff,
     UpdateCheckError,
+    VirtualFileNotFoundError,
+    VirtualFilesUnsupportedError,
 )
 from .keyring import CredentialStorage, VaultSecretStorage
 from .logging import (
@@ -97,6 +99,14 @@ from .utils.path import (
     rooted_tree_snapshot,
 )
 from .utils.path import unlink as rooted_unlink
+from .virtual_files import (
+    VIRTUAL_MODE,
+    UnsupportedVirtualFileBackend,
+    VirtualFileBackend,
+    VirtualFileController,
+    create_native_virtual_file_backend,
+    normalise_sync_mode,
+)
 
 __all__ = ["Maestral"]
 
@@ -172,6 +182,8 @@ class Maestral:
         event_loop: AbstractEventLoop | None = None,
         shutdown_future: Future[bool] | None = None,
         provider: str | None = None,
+        virtual_file_backend: VirtualFileBackend | None = None,
+        virtual_file_remote_polling: bool = True,
     ) -> None:
         # Check system compatibility.
         self._check_system_compatibility()
@@ -202,6 +214,14 @@ class Maestral:
             # provider was selected before this flag existed.
             self._save_provider_selection(configured_provider, selected=True)
         self._provider = configured_provider
+        self._sync_mode = normalise_sync_mode(self._conf.get("sync", "mode"))
+        self._virtual_file_backend_override = virtual_file_backend
+        if self.sync_mode == VIRTUAL_MODE:
+            selected_virtual_backend = (
+                virtual_file_backend or create_native_virtual_file_backend()
+            )
+        else:
+            selected_virtual_backend = UnsupportedVirtualFileBackend()
         self._state = MaestralState(self.config_name)
         self._logger = scoped_logger(__name__, self.config_name)
         self.cred_storage = CredentialStorage(self.config_name, self.provider)
@@ -234,6 +254,12 @@ class Maestral:
         self._recover_pending_dropbox_root_move()
         self.sync = SyncEngine(self.client, event_callback=self._publish_sync_events)
         self.manager = SyncManager(self.sync)
+        self.virtual_files = VirtualFileController(
+            self.config_name,
+            self.client,
+            selected_virtual_backend,
+            remote_polling=virtual_file_remote_polling,
+        )
 
         # Create a future which will return once `shutdown_daemon` is called.
         # This can be used by an event loop to wait until maestral has been stopped.
@@ -364,6 +390,9 @@ class Maestral:
         """
         self._check_linked()
         self.sync._ensure_unlink_recovery_clear()
+        virtual_was_running = self.virtual_files.running
+        if virtual_was_running:
+            self.virtual_files.reset()
         stop_state = self.manager.pause_for_internal_operation()
         try:
             with self.sync.sync_lock:
@@ -390,6 +419,8 @@ class Maestral:
 
                 self._resume_pending_unlink_credentials()
 
+                if self.sync_mode == VIRTUAL_MODE:
+                    self.virtual_files.reset()
                 self.sync._complete_pending_sync_reset()
                 self.manager.reload_download_queue()
         except BaseException:
@@ -397,6 +428,13 @@ class Maestral:
                 self.manager.resume_after_internal_stop(stop_state)
             else:
                 self.manager._finish_internal_operation(stop_state)
+            if (
+                virtual_was_running
+                and self.client.linked
+                and self.sync.dropbox_path
+                and not self._state.get("recovery", "sync_reset")
+            ):
+                self.virtual_files.start(self.sync.dropbox_path)
             raise
 
         self.manager._finish_internal_operation(stop_state)
@@ -631,10 +669,16 @@ class Maestral:
             )
             old_client = self.client
             try:
+                self.virtual_files.replace_provider(new_client)
+            except BaseException:
+                new_client.close()
+                raise
+            try:
                 self._save_encryption_settings(True, False, remote_path, resolved_cache)
                 self.client = new_client
                 self.sync.client = new_client
             except BaseException:
+                self.virtual_files.replace_provider(old_client)
                 new_client.close()
                 raise
 
@@ -656,10 +700,16 @@ class Maestral:
             )
             old_client = self.client
             try:
+                self.virtual_files.replace_provider(new_client)
+            except BaseException:
+                new_client.close()
+                raise
+            try:
                 self._save_encryption_settings(False, False, "", "")
                 self.client = new_client
                 self.sync.client = new_client
             except BaseException:
+                self.virtual_files.replace_provider(old_client)
                 new_client.close()
                 raise
 
@@ -698,7 +748,7 @@ class Maestral:
     def lock_encrypted_vault(self) -> None:
         """Close the configured vault and wipe its in-memory password."""
         with self.manager._lock:
-            if self.manager.running.is_set():
+            if self.manager.running.is_set() or self.virtual_files.running:
                 raise BusyError(
                     "Cannot lock the encrypted vault", "Stop sync and try again."
                 )
@@ -712,6 +762,57 @@ class Maestral:
                 "Configure a Cryptomator vault and try again.",
             )
         return self.client
+
+    @property
+    def sync_mode(self) -> str:
+        """The local root mode, either ``mirror`` or ``virtual``."""
+        return self._sync_mode
+
+    def set_sync_mode(self, mode: str) -> None:
+        """Select a mirror root or a separate native virtual root.
+
+        The mode is fixed once a local root exists. A virtual selection is saved only
+        after a real native backend is available.
+        """
+        selected_mode = normalise_sync_mode(mode)
+        if selected_mode == self.sync_mode:
+            return
+
+        with self._provider_selection_lock, self.manager._lock, self.sync.sync_lock:
+            if (
+                self.manager.running.is_set()
+                or self.virtual_files.running
+                or self.manager._active_internal_operation is not None
+            ):
+                raise BusyError(
+                    "Cannot change the sync mode", "Stop sync before you try again."
+                )
+            if self.sync.dropbox_path:
+                raise MaestralApiError(
+                    "Cannot change the sync mode",
+                    "Remove the current local root before you change its mode.",
+                )
+
+            if selected_mode == VIRTUAL_MODE:
+                backend = (
+                    self._virtual_file_backend_override
+                    or create_native_virtual_file_backend()
+                )
+                if not backend.supported:
+                    raise VirtualFilesUnsupportedError(
+                        "Native virtual files are unavailable",
+                        "Install the native virtual-file backend for this platform.",
+                    )
+            else:
+                backend = UnsupportedVirtualFileBackend()
+
+            old_backend = self.virtual_files.replace_backend(backend)
+            try:
+                self._conf.set("sync", "mode", selected_mode)
+            except BaseException:
+                self.virtual_files.replace_backend(old_backend)
+                raise
+            self._sync_mode = selected_mode
 
     def _save_provider_selection(self, provider: str, *, selected: bool) -> None:
         """Save the provider and its explicit selection as one config update."""
@@ -785,12 +886,18 @@ class Maestral:
                     new_cred_storage,
                 )
                 try:
+                    self.virtual_files.replace_provider(new_client)
+                except BaseException:
+                    new_client.close()
+                    raise
+                try:
                     self._save_provider_selection(selected_provider, selected=True)
                     self._provider = selected_provider
                     self.cred_storage = new_cred_storage
                     self.client = new_client
                     self.sync.client = new_client
                 except BaseException:
+                    self.virtual_files.replace_provider(old_client)
                     new_client.close()
                     raise
 
@@ -837,6 +944,8 @@ class Maestral:
             raise ValueError("Use the provider selection API for this setting")
         if normalised_section == "encryption":
             raise ValueError("Use the remote encryption API for this setting")
+        if normalised_section == "sync" and normalised_name == "mode":
+            raise ValueError("Use the sync mode selection API for this setting")
         self._conf.set(section, name, value)
 
     def get_conf(self, section: str, name: str) -> Any:
@@ -1038,6 +1147,7 @@ class Maestral:
             "encryption_vault_path": self.encryption_vault_path,
             "encryption_cache_path": self.encryption_cache_path,
             "encryption_vault_open": self.encryption_vault_open,
+            "sync_mode": self.sync_mode,
             "status": self.status,
             "pending_link": self.pending_link,
             "pending_dropbox_folder": self.pending_dropbox_folder,
@@ -1058,7 +1168,51 @@ class Maestral:
             "notification_level": self.notification_level,
             "bandwidth_limit_down": self.bandwidth_limit_down,
             "bandwidth_limit_up": self.bandwidth_limit_up,
+            "virtual_files": self.virtual_files.summary(),
         }
+
+    @property
+    def virtual_file_backend(self) -> str:
+        """The selected native virtual-file backend, if any."""
+        return self.virtual_files.backend_id
+
+    def get_virtual_file_status(self, provider_id: str) -> dict[str, object]:
+        """Return virtual-file status by stable provider identity."""
+        self._check_virtual_mode()
+        return self.virtual_files.get_status(provider_id)
+
+    def get_virtual_file_statuses(self) -> list[dict[str, object]]:
+        """Return status for all items in the separate virtual root."""
+        self._check_virtual_mode()
+        return self.virtual_files.list_status()
+
+    def hydrate_virtual_file(self, provider_id: str) -> dict[str, object]:
+        """Hydrate the newest revision of one virtual file."""
+        self._check_virtual_mode()
+        return self.virtual_files.hydrate(provider_id)
+
+    def pin_virtual_file(self, provider_id: str) -> dict[str, object]:
+        """Persist a pin and hydrate one virtual file."""
+        self._check_virtual_mode()
+        return self.virtual_files.pin(provider_id)
+
+    def unpin_virtual_file(self, provider_id: str) -> dict[str, object]:
+        """Remove a pin without evicting the file."""
+        self._check_virtual_mode()
+        return self.virtual_files.unpin(provider_id)
+
+    def evict_virtual_file(self, provider_id: str) -> dict[str, object]:
+        """Safely evict clean and closed content for one virtual file."""
+        self._check_virtual_mode()
+        return self.virtual_files.evict(provider_id)
+
+    def refresh_virtual_files(self) -> None:
+        """Apply pending remote changes to the separate virtual root."""
+        if self.sync_mode != VIRTUAL_MODE or not self.virtual_files.running:
+            raise BusyError(
+                "Virtual root is stopped", "Start virtual sync before a refresh."
+            )
+        self.virtual_files.refresh_remote()
 
     def _publish_sync_events(self, sync_events: Sequence[SyncEvent]) -> None:
         events = tuple(
@@ -1130,12 +1284,16 @@ class Maestral:
     @property
     def pending_first_download(self) -> bool:
         """Whether the initial download has already started (read only)."""
+        if self.sync_mode == VIRTUAL_MODE:
+            return self.virtual_files.cursor == ""
         return self.sync.local_cursor == 0 or self.sync.remote_cursor == ""
 
     @property
     def paused(self) -> bool:
         """Whether syncing is paused by the user (read only). Use :meth:`start_sync` and
         :meth:`stop_sync` to start and stop syncing, respectively."""
+        if self.sync_mode == VIRTUAL_MODE:
+            return not self.virtual_files.running
         return not self.manager.autostart.is_set() and not self.sync.busy()
 
     @property
@@ -1143,6 +1301,8 @@ class Maestral:
         """Whether sync threads are running (read only). This is similar to
         :attr:`paused` but also returns False if syncing is paused because we cannot
         connect to Dropbox servers.."""
+        if self.sync_mode == VIRTUAL_MODE:
+            return self.virtual_files.running
         return self.manager.running.is_set() or self.sync.busy()
 
     @property
@@ -1150,6 +1310,8 @@ class Maestral:
         """Whether Dropbox servers can be reached (read only)."""
         if self.pending_link:
             return False
+        elif self.sync_mode == VIRTUAL_MODE:
+            return self.virtual_files.connected
         else:
             return self.manager.connected
 
@@ -1161,6 +1323,10 @@ class Maestral:
             return PAUSED
         elif not self.connected:
             return CONNECTING
+        elif self.sync_mode == VIRTUAL_MODE:
+            summary = self.virtual_files.summary()
+            error = summary["error"]
+            return str(error) if error else IDLE
         else:
             return self._log_handler_info_cache.get_last_message()
 
@@ -1246,6 +1412,19 @@ class Maestral:
             dbx_path_cased = self.sync.to_dbx_path(local_path)
         except ValueError:
             return FileStatus.Unwatched.value
+
+        if self.sync_mode == VIRTUAL_MODE:
+            try:
+                virtual_status = self.virtual_files.get_status_for_path(
+                    self.sync.to_dbx_path_lower(local_path)
+                )
+            except VirtualFileNotFoundError:
+                return FileStatus.Unwatched.value
+            if virtual_status["hydration_state"] == "hydrating":
+                return FileStatus.Downloading.value
+            if virtual_status["error"]:
+                return FileStatus.Error.value
+            return FileStatus.Synced.value
 
         # Find any sync activity for the local path.
         sync_events = self.sync.activity.get_events(dbx_path_cased)
@@ -1742,14 +1921,20 @@ class Maestral:
         self._check_linked()
         self._check_dropbox_dir()
 
-        self.manager.start()
+        if self.sync_mode == VIRTUAL_MODE:
+            self.virtual_files.start(self.sync.dropbox_path)
+        else:
+            self.manager.start()
 
     def stop_sync(self) -> None:
         """
         Stops all syncing threads if running. Call :meth:`start_sync` to restart
         syncing.
         """
-        self.manager.stop()
+        if self.sync_mode == VIRTUAL_MODE:
+            self.virtual_files.stop()
+        else:
+            self.manager.stop()
 
     def reset_sync_state(self) -> None:
         """
@@ -1760,6 +1945,9 @@ class Maestral:
         :raises NotLinkedError: if no Dropbox account is linked.
         """
         self._check_linked()
+        if self.sync_mode == VIRTUAL_MODE:
+            self.virtual_files.reset()
+            return
         self.manager.reset_sync_state()
 
     def set_selective_sync(self, mode: str, dbx_paths: Collection[str]) -> None:
@@ -1986,6 +2174,11 @@ class Maestral:
         """
         self._check_linked()
         self._check_dropbox_dir()
+        if self.sync_mode == VIRTUAL_MODE:
+            raise MaestralApiError(
+                "Cannot move the virtual root",
+                "Create a new native virtual root instead.",
+            )
         if self._state.get("recovery", "sync_reset"):
             raise MaestralApiError(
                 "Cannot move Dropbox folder",
@@ -2174,6 +2367,7 @@ class Maestral:
             path = osp.normpath(osp.abspath(osp.expanduser(path)))
             root_identity = rooted_makedirs(path, exist_ok=True)
             self.manager.reset_sync_state()
+            self.virtual_files.reset()
             self.sync.set_dropbox_path(
                 path,
                 expected_root_identity=root_identity,
@@ -2390,6 +2584,7 @@ class Maestral:
         """
         Stop syncing and notify anyone monitoring ``shutdown_future`` that we are done.
         """
+        self.virtual_files.close()
         self.manager.shutdown()
 
         with self._sync_event_condition:
@@ -2415,6 +2610,13 @@ class Maestral:
             raise MaestralApiError(
                 "No storage provider selected",
                 "Select Dropbox or Google Drive before you link an account.",
+            )
+
+    def _check_virtual_mode(self) -> None:
+        if self.sync_mode != VIRTUAL_MODE:
+            raise MaestralApiError(
+                "Virtual root is not enabled",
+                "Select the virtual sync mode before you use virtual files.",
             )
 
     def _check_dropbox_dir(self) -> None:

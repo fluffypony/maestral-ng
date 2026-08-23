@@ -46,6 +46,7 @@ DEFAULTS_CONFIG: _DefaultsType = {
     },
     "sync": {
         "path": "",  # dropbox folder location
+        "mode": "mirror",  # "mirror" or separate native "virtual" root
         "selective_sync_mode": "exclude",  # "exclude" or "include"
         "selective_sync_paths": [],  # paths selected by selective sync mode
         "ignore_symlinks": False,  # leave local symbolic links unmanaged
@@ -88,6 +89,9 @@ DEFAULTS_STATE: _DefaultsType = {
         "pending_uploads": [],  # incomplete uploads to retry on next sync
         "pending_downloads": [],  # incomplete downloads to retry on next sync
         "ignored_symlink_paths": [],  # local symlink overlays ignored by sync
+    },
+    "virtual_files": {
+        "cursor": "",  # provider cursor for the separate virtual root
     },
     "recovery": {
         "sync_reset": {},  # durable sync-state or unlink reset journal
