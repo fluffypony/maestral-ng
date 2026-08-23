@@ -29,6 +29,9 @@ from typing import (
     overload,
 )
 
+from fasteners import InterProcessLock
+
+from maestral.config import MaestralState
 from maestral.core import (
     Account,
     DeletedMetadata,
@@ -58,7 +61,8 @@ from maestral.exceptions import (
 )
 from maestral.providers.base import RemoteProvider
 from maestral.utils.hashing import ContentHasherFactory, sha256_content_hasher
-from maestral.utils.path import normalize
+from maestral.utils.path import create_rooted_tempfile, normalize
+from maestral.utils.path import unlink as rooted_unlink
 
 if TYPE_CHECKING:
     from maestral.models import SyncEvent
@@ -1872,8 +1876,20 @@ class EncryptedRemoteProvider:
         self._cursor = ""
         self._state: _VaultState = "locked"
         self._closed = False
-
         self.config_name = provider.config_name
+        self._profile_state = MaestralState(provider.config_name)
+        self._plaintext_transfer_root = (
+            self._mirror.local_root.parent / ".plaintext-transfers"
+        )
+        self._plaintext_transfer_lock = InterProcessLock(
+            str(
+                self._mirror.local_root.parent
+                / f".plaintext-transfers.{provider.config_name}.lock"
+            )
+        )
+        self._plaintext_transfer_thread_lock = threading.RLock()
+        self._plaintext_transfer_depth = 0
+
         self.provider_id = f"cryptomator_{provider.provider_id}"
         self.api_url = provider.api_url
 
@@ -1888,6 +1904,19 @@ class EncryptedRemoteProvider:
     @property
     def namespace_id(self) -> str:
         return self._provider.namespace_id
+
+    @property
+    def virtual_source_identity(self) -> str:
+        """Return the durable vault identity, including during offline recovery."""
+        with self._lock:
+            if self._vault_identity is not None:
+                self._bind_profile_vault_identity()
+                return self._vault_identity
+            saved = self._validated_profile_vault_binding()
+            if saved is not None:
+                return cast(str, saved["vault_id"])
+            self._ensure_loaded()
+            return self._require_vault_identity()
 
     @property
     def is_team_space(self) -> bool:
@@ -1971,6 +2000,7 @@ class EncryptedRemoteProvider:
                 self._wipe(secret_bytes)
                 raise
             try:
+                self._prepare_plaintext_transfer_root()
                 self._prepare_local_root_for_initialisation()
                 self._state = "opening"
                 self._vault_info = self._sidecar.initialize(
@@ -2450,6 +2480,7 @@ class EncryptedRemoteProvider:
         self, secret: bytearray, *, persist_identity: bool = True
     ) -> None:
         self._require_locked_state()
+        self._prepare_plaintext_transfer_root()
         self._state = "opening"
         self._vault_info = self._sidecar.open(self._mirror.local_root, secret)
         self._secret = secret
@@ -2457,6 +2488,63 @@ class EncryptedRemoteProvider:
         self._rebuild_logical_metadata()
         if persist_identity and self._identity_manifest_dirty:
             self._persist_identity_manifest_locked()
+        self._bind_profile_vault_identity()
+
+    def _profile_vault_binding(self) -> dict[str, object]:
+        return {
+            "version": 1,
+            "provider": self._provider.provider_id,
+            "remote_root": self._mirror.remote_root,
+            "local_root": str(self._mirror.local_root),
+            "vault_id": self._require_vault_identity(),
+        }
+
+    def _validated_profile_vault_binding(self) -> dict[str, object] | None:
+        raw = self._profile_state.get("virtual_files", "encrypted_vault_binding")
+        if raw == {}:
+            return None
+        if (
+            not isinstance(raw, dict)
+            or set(raw)
+            != {"version", "provider", "remote_root", "local_root", "vault_id"}
+            or raw.get("version") != 1
+            or not all(
+                isinstance(raw.get(key), str)
+                for key in ("provider", "remote_root", "local_root", "vault_id")
+            )
+        ):
+            raise EncryptedVaultError(
+                "Encrypted vault identity is invalid",
+                "The saved virtual-source binding is corrupt.",
+            )
+        saved = cast(dict[str, object], raw)
+        vault_id = self._canonical_uuid(saved["vault_id"])
+        if vault_id != saved["vault_id"]:
+            raise EncryptedVaultError(
+                "Encrypted vault identity is invalid",
+                "The saved vault identity is not canonical.",
+            )
+        if (
+            saved["provider"] != self._provider.provider_id
+            or saved["remote_root"] != self._mirror.remote_root
+            or saved["local_root"] != str(self._mirror.local_root)
+        ):
+            return None
+        return saved
+
+    def _bind_profile_vault_identity(self) -> None:
+        """Persist and verify the vault identity for offline virtual recovery."""
+        expected = self._profile_vault_binding()
+        saved = self._validated_profile_vault_binding()
+        if saved is not None and saved != expected:
+            raise EncryptedVaultError(
+                "Encrypted vault identity changed",
+                "The configured cache belongs to another encrypted vault.",
+            )
+        if saved is None:
+            self._profile_state.set(
+                "virtual_files", "encrypted_vault_binding", expected
+            )
 
     def _close_for_transition(self) -> bytearray:
         secret = self._require_secret()
@@ -3496,35 +3584,145 @@ class EncryptedRemoteProvider:
 
     @contextmanager
     def _temporary_plaintext_file(self, purpose: str) -> Iterator[Path]:
-        transfer_root = self._mirror.local_root.parent / ".plaintext-transfers"
-        if _has_link_or_junction_ancestor(transfer_root.parent):
+        if not re.fullmatch(r"[a-z0-9-]{1,64}", purpose):
+            raise ValueError("The encrypted transfer purpose is invalid")
+        with self._plaintext_transfer_guard():
+            root_identity = self._ensure_plaintext_transfer_root()
+            temporary = create_rooted_tempfile(
+                str(self._plaintext_transfer_root),
+                str(self._plaintext_transfer_root),
+                expected_root_identity=root_identity,
+                prefix=f"maestral-{self.config_name}-{purpose}-",
+                mode=0o600,
+            )
+            path = Path(temporary.path)
+            try:
+                yield path
+            finally:
+                temporary.close()
+                try:
+                    rooted_unlink(
+                        str(path),
+                        root_path=str(self._plaintext_transfer_root),
+                        expected_root_identity=root_identity,
+                        expected_target_identity=temporary.identity,
+                    )
+                except FileNotFoundError:
+                    pass
+
+    @contextmanager
+    def _plaintext_transfer_guard(self) -> Iterator[None]:
+        with self._plaintext_transfer_thread_lock:
+            if self._plaintext_transfer_depth == 0:
+                if not self._plaintext_transfer_lock.acquire(blocking=False):
+                    raise EncryptedVaultError(
+                        "Encrypted transfer cache is busy",
+                        "Another process owns this profile's plaintext transfer cache.",
+                    )
+            self._plaintext_transfer_depth += 1
+            try:
+                yield
+            finally:
+                self._plaintext_transfer_depth -= 1
+                if self._plaintext_transfer_depth == 0:
+                    self._plaintext_transfer_lock.release()
+
+    def _ensure_plaintext_transfer_root(self) -> tuple[int, int, int]:
+        transfer_root = self._plaintext_transfer_root
+        parent = transfer_root.parent
+        if _has_link_or_junction_ancestor(parent):
             raise EncryptedVaultError(
                 "Encrypted transfer cache is unsafe",
                 "The private plaintext cache cannot use a symbolic link or junction.",
             )
-        transfer_root.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        if _has_link_or_junction_ancestor(transfer_root):
+        parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if _has_link_or_junction_ancestor(parent):
             raise EncryptedVaultError(
                 "Encrypted transfer cache is unsafe",
                 "The private plaintext cache cannot use a symbolic link or junction.",
             )
         transfer_root.mkdir(mode=0o700, exist_ok=True)
-        if _has_link_or_junction_ancestor(transfer_root):
+        root_stat = os.lstat(transfer_root)
+        owner_matches = not hasattr(os, "getuid") or root_stat.st_uid == os.getuid()
+        if (
+            not stat.S_ISDIR(root_stat.st_mode)
+            or stat.S_ISLNK(root_stat.st_mode)
+            or _is_link_or_junction(transfer_root)
+            or not owner_matches
+        ):
+            raise EncryptedVaultError(
+                "Encrypted transfer cache is unsafe",
+                "The private plaintext cache must be an owned real directory.",
+            )
+        os.chmod(transfer_root, 0o700)
+        root_stat = os.lstat(transfer_root)
+        if os.name != "nt" and stat.S_IMODE(root_stat.st_mode) != 0o700:
+            raise EncryptedVaultError(
+                "Encrypted transfer cache is unsafe",
+                "The private plaintext cache permissions are not private.",
+            )
+        return root_stat.st_dev, root_stat.st_ino, root_stat.st_mode
+
+    def _prepare_plaintext_transfer_root(self) -> None:
+        """Delete only this profile's safe plaintext files before provider use."""
+        parent = self._plaintext_transfer_root.parent
+        if _has_link_or_junction_ancestor(parent):
             raise EncryptedVaultError(
                 "Encrypted transfer cache is unsafe",
                 "The private plaintext cache cannot use a symbolic link or junction.",
             )
-        os.chmod(transfer_root, 0o700)
-        descriptor, name = tempfile.mkstemp(
-            prefix=f"maestral-{purpose}-", dir=transfer_root
-        )
-        os.close(descriptor)
-        path = Path(name)
-        os.chmod(path, 0o600)
-        try:
-            yield path
-        finally:
-            path.unlink(missing_ok=True)
+        parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if _has_link_or_junction_ancestor(parent):
+            raise EncryptedVaultError(
+                "Encrypted transfer cache is unsafe",
+                "The private plaintext cache cannot use a symbolic link or junction.",
+            )
+        with self._plaintext_transfer_guard():
+            root_identity = self._ensure_plaintext_transfer_root()
+            owned_prefix = f"maestral-{self.config_name}-"
+            with os.scandir(self._plaintext_transfer_root) as entries:
+                candidates = [
+                    entry.path
+                    for entry in entries
+                    if entry.name.startswith(owned_prefix)
+                ]
+            for candidate in candidates:
+                candidate_path = Path(candidate)
+                try:
+                    item_stat = os.lstat(candidate_path)
+                except FileNotFoundError:
+                    continue
+                owner_matches = (
+                    not hasattr(os, "getuid") or item_stat.st_uid == os.getuid()
+                )
+                private_mode = (
+                    os.name == "nt" or stat.S_IMODE(item_stat.st_mode) == 0o600
+                )
+                if (
+                    not stat.S_ISREG(item_stat.st_mode)
+                    or stat.S_ISLNK(item_stat.st_mode)
+                    or _is_link_or_junction(candidate_path)
+                    or item_stat.st_nlink != 1
+                    or not owner_matches
+                    or not private_mode
+                ):
+                    continue
+                try:
+                    rooted_unlink(
+                        str(candidate_path),
+                        root_path=str(self._plaintext_transfer_root),
+                        expected_root_identity=root_identity,
+                        expected_target_identity=(
+                            item_stat.st_dev,
+                            item_stat.st_ino,
+                            item_stat.st_mode,
+                            item_stat.st_size,
+                            item_stat.st_mtime_ns,
+                            item_stat.st_ctime_ns,
+                        ),
+                    )
+                except FileNotFoundError:
+                    continue
 
     @staticmethod
     def _install_verified_download(source: Path, destination: Path) -> None:

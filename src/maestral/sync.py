@@ -2634,6 +2634,16 @@ class SyncEngine:
                 journal["phase"] = "virtual"
                 phase = "virtual"
             self._state.set("recovery", "sync_reset", journal)
+        # Remove this one-shot upgrade after all pre-native unlink journals expire.
+        if kind == "unlink" and "sync_mode" not in journal:
+            journal.update(
+                sync_mode=self._conf.get("sync", "mode"),
+                source_root_path=journal.get("root_path", ""),
+                source_root_identity=None,
+                native_registration_committed=False,
+                root_marker_removed=False,
+            )
+            self._state.set("recovery", "sync_reset", journal)
         if kind == "sync":
             if set(journal) != {"kind", "phase"} or phase not in {
                 "pending",
@@ -2652,8 +2662,13 @@ class SyncEngine:
                     "credentials_deleted",
                     "vault_password_deleted",
                     "virtual_files_reset",
+                    "sync_mode",
                     "root_path",
+                    "source_root_path",
+                    "source_root_identity",
                     "root_marker_id",
+                    "native_registration_committed",
+                    "root_marker_removed",
                 }
                 or phase not in {"pending", "config", "virtual", "queue"}
                 or journal.get("provider") not in {"dropbox", "google_drive"}
@@ -2662,8 +2677,23 @@ class SyncEngine:
                 or not isinstance(journal.get("credentials_deleted"), bool)
                 or not isinstance(journal.get("vault_password_deleted"), bool)
                 or not isinstance(journal.get("virtual_files_reset"), bool)
+                or journal.get("sync_mode") not in {"mirror", "virtual"}
                 or not isinstance(journal.get("root_path"), str)
+                or not isinstance(journal.get("source_root_path"), str)
+                or not (
+                    journal.get("source_root_identity") is None
+                    or (
+                        isinstance(journal.get("source_root_identity"), list)
+                        and len(journal["source_root_identity"]) == 3
+                        and isinstance(journal["source_root_identity"][0], str)
+                        and isinstance(journal["source_root_identity"][1], str)
+                        and isinstance(journal["source_root_identity"][2], int)
+                        and not isinstance(journal["source_root_identity"][2], bool)
+                    )
+                )
                 or not isinstance(journal.get("root_marker_id"), str)
+                or not isinstance(journal.get("native_registration_committed"), bool)
+                or not isinstance(journal.get("root_marker_removed"), bool)
             ):
                 raise ValueError("The sync reset journal is invalid")
         else:
@@ -2703,8 +2733,12 @@ class SyncEngine:
         provider: str = "",
         account_id: str = "",
         keyring: str = "automatic",
+        sync_mode: str = "mirror",
         root_path: str = "",
+        source_root_path: str = "",
+        source_root_identity: list[object] | None = None,
         root_marker_id: str = "",
+        native_registration_committed: bool = False,
     ) -> None:
         """Persist a reset request before any database or account change."""
         if kind not in {"sync", "unlink"}:
@@ -2720,6 +2754,24 @@ class SyncEngine:
                 if kind == "unlink":
                     if provider not in {"dropbox", "google_drive"}:
                         raise ValueError("The unlink provider is invalid")
+                    if sync_mode not in {"mirror", "virtual"}:
+                        raise ValueError("The unlink sync mode is invalid")
+                    if not isinstance(root_path, str) or not isinstance(
+                        source_root_path, str
+                    ):
+                        raise ValueError("The unlink root path is invalid")
+                    if not (
+                        source_root_identity is None
+                        or (
+                            isinstance(source_root_identity, list)
+                            and len(source_root_identity) == 3
+                            and isinstance(source_root_identity[0], str)
+                            and isinstance(source_root_identity[1], str)
+                            and isinstance(source_root_identity[2], int)
+                            and not isinstance(source_root_identity[2], bool)
+                        )
+                    ):
+                        raise ValueError("The unlink root identity is invalid")
                     journal.update(
                         provider=provider,
                         account_id=account_id,
@@ -2729,8 +2781,13 @@ class SyncEngine:
                             self._conf.get("encryption", "enabled")
                         ),
                         virtual_files_reset=False,
+                        sync_mode=sync_mode,
                         root_path=root_path,
+                        source_root_path=source_root_path,
+                        source_root_identity=source_root_identity,
                         root_marker_id=root_marker_id,
+                        native_registration_committed=(native_registration_committed),
+                        root_marker_removed=False,
                     )
                 self._state.set("recovery", "sync_reset", journal)
 
@@ -2810,7 +2867,6 @@ class SyncEngine:
                     encryption_enabled = self._conf.get("encryption", "enabled")
                     encryption_remote_path = self._conf.get("encryption", "remote_path")
                     encryption_cache_path = self._conf.get("encryption", "cache_path")
-                    sync_mode = self._conf.get("sync", "mode")
                     self._conf.reset_to_defaults(save=False)
                     self._conf.set("auth", "provider", journal["provider"], save=False)
                     self._conf.set("auth", "provider_selected", False, save=False)
@@ -2830,7 +2886,7 @@ class SyncEngine:
                         encryption_cache_path,
                         save=False,
                     )
-                    self._conf.set("sync", "mode", sync_mode, save=False)
+                    self._conf.set("sync", "mode", journal["sync_mode"], save=False)
                     self._conf.save()
                 except BaseException:
                     if not self._conf.save_committed_since(save_generation):

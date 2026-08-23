@@ -7,6 +7,9 @@ import json
 import os
 import posixpath
 import shutil
+import stat
+import subprocess
+import sys
 import time
 import uuid
 from collections.abc import Iterator
@@ -653,6 +656,83 @@ def test_ciphertext_cache_rejects_a_windows_junction_ancestor(
 
     with pytest.raises(EncryptedVaultError, match="symbolic link or junction"):
         mirror.claim_local_root(allow_nonempty=False)
+
+
+def test_encrypted_provider_cleans_only_owned_plaintext_transfer_files(
+    tmp_path: Path,
+) -> None:
+    transfer_root = tmp_path / ".plaintext-transfers"
+    transfer_root.mkdir(mode=0o700)
+    stale = transfer_root / "maestral-encrypted-test-upload-stale"
+    stale.write_bytes(b"plaintext")
+    stale.chmod(0o600)
+    another_profile = transfer_root / "maestral-other-upload-stale"
+    another_profile.write_bytes(b"other")
+    another_profile.chmod(0o600)
+    unsafe_target = tmp_path / "outside"
+    unsafe_target.write_bytes(b"outside")
+    unsafe_link = transfer_root / "maestral-encrypted-test-upload-link"
+    unsafe_link.symlink_to(unsafe_target)
+
+    provider = EncryptedRemoteProvider(
+        FakeRemoteProvider(tmp_path / "remote-provider"),
+        FakeSecretStore(),
+        "/Encrypted",
+        tmp_path / "ciphertext-cache",
+        sidecar=FakeCryptomatorSession("password"),
+    )
+    try:
+        provider.initialise_vault("password")
+        assert not stale.exists()
+        assert another_profile.read_bytes() == b"other"
+        assert unsafe_link.is_symlink()
+        assert unsafe_target.read_bytes() == b"outside"
+        assert stat.S_IMODE(os.lstat(transfer_root).st_mode) == 0o700
+    finally:
+        provider.close()
+
+
+def test_encrypted_provider_rejects_a_busy_plaintext_transfer_cache(
+    tmp_path: Path,
+) -> None:
+    lock_path = tmp_path / ".plaintext-transfers.encrypted-test.lock"
+    ready = tmp_path / "lock-ready"
+    holder = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import pathlib,sys; from fasteners import InterProcessLock; "
+                "lock=InterProcessLock(sys.argv[1]); assert lock.acquire(False); "
+                "pathlib.Path(sys.argv[2]).write_text('ready'); "
+                "sys.stdin.buffer.read(1); lock.release()"
+            ),
+            str(lock_path),
+            str(ready),
+        ],
+        stdin=subprocess.PIPE,
+    )
+    try:
+        deadline = time.monotonic() + 2
+        while not ready.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert ready.exists()
+        provider = EncryptedRemoteProvider(
+            FakeRemoteProvider(tmp_path / "remote-provider"),
+            FakeSecretStore(),
+            "/Encrypted",
+            tmp_path / "ciphertext-cache",
+            sidecar=FakeCryptomatorSession("password"),
+        )
+        with pytest.raises(EncryptedVaultError, match="transfer cache is busy"):
+            provider.initialise_vault("password")
+        provider.close()
+    finally:
+        if holder.poll() is None:
+            assert holder.stdin is not None
+            holder.stdin.write(b"x")
+            holder.stdin.close()
+            holder.wait(timeout=2)
 
 
 def test_remote_vault_root_must_be_dedicated() -> None:

@@ -56,6 +56,133 @@ def make_controller(
     return controller
 
 
+def test_start_detaches_an_unaccepted_registration_after_validation_failure(
+    config_name: str, tmp_path: Path
+) -> None:
+    provider = FakeVirtualProvider()
+    backend = FakeVirtualFileBackend()
+    root = tmp_path / "virtual-root"
+    root.mkdir()
+    controller = VirtualFileController(
+        config_name,
+        provider,  # type: ignore[arg-type]
+        backend,
+        database_path=str(tmp_path / "virtual-files.db"),
+        remote_polling=False,
+    )
+
+    def reject_binding(_binding: object) -> None:
+        raise ValueError("unsafe root binding")
+
+    with pytest.raises(ValueError, match="unsafe root binding"):
+        controller.start(
+            str(root),
+            root_marker_id="a" * 32,
+            binding_validator=reject_binding,  # type: ignore[arg-type]
+        )
+
+    assert not backend.registration_committed("a" * 32)
+    assert not backend.binding_accepted("a" * 32)
+    assert ("detach", str(root), "a" * 32) in backend.calls
+    controller.close()
+
+
+def test_recovery_failure_preserves_an_accepted_registration_for_retry(
+    config_name: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = FakeVirtualProvider()
+    backend = FakeVirtualFileBackend()
+    root = tmp_path / "virtual-root"
+    root.mkdir()
+    controller = VirtualFileController(
+        config_name,
+        provider,  # type: ignore[arg-type]
+        backend,
+        database_path=str(tmp_path / "virtual-files.db"),
+        remote_polling=False,
+    )
+    recover = Mock(side_effect=[RuntimeError("recovery failed"), []])
+    monkeypatch.setattr(backend, "recover", recover)
+
+    with pytest.raises(RuntimeError, match="recovery failed"):
+        controller.start(str(root), root_marker_id="a" * 32)
+
+    assert backend.registration_committed("a" * 32)
+    assert backend.binding_accepted("a" * 32)
+    assert not any(call[0] == "detach" for call in backend.calls)
+
+    controller.start(str(root), root_marker_id="a" * 32)
+    assert controller.running
+    controller.close()
+
+
+def test_adoption_failure_preserves_a_validated_registration_for_retry(
+    config_name: str, tmp_path: Path
+) -> None:
+    provider = FakeVirtualProvider()
+    backend = FakeVirtualFileBackend()
+    root = tmp_path / "virtual-root"
+    root.mkdir()
+    controller = VirtualFileController(
+        config_name,
+        provider,  # type: ignore[arg-type]
+        backend,
+        database_path=str(tmp_path / "virtual-files.db"),
+        remote_polling=False,
+    )
+
+    def fail_adoption(_binding: object, _proof: object) -> None:
+        raise OSError("config save failed")
+
+    with pytest.raises(OSError, match="config save failed"):
+        controller.start(
+            str(root),
+            root_marker_id="a" * 32,
+            binding_validator=lambda _binding: "validated",
+            binding_adopter=fail_adoption,  # type: ignore[arg-type]
+        )
+
+    assert backend.registration_committed("a" * 32)
+    assert backend.binding_accepted("a" * 32)
+    assert not any(call[0] == "detach" for call in backend.calls)
+
+    controller.start(
+        str(root),
+        root_marker_id="a" * 32,
+        binding_validator=lambda _binding: "validated",
+        binding_adopter=lambda _binding, _proof: None,
+    )
+    assert controller.running
+    controller.close()
+
+
+def test_virtual_index_rejects_another_remote_account(
+    config_name: str, tmp_path: Path
+) -> None:
+    config = MaestralConfig(config_name)
+    config.set("auth", "account_id", "account-one")
+    provider = FakeVirtualProvider()
+    backend = FakeVirtualFileBackend()
+    first = make_controller(config_name, tmp_path, provider, backend)
+    first.close()
+
+    config.set("auth", "account_id", "account-two")
+    second = VirtualFileController(
+        config_name,
+        provider,  # type: ignore[arg-type]
+        backend,
+        database_path=str(tmp_path / "virtual-files.db"),
+        remote_polling=False,
+    )
+    with pytest.raises(VirtualFileBusyError, match="another remote source"):
+        second.start(str(tmp_path / "virtual-root"))
+
+    assert backend.binding_accepted("a" * 32) is False
+    second.close()
+
+
 def test_hydration_state_persists_by_stable_provider_id(
     config_name: str, tmp_path: Path
 ) -> None:
@@ -1135,7 +1262,7 @@ def test_detach_preserves_hydrated_bytes_and_clears_core_state(
     controller.reconcile_remote_batch([metadata], "cursor-1")
     backend.open("file-1")
 
-    controller.detach()
+    controller.detach(str(tmp_path / "virtual-root"), "a" * 32)
 
     assert controller.cursor == ""
     assert controller.status_page()["items"] == []
@@ -1171,6 +1298,8 @@ def test_status_pages_and_summary_cover_the_complete_index(
     assert second["cursor"] is None
     assert summary["items"] == 3
     assert summary["pinned"] == 1
+    assert summary["indexed"] is True
+    assert "cursor" not in summary
     assert summary["states"] == {
         "online_only": 2,
         "hydrating": 0,
@@ -1180,6 +1309,64 @@ def test_status_pages_and_summary_cover_the_complete_index(
     }
     with pytest.raises(ValueError, match="status limit"):
         controller.status_page(limit=257)
+    controller.close()
+
+
+def test_evict_serialises_a_same_revision_remote_move(
+    config_name: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = FakeVirtualProvider()
+    backend = FakeVirtualFileBackend()
+    controller = make_controller(config_name, tmp_path, provider, backend)
+    first = provider.add_file("file-1", "/Old.txt", "rev-1", b"data")
+    controller.reconcile_remote_change(first)
+    backend.open("file-1")
+
+    evict_started = threading.Event()
+    release_evict = threading.Event()
+    original_evict = backend.evict
+
+    def blocked_evict(provider_id: str, *, expected_revision: str) -> None:
+        evict_started.set()
+        assert release_evict.wait(2)
+        original_evict(provider_id, expected_revision=expected_revision)
+
+    monkeypatch.setattr(backend, "evict", blocked_evict)
+    errors: list[BaseException] = []
+
+    def evict() -> None:
+        try:
+            controller.evict("file-1")
+        except BaseException as exc:
+            errors.append(exc)
+
+    moved = provider.add_file("file-1", "/New.txt", "rev-1", b"data")
+
+    def reconcile() -> None:
+        try:
+            controller.reconcile_remote_change(moved)
+        except BaseException as exc:
+            errors.append(exc)
+
+    evict_thread = threading.Thread(target=evict)
+    reconcile_thread = threading.Thread(target=reconcile)
+    evict_thread.start()
+    assert evict_started.wait(1)
+    reconcile_thread.start()
+    reconcile_thread.join(0.1)
+    assert reconcile_thread.is_alive()
+    release_evict.set()
+    evict_thread.join(2)
+    reconcile_thread.join(2)
+
+    assert not evict_thread.is_alive()
+    assert not reconcile_thread.is_alive()
+    assert errors == []
+    status = controller.get_status("file-1")
+    assert status["path"] == "/New.txt"
+    assert status["hydration_state"] == "online_only"
     controller.close()
 
 
@@ -1559,6 +1746,43 @@ def test_missing_database_rebuild_preserves_matching_hydrated_content(
         assert status["hydration_state"] == "hydrated"
         assert status["pinned"] is True
         assert backend.items["file-1"].content == b"data"
+        assert second.cursor == "cursor-new"
+    finally:
+        second.close()
+
+
+def test_missing_database_rebuild_preserves_exact_dirty_native_content(
+    config_name: str, tmp_path: Path
+) -> None:
+    provider = FakeVirtualProvider()
+    backend = FakeVirtualFileBackend()
+    database_path = tmp_path / "virtual-files.db"
+    first = make_controller(config_name, tmp_path, provider, backend)
+    metadata = provider.add_file("file-1", "/file.txt", "rev-1", b"remote")
+    first.reconcile_remote_batch([metadata], "cursor-old")
+    backend.open("file-1")
+    backend.items["file-1"].content = b"local changes"
+    backend.set_access_state("file-1", dirty=True)
+    first.close()
+    database_path.unlink()
+    provider.pages = [ListFolderResult([metadata], False, "cursor-new")]
+
+    second = VirtualFileController(
+        config_name,
+        provider,  # type: ignore[arg-type]
+        backend,
+        database_path=str(database_path),
+        remote_polling=False,
+    )
+    second.start(str(tmp_path / "virtual-root"))
+    try:
+        second.refresh_remote()
+
+        status = second.get_status("file-1")
+        assert status["hydration_state"] == "hydrated"
+        assert "preserved" in str(status["error"])
+        assert backend.items["file-1"].content == b"local changes"
+        assert backend.items["file-1"].dirty is True
         assert second.cursor == "cursor-new"
     finally:
         second.close()
@@ -2071,6 +2295,7 @@ def test_virtual_start_never_starts_the_mirror_engine(
     try:
         maestral.set_sync_mode("virtual")
         maestral.sync._dropbox_path = "/native-virtual-root"
+        maestral._conf.set("sync", "root_marker_id", "a" * 32)
         monkeypatch.setattr(maestral, "_check_linked", Mock())
         monkeypatch.setattr(maestral, "_check_dropbox_dir", Mock())
         virtual_start = Mock()
@@ -2080,7 +2305,12 @@ def test_virtual_start_never_starts_the_mirror_engine(
 
         maestral.start_sync()
 
-        virtual_start.assert_called_once_with("/native-virtual-root")
+        virtual_start.assert_called_once_with(
+            "/native-virtual-root",
+            root_marker_id="a" * 32,
+            binding_validator=maestral._validate_start_virtual_root_binding,
+            binding_adopter=maestral._adopt_virtual_root_binding,
+        )
         mirror_start.assert_not_called()
     finally:
         maestral.virtual_files.close()

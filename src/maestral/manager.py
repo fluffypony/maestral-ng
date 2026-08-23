@@ -411,8 +411,12 @@ class SyncManager:
         provider: str,
         account_id: str,
         keyring: str,
+        sync_mode: str,
         root_path: str,
+        source_root_path: str,
+        source_root_identity: list[object] | None,
         root_marker_id: str,
+        native_registration_committed: bool,
     ) -> None:
         """Reserve a stopped manager generation for an account unlink."""
         if self._active_internal_operation != stop_state.internal_operation:
@@ -430,8 +434,12 @@ class SyncManager:
             provider=provider,
             account_id=account_id,
             keyring=keyring,
+            sync_mode=sync_mode,
             root_path=root_path,
+            source_root_path=source_root_path,
+            source_root_identity=source_root_identity,
             root_marker_id=root_marker_id,
+            native_registration_committed=native_registration_committed,
         )
 
     @_with_lock

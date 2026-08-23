@@ -1045,6 +1045,7 @@ def test_restart_rejects_a_replaced_source_root_before_launch(
     backend = make_backend(fake_adapter, tmp_path, log_path=log_path)
     start_backend(backend, tmp_path)
     backend.stop()
+    backend._platform_name = "Darwin"
 
     root = tmp_path / "root"
     old_root = tmp_path / "old-root"
@@ -1058,6 +1059,27 @@ def test_restart_rejects_a_replaced_source_root_before_launch(
         backend.start(str(root), lambda _provider_id, _revision: {})
     assert backend._process is None
     assert len(wait_for_log(log_path, 1)) == 1
+
+
+def test_linux_restart_checks_a_replaced_source_after_adapter_start(
+    fake_adapter: Path, tmp_path: Path
+) -> None:
+    log_path = tmp_path / "replace-linux-root.jsonl"
+    backend = make_backend(fake_adapter, tmp_path, log_path=log_path)
+    start_backend(backend, tmp_path)
+    backend.stop()
+
+    root = tmp_path / "root"
+    root.rename(tmp_path / "old-root")
+    root.mkdir()
+    marker = root / ".maestral-root"
+    marker.write_text(f"maestral-root-v1:{ROOT_MARKER_ID}\n")
+    marker.chmod(0o600)
+
+    with pytest.raises(NativeVirtualFileProtocolError, match="root binding"):
+        backend.start(str(root), lambda _provider_id, _revision: {})
+    assert backend._process is None
+    assert len(wait_for_log(log_path, 2)) == 2
 
 
 @pytest.mark.parametrize("operation", ["validate", "detach"])
@@ -1106,6 +1128,23 @@ def test_registration_is_not_committed_after_an_invalid_start(
     assert not backend.registration_committed(ROOT_MARKER_ID)
     with pytest.raises(NativeVirtualFileProcessError, match="did not complete"):
         backend.detach(str(root), ROOT_MARKER_ID)
+
+
+def test_core_acceptance_is_durable_and_separate_from_native_registration(
+    fake_adapter: Path, tmp_path: Path
+) -> None:
+    backend = make_backend(fake_adapter, tmp_path)
+    start_backend(backend, tmp_path)
+
+    assert backend.registration_committed(ROOT_MARKER_ID)
+    assert not backend.binding_accepted(ROOT_MARKER_ID)
+
+    backend.accept_binding(ROOT_MARKER_ID)
+    backend.stop()
+    restarted = make_backend(fake_adapter, tmp_path)
+
+    assert restarted.registration_committed(ROOT_MARKER_ID)
+    assert restarted.binding_accepted(ROOT_MARKER_ID)
 
 
 def test_concurrent_out_of_order_responses_are_routed_by_id(

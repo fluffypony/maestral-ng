@@ -256,11 +256,37 @@ class NativeProcessVirtualFileBackend:
         )
         return str(prepared)
 
+    def binding_for_root(self, root_marker_id: str) -> VirtualFileRootBinding | None:
+        """Return one saved platform binding without starting its adapter."""
+        marker_id = _validate_root_marker_id(root_marker_id)
+        binding = self._load_root_bindings().get(marker_id)
+        return self._public_root_binding(binding) if binding is not None else None
+
     def registration_committed(self, root_marker_id: str) -> bool:
         """Return whether one native root has a confirmed live registration."""
         marker_id = _validate_root_marker_id(root_marker_id)
         binding = self._load_root_bindings().get(marker_id)
-        return binding is not None and binding.state == "registered"
+        return binding is not None and binding.state in {"registered", "accepted"}
+
+    def binding_accepted(self, root_marker_id: str) -> bool:
+        """Return whether core accepted one confirmed native binding."""
+        marker_id = _validate_root_marker_id(root_marker_id)
+        binding = self._load_root_bindings().get(marker_id)
+        return binding is not None and binding.state == "accepted"
+
+    def binding_detached(self, root_marker_id: str) -> bool:
+        """Return whether one saved native binding is already detached."""
+        marker_id = _validate_root_marker_id(root_marker_id)
+        binding = self._load_root_bindings().get(marker_id)
+        return binding is not None and binding.state == "detached"
+
+    def accept_binding(self, root_marker_id: str) -> None:
+        """Persist that core validated and adopted one native binding."""
+        marker_id = _validate_root_marker_id(root_marker_id)
+        binding = self._saved_root_binding(marker_id, require_registered=True)
+        if binding.state == "accepted":
+            return
+        self._save_root_binding(replace(binding, state="accepted"))
 
     @property
     def capabilities(self) -> tuple[str, ...]:
@@ -328,7 +354,12 @@ class NativeProcessVirtualFileBackend:
                 )
                 binding_state = stored["state"]
                 detached_root_value = stored["detachedRootPath"]
-                if binding_state not in {"pending", "registered", "detached"}:
+                if binding_state not in {
+                    "pending",
+                    "registered",
+                    "accepted",
+                    "detached",
+                }:
                     raise ValueError("root binding is invalid")
                 if detached_root_value is None:
                     detached_root_path = None
@@ -397,7 +428,7 @@ class NativeProcessVirtualFileBackend:
                 "Native virtual root is unavailable",
                 "The saved native root binding is missing.",
             ) from None
-        if require_registered and binding.state != "registered":
+        if require_registered and binding.state not in {"registered", "accepted"}:
             raise NativeVirtualFileProcessError(
                 "Native virtual root is unavailable",
                 "The saved native root registration is not active.",
@@ -416,10 +447,38 @@ class NativeProcessVirtualFileBackend:
         existing = bindings.get(root_marker_id)
         if existing is not None:
             if existing.state == "detached":
-                raise NativeVirtualFileProcessError(
-                    "Native virtual root is unavailable",
-                    "This native root was already detached.",
+                if requested_root not in {
+                    existing.source_root_path,
+                    existing.detached_root_path,
+                }:
+                    raise NativeVirtualFileProcessError(
+                        "Native virtual root path changed",
+                        "The configured path does not match the detached native root.",
+                    )
+                source_path, source_identity = _snapshot_real_directory(
+                    Path(existing.source_root_path), "detached native root"
                 )
+                if (
+                    str(source_path) != existing.source_root_path
+                    or _root_identity_object(source_identity)
+                    != existing.source_root_identity
+                ):
+                    raise NativeVirtualFileProcessError(
+                        "Native virtual root identity changed",
+                        "The detached native root was replaced.",
+                    )
+                self._verify_binding_caches(existing)
+                pending = replace(
+                    existing,
+                    visible_root_path=existing.source_root_path,
+                    cache_path=existing.source_cache_path,
+                    root_identity=existing.source_root_identity,
+                    cache_identity=existing.source_cache_identity,
+                    state="pending",
+                    detached_root_path=None,
+                )
+                self._save_root_binding(pending)
+                return pending
             if requested_root not in {
                 existing.source_root_path,
                 existing.visible_root_path,
@@ -428,17 +487,18 @@ class NativeProcessVirtualFileBackend:
                     "Native virtual root path changed",
                     "The configured path does not match the saved native root.",
                 )
-            _saved_source_path, current_source_identity = _snapshot_real_directory(
-                Path(existing.source_root_path), "native root"
-            )
-            if (
-                _root_identity_object(current_source_identity)
-                != existing.source_root_identity
-            ):
-                raise NativeVirtualFileProcessError(
-                    "Native virtual root identity changed",
-                    "The saved native root source was replaced.",
+            if self._platform_name != "Linux":
+                _saved_source_path, current_source_identity = _snapshot_real_directory(
+                    Path(existing.source_root_path), "native root"
                 )
+                if (
+                    _root_identity_object(current_source_identity)
+                    != existing.source_root_identity
+                ):
+                    raise NativeVirtualFileProcessError(
+                        "Native virtual root identity changed",
+                        "The saved native root source was replaced.",
+                    )
             self._verify_binding_caches(existing)
             return existing
 
@@ -500,13 +560,36 @@ class NativeProcessVirtualFileBackend:
             Path(binding.visible_root_path), Path(binding.source_cache_path)
         )
 
+    def _verify_visible_root(self, binding: _NativeRootBinding) -> None:
+        """Bind the saved visible root to the current no-follow directory."""
+        if self._platform_name == "Linux":
+            # A stale FUSE mount can reject lstat before its adapter can recover it.
+            return
+        visible_path, visible_identity = _snapshot_real_directory(
+            Path(binding.visible_root_path), "native visible root"
+        )
+        if (
+            str(visible_path) != binding.visible_root_path
+            or _root_identity_object(visible_identity) != binding.root_identity
+        ):
+            raise NativeVirtualFileProcessError(
+                "Native virtual root identity changed",
+                "The saved visible native root was replaced.",
+            )
+
     @staticmethod
     def _public_root_binding(binding: _NativeRootBinding) -> VirtualFileRootBinding:
         identity = binding.root_identity
+        source_identity = binding.source_root_identity
         return VirtualFileRootBinding(
             source_root_path=binding.source_root_path,
             root_path=binding.visible_root_path,
             cache_path=binding.cache_path,
+            source_root_identity=VirtualFileRootIdentity(
+                device=cast(str, source_identity["device"]),
+                inode=cast(str, source_identity["inode"]),
+                mode=cast(int, source_identity["mode"]),
+            ),
             root_identity=VirtualFileRootIdentity(
                 device=cast(str, identity["device"]),
                 inode=cast(str, identity["inode"]),
@@ -629,6 +712,7 @@ class NativeProcessVirtualFileBackend:
                 "The configured path does not match the saved visible root.",
             )
         self._verify_binding_caches(binding)
+        self._verify_visible_root(binding)
 
         with self._lifecycle_lock:
             with self._state_lock:
@@ -705,8 +789,20 @@ class NativeProcessVirtualFileBackend:
                     "Native virtual root path changed",
                     "The requested path does not match the detached native root.",
                 )
+            detached_path, detached_identity = _snapshot_real_directory(
+                Path(binding.detached_root_path), "detached native root"
+            )
+            if (
+                str(detached_path) != binding.detached_root_path
+                or _root_identity_object(detached_identity)
+                != binding.source_root_identity
+            ):
+                raise NativeVirtualFileProcessError(
+                    "Native virtual root identity changed",
+                    "The detached native root was replaced.",
+                )
             return binding.detached_root_path
-        if binding.state != "registered":
+        if binding.state not in {"registered", "accepted"}:
             raise NativeVirtualFileProcessError(
                 "Native virtual root is unavailable",
                 "The native root registration did not complete.",
@@ -717,6 +813,7 @@ class NativeProcessVirtualFileBackend:
                 "The configured path does not match the saved visible root.",
             )
         self._verify_binding_caches(binding)
+        self._verify_visible_root(binding)
 
         with self._lifecycle_lock:
             with self._state_lock:
@@ -1718,6 +1815,17 @@ class NativeProcessVirtualFileBackend:
             actual_identity = _validate_directory_identity_object(
                 result["rootIdentity"]
             )
+            actual_root_path, local_root_identity = _snapshot_real_directory(
+                Path(actual_root), "adopted native root"
+            )
+            if (
+                str(actual_root_path) != actual_root
+                or _root_identity_object(local_root_identity) != actual_identity
+            ):
+                raise NativeVirtualFileProcessError(
+                    "Native virtual root identity changed",
+                    "The adapter returned a different adopted root identity.",
+                )
             _require_disjoint_paths(Path(actual_root), Path(actual_cache))
             _require_disjoint_paths(Path(binding.source_root_path), Path(actual_cache))
             _require_disjoint_paths(Path(actual_root), Path(binding.source_cache_path))
@@ -1741,13 +1849,19 @@ class NativeProcessVirtualFileBackend:
             cache_path=actual_cache,
             root_identity=actual_identity,
             cache_identity=actual_cache_identity,
-            state="registered",
+            state=("accepted" if binding.state == "accepted" else "registered"),
             detached_root_path=None,
         )
-        if binding.state == "registered" and completed != binding:
-            self._protocol_result_failure(
-                "The adapter returned a different saved native root binding."
+        if binding.state in {"registered", "accepted"}:
+            comparable = (
+                replace(completed, root_identity=binding.root_identity)
+                if self._platform_name == "Linux"
+                else completed
             )
+            if comparable != binding:
+                self._protocol_result_failure(
+                    "The adapter returned a different saved native root binding."
+                )
         return completed, capabilities
 
     def _native_record(self, value: object, context: str) -> NativeFileRecord:

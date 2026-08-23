@@ -92,6 +92,7 @@ DEFAULTS_STATE: _DefaultsType = {
     },
     "virtual_files": {
         "root_bindings": {},  # durable per-root native source and visible paths
+        "encrypted_vault_binding": {},  # offline vault identity for virtual recovery
     },
     "recovery": {
         "sync_reset": {},  # durable sync-state or unlink reset journal

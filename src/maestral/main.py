@@ -22,7 +22,7 @@ from asyncio import AbstractEventLoop, Future
 from collections import deque
 from datetime import datetime, timezone
 from stat import S_ISDIR
-from typing import Any, Collection, Iterator, Sequence
+from typing import Any, Collection, Iterator, Sequence, TypedDict
 
 # external imports
 import requests
@@ -105,11 +105,21 @@ from .virtual_files import (
     UnsupportedVirtualFileBackend,
     VirtualFileBackend,
     VirtualFileController,
+    VirtualFileRootBinding,
     create_native_virtual_file_backend,
     normalise_sync_mode,
 )
 
 __all__ = ["Maestral"]
+
+
+class _UnlinkRootContext(TypedDict):
+    sync_mode: str
+    root_path: str
+    source_root_path: str
+    source_root_identity: list[object] | None
+    root_marker_id: str
+    native_registration_committed: bool
 
 
 def _sql_add_column(db: Database, table: str, column: str, affinity: str) -> None:
@@ -305,6 +315,8 @@ class Maestral:
         )
         if pending_unlink_recovery:
             self._complete_pending_unlink_reset()
+        else:
+            self._repair_unaccepted_virtual_binding()
 
         # Create a future which will return once `shutdown_daemon` is called.
         # This can be used by an event loop to wait until maestral has been stopped.
@@ -434,6 +446,7 @@ class Maestral:
         """
         self._check_linked()
         self.sync._ensure_unlink_recovery_clear()
+        root_context = self._unlink_root_context()
         virtual_was_running = self.virtual_files.running
         if virtual_was_running:
             self.virtual_files.stop()
@@ -446,8 +459,7 @@ class Maestral:
                     provider=self.provider,
                     account_id=self._conf.get("auth", "account_id"),
                     keyring=self._conf.get("auth", "keyring"),
-                    root_path=self._conf.get("sync", "path"),
-                    root_marker_id=self._conf.get("sync", "root_marker_id"),
+                    **root_context,
                 )
 
                 try:
@@ -473,11 +485,64 @@ class Maestral:
                 and self.sync.dropbox_path
                 and not self._state.get("recovery", "sync_reset")
             ):
-                self.virtual_files.start(self.sync.dropbox_path)
+                self._start_virtual_files()
             raise
 
         self.manager._finish_internal_operation(stop_state)
         self._logger.info("Unlinked Dropbox account.")
+
+    def _unlink_root_context(self) -> _UnlinkRootContext:
+        """Capture the exact source and visible roots before config reset."""
+        sync_mode = self.sync_mode
+        marker_id = self._conf.get("sync", "root_marker_id")
+        configured_root = self._conf.get("sync", "path")
+        binding = None
+        registered = False
+        if sync_mode == VIRTUAL_MODE and marker_id:
+            binding = self.virtual_files.binding_for_root(marker_id)
+            registered = self.virtual_files.registration_committed(marker_id)
+            detached = self.virtual_files.binding_detached(marker_id)
+            if binding is not None and not registered and not detached:
+                self._start_virtual_files()
+                binding = self.virtual_files.binding_for_root(marker_id)
+                registered = self.virtual_files.registration_committed(marker_id)
+            if registered and binding is None:
+                raise MaestralApiError(
+                    "Cannot unlink this virtual root",
+                    "The native registration has no saved root binding.",
+                )
+            if binding is not None and not registered and not detached:
+                raise MaestralApiError(
+                    "Cannot unlink this virtual root",
+                    "The pending native registration could not be recovered.",
+                )
+
+        if binding is not None:
+            root_path = binding.root_path
+            source_root_path = binding.source_root_path
+            source_root_identity: list[object] | None = [
+                binding.source_root_identity.device,
+                binding.source_root_identity.inode,
+                binding.source_root_identity.mode,
+            ]
+        else:
+            root_path = configured_root
+            source_root_path = configured_root
+            identity = self._confirmed_root_identity_at(configured_root)
+            source_root_identity = (
+                [str(identity[0]), str(identity[1]), identity[2]]
+                if identity is not None
+                else None
+            )
+
+        return {
+            "sync_mode": sync_mode,
+            "root_path": root_path,
+            "source_root_path": source_root_path,
+            "source_root_identity": source_root_identity,
+            "root_marker_id": marker_id,
+            "native_registration_committed": registered,
+        }
 
     def _root_bound_recovery_names(self) -> tuple[str, ...]:
         """Return saved work which belongs to the configured account root."""
@@ -550,9 +615,99 @@ class Maestral:
         self.sync._complete_pending_sync_reset()
         journal = self.sync._validated_sync_reset()
         if journal and journal["phase"] == "virtual":
-            self.virtual_files.detach()
+            if (
+                journal["sync_mode"] == VIRTUAL_MODE
+                and journal["native_registration_committed"]
+            ):
+                source_root = self.virtual_files.detach(
+                    journal["root_path"], journal["root_marker_id"]
+                )
+                try:
+                    source_matches = _canonical_no_follow_path(
+                        source_root
+                    ) == _canonical_no_follow_path(journal["source_root_path"])
+                except (OSError, ValueError):
+                    source_matches = False
+                if not source_matches:
+                    raise MaestralApiError(
+                        "Cannot finish virtual root detach",
+                        "The adapter returned a different source root.",
+                    )
+            else:
+                self.virtual_files.clear()
+            self._remove_pending_unlink_root_marker(journal)
             self.sync._complete_pending_virtual_reset()
         self.manager.reload_download_queue()
+
+    def _remove_pending_unlink_root_marker(self, journal: dict[str, Any]) -> None:
+        """Remove only the saved source marker after native detach succeeds."""
+        if journal["root_marker_removed"]:
+            return
+        source_path = journal["source_root_path"]
+        marker_id = journal["root_marker_id"]
+        saved_identity = journal["source_root_identity"]
+        if not source_path or not marker_id or saved_identity is None:
+            self._publish_unlink_marker_removed(journal)
+            return
+
+        try:
+            root_stat = os.lstat(source_path)
+            root_identity = (
+                root_stat.st_dev,
+                root_stat.st_ino,
+                root_stat.st_mode,
+            )
+            if (
+                not S_ISDIR(root_stat.st_mode)
+                or is_fs_link(root_stat)
+                or (str(root_stat.st_dev), str(root_stat.st_ino), root_stat.st_mode)
+                != tuple(saved_identity)
+            ):
+                raise OSError("The saved source root identity changed")
+            marker_path = osp.join(source_path, ROOT_MARKER_FILE)
+            try:
+                marker_stat = os.lstat(marker_path)
+            except FileNotFoundError:
+                self._publish_unlink_marker_removed(journal)
+                return
+            marker_content = f"maestral-root-v1:{marker_id}\n".encode("ascii")
+            if not SyncEngine._root_marker_matches(
+                marker_path,
+                marker_content,
+                root_path=source_path,
+                expected_root_identity=root_identity,
+            ):
+                raise OSError("The saved source root marker changed")
+            rooted_unlink(
+                marker_path,
+                root_path=source_path,
+                expected_root_identity=root_identity,
+                expected_target_identity=(
+                    marker_stat.st_dev,
+                    marker_stat.st_ino,
+                    marker_stat.st_mode,
+                    marker_stat.st_size,
+                    marker_stat.st_mtime_ns,
+                    marker_stat.st_ctime_ns,
+                ),
+            )
+        except (OSError, ValueError) as exc:
+            raise MaestralApiError(
+                "Cannot remove the old root marker", str(exc)
+            ) from None
+        self._publish_unlink_marker_removed(journal)
+
+    def _publish_unlink_marker_removed(self, journal: dict[str, Any]) -> None:
+        """Publish one idempotent unlink marker-removal phase."""
+        with self._state._lock:
+            current = self.sync._validated_sync_reset()
+            if current != journal:
+                if current.get("root_marker_removed") is True:
+                    return
+                raise RuntimeError("The unlink reset changed during marker removal")
+            updated = journal.copy()
+            updated["root_marker_removed"] = True
+            self._state.set("recovery", "sync_reset", updated)
 
     def _migrate_pending_unlink_provider(self) -> None:
         """Scope an old pending unlink to its only supported provider."""
@@ -743,6 +898,176 @@ class Maestral:
                 operation,
                 "The plaintext sync root and an encrypted cache path cannot contain "
                 "each other.",
+            )
+
+    def _validate_virtual_root_binding(
+        self, binding: VirtualFileRootBinding, operation: str
+    ) -> tuple[int, int, int]:
+        """Validate every local path before the native root becomes ready."""
+        paths = {
+            "source root": binding.source_root_path,
+            "visible root": binding.root_path,
+            "native cache": binding.cache_path,
+            "hydration stage": self.virtual_files.stage_directory,
+        }
+        try:
+            canonical = {
+                name: _canonical_no_follow_path(path) for name, path in paths.items()
+            }
+            for name, path in paths.items():
+                if not osp.isabs(path) or osp.normpath(path) != path:
+                    raise ValueError(f"The {name} path is not canonical")
+            names = tuple(paths)
+            for index, first_name in enumerate(names):
+                for second_name in names[index + 1 :]:
+                    if {first_name, second_name} == {"source root", "visible root"}:
+                        if canonical[first_name] == canonical[second_name]:
+                            continue
+                    if _local_roots_overlap(paths[first_name], paths[second_name]):
+                        raise ValueError(
+                            f"The {first_name} and {second_name} paths overlap"
+                        )
+            for path in paths.values():
+                self._check_encrypted_local_root(path, operation)
+
+            root_stat = os.lstat(binding.root_path)
+            if not S_ISDIR(root_stat.st_mode) or is_fs_link(root_stat):
+                raise ValueError("The visible native root is not a real directory")
+            actual_identity = (
+                str(root_stat.st_dev),
+                str(root_stat.st_ino),
+                root_stat.st_mode,
+            )
+            expected_identity = (
+                binding.root_identity.device,
+                binding.root_identity.inode,
+                binding.root_identity.mode,
+            )
+            if actual_identity != expected_identity:
+                raise ValueError("The visible native root identity changed")
+            if canonical["source root"] != canonical["visible root"]:
+                source_stat = os.lstat(binding.source_root_path)
+                if not S_ISDIR(source_stat.st_mode) or is_fs_link(source_stat):
+                    raise ValueError("The source native root is not a real directory")
+                source_identity = (
+                    str(source_stat.st_dev),
+                    str(source_stat.st_ino),
+                    source_stat.st_mode,
+                )
+                expected_source_identity = (
+                    binding.source_root_identity.device,
+                    binding.source_root_identity.inode,
+                    binding.source_root_identity.mode,
+                )
+                if source_identity != expected_source_identity:
+                    raise ValueError("The source native root identity changed")
+            elif self.virtual_files.backend_id != "linux-fuse":
+                expected_source_identity = (
+                    binding.source_root_identity.device,
+                    binding.source_root_identity.inode,
+                    binding.source_root_identity.mode,
+                )
+                if actual_identity != expected_source_identity:
+                    raise ValueError("The source native root identity changed")
+        except (OSError, ValueError) as exc:
+            raise MaestralApiError(operation, str(exc)) from None
+        return root_stat.st_dev, root_stat.st_ino, root_stat.st_mode
+
+    def _adopt_virtual_root_binding(
+        self, binding: VirtualFileRootBinding, proof: object
+    ) -> None:
+        """Save a validated platform root before placeholder recovery starts."""
+        if (
+            not isinstance(proof, tuple)
+            or len(proof) != 3
+            or not all(isinstance(value, int) for value in proof)
+        ):
+            raise RuntimeError("The virtual root proof is invalid")
+        self.sync.set_dropbox_path(
+            binding.root_path,
+            expected_root_identity=proof,
+        )
+
+    def _validate_start_virtual_root_binding(
+        self, binding: VirtualFileRootBinding
+    ) -> tuple[int, int, int]:
+        return self._validate_virtual_root_binding(
+            binding, "Cannot start the virtual root"
+        )
+
+    def _start_virtual_files(self) -> VirtualFileRootBinding:
+        """Start and adopt the configured native virtual root."""
+        marker_id = self._conf.get("sync", "root_marker_id")
+        if not isinstance(marker_id, str) or not marker_id:
+            raise NoDropboxDirError(
+                "Virtual root is not confirmed",
+                "The configured root marker identity is missing.",
+            )
+        try:
+            return self.virtual_files.start(
+                self.sync.dropbox_path,
+                root_marker_id=marker_id,
+                binding_validator=self._validate_start_virtual_root_binding,
+                binding_adopter=self._adopt_virtual_root_binding,
+            )
+        except BaseException:
+            binding = self.virtual_files.binding_for_root(marker_id)
+            if (
+                binding is not None
+                and not self.virtual_files.registration_committed(marker_id)
+                and self.sync.dropbox_path == binding.root_path
+                and binding.source_root_path != binding.root_path
+            ):
+                identity = self._confirmed_root_identity_at(binding.source_root_path)
+                expected = (
+                    binding.source_root_identity.device,
+                    binding.source_root_identity.inode,
+                    binding.source_root_identity.mode,
+                )
+                if (
+                    identity is not None
+                    and (str(identity[0]), str(identity[1]), identity[2]) == expected
+                ):
+                    self.sync.set_dropbox_path(
+                        binding.source_root_path,
+                        expected_root_identity=identity,
+                    )
+            raise
+
+    def _repair_unaccepted_virtual_binding(self) -> None:
+        """Finish or safely detach a native binding left by a process crash."""
+        if self.sync_mode != VIRTUAL_MODE:
+            return
+        marker_id = self._conf.get("sync", "root_marker_id")
+        if not isinstance(marker_id, str) or not marker_id:
+            return
+        binding = self.virtual_files.binding_for_root(marker_id)
+        if binding is None:
+            return
+        if (
+            self.virtual_files.binding_accepted(marker_id)
+            and self.sync.dropbox_path == binding.root_path
+        ):
+            return
+        root_path = self.sync.dropbox_path or binding.root_path
+        try:
+            self.virtual_files.accept_pending_binding(
+                root_path,
+                marker_id,
+                lambda candidate: self._validate_virtual_root_binding(
+                    candidate, "Cannot recover the virtual root"
+                ),
+                self._adopt_virtual_root_binding,
+            )
+        except BaseException:
+            if not (
+                self.virtual_files.binding_detached(marker_id)
+                or self.virtual_files.binding_accepted(marker_id)
+            ):
+                raise
+            self._logger.error(
+                "Could not finish a native virtual root adoption during startup",
+                exc_info=True,
             )
 
     def configure_encryption(
@@ -2097,14 +2422,13 @@ class Maestral:
         :raises NoDropboxDirError: if local Dropbox folder is not set up.
         """
         self._check_linked()
-        self._check_dropbox_dir()
-        self._check_encrypted_local_root(
-            self.sync.dropbox_path, "Cannot start encrypted sync"
-        )
-
         if self.sync_mode == VIRTUAL_MODE:
-            self.virtual_files.start(self.sync.dropbox_path)
+            self._start_virtual_files()
         else:
+            self._check_dropbox_dir()
+            self._check_encrypted_local_root(
+                self.sync.dropbox_path, "Cannot start encrypted sync"
+            )
             self.manager.start()
 
     @_with_main_lifecycle

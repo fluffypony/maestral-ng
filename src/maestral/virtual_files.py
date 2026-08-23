@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import enum
 import hashlib
+import json
 import os
 import platform
 import posixpath
@@ -21,6 +22,7 @@ from typing import BinaryIO, Protocol, cast
 
 from fasteners import InterProcessLock
 
+from .config import MaestralConfig
 from .constants import ROOT_MARKER_FILE, ROOT_MARKER_TEMP_PREFIX
 from .core import (
     DeletedMetadata,
@@ -57,6 +59,7 @@ _MAX_REMOTE_PAGE_ITEMS = 4_096
 _MAX_REMOTE_PAGES = 100_000
 _MAX_REMOTE_BATCH_ITEMS = 10_000_000
 _MAX_STATUS_PAGE_ITEMS = 256
+_MAX_SOURCE_IDENTITY_BYTES = 16 * 1_024
 _CONTENT_HASH_PATTERN = re.compile(r"(?:[0-9a-f]{32}|[0-9a-f]{64})")
 
 
@@ -224,6 +227,7 @@ class VirtualFileRootBinding:
     source_root_path: str
     root_path: str
     cache_path: str
+    source_root_identity: VirtualFileRootIdentity
     root_identity: VirtualFileRootIdentity
 
 
@@ -270,6 +274,8 @@ class _KeyedOperationLock:
 
 
 HydrationRequest = Callable[[str, str], dict[str, object]]
+RootBindingValidator = Callable[[VirtualFileRootBinding], object]
+RootBindingAdopter = Callable[[VirtualFileRootBinding, object], None]
 
 
 class VirtualFileBackend(Protocol):
@@ -290,7 +296,17 @@ class VirtualFileBackend(Protocol):
 
     def cache_path_for_root(self, root_marker_id: str) -> str: ...
 
+    def binding_for_root(
+        self, root_marker_id: str
+    ) -> VirtualFileRootBinding | None: ...
+
     def registration_committed(self, root_marker_id: str) -> bool: ...
+
+    def binding_accepted(self, root_marker_id: str) -> bool: ...
+
+    def binding_detached(self, root_marker_id: str) -> bool: ...
+
+    def accept_binding(self, root_marker_id: str) -> None: ...
 
     def validate_root(self, root_path: str, root_marker_id: str) -> None: ...
 
@@ -347,9 +363,25 @@ class UnsupportedVirtualFileBackend:
         del root_marker_id
         return ""
 
+    def binding_for_root(self, root_marker_id: str) -> VirtualFileRootBinding | None:
+        del root_marker_id
+        return None
+
     def registration_committed(self, root_marker_id: str) -> bool:
         del root_marker_id
         return False
+
+    def binding_accepted(self, root_marker_id: str) -> bool:
+        del root_marker_id
+        return False
+
+    def binding_detached(self, root_marker_id: str) -> bool:
+        del root_marker_id
+        return False
+
+    def accept_binding(self, root_marker_id: str) -> None:
+        del root_marker_id
+        raise self._unsupported()
 
     def validate_root(self, root_path: str, root_marker_id: str) -> None:
         del root_path, root_marker_id
@@ -431,7 +463,8 @@ class _VirtualFileStore:
                     f"CREATE TABLE IF NOT EXISTS {self._SENTINEL_TABLE} "
                     "(identity TEXT PRIMARY KEY NOT NULL, status TEXT NOT NULL, "
                     "cursor TEXT NOT NULL DEFAULT '', "
-                    "needs_full_snapshot INTEGER NOT NULL DEFAULT 1)"
+                    "needs_full_snapshot INTEGER NOT NULL DEFAULT 1, "
+                    "source_identity TEXT NOT NULL DEFAULT '')"
                 )
                 sentinel_columns = {
                     row["name"]
@@ -449,8 +482,15 @@ class _VirtualFileStore:
                         f"ALTER TABLE {self._SENTINEL_TABLE} ADD COLUMN "
                         "needs_full_snapshot INTEGER NOT NULL DEFAULT 1"
                     )
+                if "source_identity" not in sentinel_columns:
+                    # Remove this one-shot upgrade after every v2 virtual index opens.
+                    self.connection.execute(
+                        f"ALTER TABLE {self._SENTINEL_TABLE} ADD COLUMN "
+                        "source_identity TEXT NOT NULL DEFAULT ''"
+                    )
                 sentinel = self.connection.execute(
-                    f"SELECT identity, status, cursor, needs_full_snapshot "
+                    f"SELECT identity, status, cursor, needs_full_snapshot, "
+                    f"source_identity "
                     f"FROM {self._SENTINEL_TABLE}"
                 ).fetchall()
                 records_table_exists = (
@@ -473,6 +513,11 @@ class _VirtualFileStore:
                     or sentinel[0]["status"] not in {"initialising", "ready"}
                     or not isinstance(sentinel[0]["cursor"], str)
                     or sentinel[0]["needs_full_snapshot"] not in {0, 1}
+                    or not isinstance(sentinel[0]["source_identity"], str)
+                    or not _has_utf8_length_at_most(
+                        sentinel[0]["source_identity"],
+                        _MAX_SOURCE_IDENTITY_BYTES,
+                    )
                 ):
                     raise ValueError("The virtual-file database identity is invalid")
                 else:
@@ -551,6 +596,51 @@ class _VirtualFileStore:
         if row is None or row["needs_full_snapshot"] not in {0, 1}:
             raise ValueError("The virtual-file snapshot state is invalid")
         return bool(row["needs_full_snapshot"])
+
+    @property
+    def source_identity(self) -> str:
+        row = self.connection.execute(
+            f"SELECT source_identity FROM {self._SENTINEL_TABLE} " "WHERE identity = ?",
+            (self._SENTINEL_VALUE,),
+        ).fetchone()
+        if row is None or not isinstance(row["source_identity"], str):
+            raise ValueError("The virtual-file source identity is invalid")
+        return row["source_identity"]
+
+    def bind_source(self, source_identity: str) -> None:
+        """Bind this index to one exact provider, account, and vault."""
+        if (
+            not isinstance(source_identity, str)
+            or not source_identity
+            or not _has_utf8_length_at_most(source_identity, _MAX_SOURCE_IDENTITY_BYTES)
+        ):
+            raise ValueError("The virtual-file source identity is invalid")
+        with self.connection:
+            current = self.source_identity
+            if current and current != source_identity:
+                raise VirtualFileBusyError(
+                    "Virtual index belongs to another remote source",
+                    "Detach the old virtual root before this account uses it.",
+                )
+            if not current:
+                changed = self.connection.execute(
+                    f"UPDATE {self._SENTINEL_TABLE} SET source_identity = ? "
+                    "WHERE identity = ? AND source_identity = ''",
+                    (source_identity, self._SENTINEL_VALUE),
+                ).rowcount
+                if changed != 1:
+                    raise ValueError("The virtual-file source identity is invalid")
+
+    def clear_source(self) -> None:
+        """Clear the source binding after the native root is safe to reuse."""
+        with self.connection:
+            changed = self.connection.execute(
+                f"UPDATE {self._SENTINEL_TABLE} SET source_identity = '' "
+                "WHERE identity = ?",
+                (self._SENTINEL_VALUE,),
+            ).rowcount
+            if changed != 1:
+                raise ValueError("The virtual-file source identity is invalid")
 
     def set_checkpoint(self, cursor: str, needs_full_snapshot: bool) -> None:
         """Commit the remote checkpoint inside its indexed database."""
@@ -703,6 +793,11 @@ class VirtualFileController:
         return self._root_binding
 
     @property
+    def stage_directory(self) -> str:
+        """Return the private hydration stage path for overlap validation."""
+        return self._stage_directory
+
+    @property
     def cursor(self) -> str:
         with self._lock:
             return self._get_store().cursor
@@ -719,6 +814,27 @@ class VirtualFileController:
             )
             self._get_store().set_checkpoint(cursor, required)
             self._needs_full_snapshot = required
+
+    def _remote_source_identity(self) -> str:
+        """Return one stable local identity for the selected remote source."""
+        config = MaestralConfig(self.config_name)
+        namespace = getattr(self.provider, "namespace_id", "")
+        provider_identity = getattr(self.provider, "virtual_source_identity", "")
+        if not isinstance(namespace, str) or not isinstance(provider_identity, str):
+            raise ValueError("The remote source identity is invalid")
+        return json.dumps(
+            {
+                "version": 1,
+                "provider": self.provider.provider_id,
+                "configured_provider": config.get("auth", "provider"),
+                "account": config.get("auth", "account_id"),
+                "namespace": namespace,
+                "provider_identity": provider_identity,
+            },
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
 
     def replace_backend(self, backend: VirtualFileBackend) -> VirtualFileBackend:
         """Replace the inactive native backend before a root is started."""
@@ -744,12 +860,14 @@ class VirtualFileController:
             self._raise_if_closed()
             has_database = os.path.exists(self._database_path)
             has_records = has_database and bool(self._get_store().all())
+            has_source = has_database and bool(self._get_store().source_identity)
             if (
                 self.running
                 or self._backend_started
                 or self._worker is not None
                 or self._active_operations
                 or has_records
+                or has_source
             ):
                 raise VirtualFileBusyError(
                     "Cannot replace the virtual-file provider",
@@ -761,9 +879,21 @@ class VirtualFileController:
         """Return the private native cache path for one durable root identity."""
         return self._backend.cache_path_for_root(root_marker_id)
 
+    def binding_for_root(self, root_marker_id: str) -> VirtualFileRootBinding | None:
+        """Return one durable native root binding, including while stopped."""
+        return self._backend.binding_for_root(root_marker_id)
+
     def registration_committed(self, root_marker_id: str) -> bool:
         """Return whether one native root has a confirmed registration."""
         return self._backend.registration_committed(root_marker_id)
+
+    def binding_accepted(self, root_marker_id: str) -> bool:
+        """Return whether core accepted one confirmed native binding."""
+        return self._backend.binding_accepted(root_marker_id)
+
+    def binding_detached(self, root_marker_id: str) -> bool:
+        """Return whether one saved native binding is already detached."""
+        return self._backend.binding_detached(root_marker_id)
 
     def validate_root(self, root_path: str, root_marker_id: str) -> None:
         """Validate one active native registration without reading its namespace."""
@@ -809,8 +939,8 @@ class VirtualFileController:
                     self._root_binding = None
                     self._release_stage_lock()
 
-    def detach(self) -> None:
-        """Forget the virtual root while preserving every native item."""
+    def clear(self) -> None:
+        """Clear core virtual state after no native registration was created."""
         with self._lifecycle_lock:
             self._quiesce()
             try:
@@ -818,6 +948,7 @@ class VirtualFileController:
                     self._set_checkpoint("", needs_full_snapshot=False)
                     with self._lock:
                         self._get_store().records.delete(AllQuery())
+                        self._get_store().clear_source()
                         self._last_worker_error = ""
             finally:
                 if self._backend_started:
@@ -826,7 +957,32 @@ class VirtualFileController:
                     self._root_binding = None
                     self._release_stage_lock()
 
-    def start(self, root_path: str) -> VirtualFileRootBinding:
+    def detach(self, root_path: str, root_marker_id: str) -> str:
+        """Detach one registered native root, then clear its core state."""
+        with self._lifecycle_lock:
+            self._quiesce()
+            with self._remote_lock:
+                if self._backend_started:
+                    self._backend.stop()
+                    self._backend_started = False
+                    self._root_binding = None
+                    self._release_stage_lock()
+                source_root = self._backend.detach(root_path, root_marker_id)
+                self._set_checkpoint("", needs_full_snapshot=False)
+                with self._lock:
+                    self._get_store().records.delete(AllQuery())
+                    self._get_store().clear_source()
+                    self._last_worker_error = ""
+                return source_root
+
+    def start(
+        self,
+        root_path: str,
+        *,
+        root_marker_id: str | None = None,
+        binding_validator: RootBindingValidator | None = None,
+        binding_adopter: RootBindingAdopter | None = None,
+    ) -> VirtualFileRootBinding:
         """Start the native root and recover all durable operations."""
         with self._lock:
             self._raise_if_closed()
@@ -834,6 +990,13 @@ class VirtualFileController:
             raise UnsupportedVirtualFileBackend()._unsupported()
         if not root_path:
             raise ValueError("A virtual root path is required")
+        binding_was_accepted = (
+            self._backend.binding_accepted(root_marker_id)
+            if root_marker_id is not None
+            else False
+        )
+        binding: VirtualFileRootBinding | None = None
+        binding_validated = False
 
         with self._lifecycle_lock:
             with self._lock:
@@ -869,11 +1032,19 @@ class VirtualFileController:
                     )
                 self._stage_lock_held = True
                 self._prepare_stage_directory()
+                with self._lock:
+                    self._get_store().bind_source(self._remote_source_identity())
                 binding = self._backend.start(root_path, self._hydrate_on_open)
                 self._backend_started = True
                 with self._lock:
                     self._root_path = binding.root_path
                     self._root_binding = binding
+                proof = binding_validator(binding) if binding_validator else None
+                if root_marker_id is not None:
+                    self._backend.accept_binding(root_marker_id)
+                binding_validated = True
+                if binding_adopter is not None:
+                    binding_adopter(binding, proof)
                 pinned_to_hydrate = self._recover()
                 self._ready.set()
             except BaseException as start_error:
@@ -898,6 +1069,21 @@ class VirtualFileController:
                         self._release_stage_lock()
                 else:
                     self._release_stage_lock()
+                if (
+                    root_marker_id is not None
+                    and not binding_validated
+                    and not binding_was_accepted
+                    and self._backend.registration_committed(root_marker_id)
+                ):
+                    failed_binding = binding or self._backend.binding_for_root(
+                        root_marker_id
+                    )
+                    if failed_binding is None:
+                        raise VirtualFileBusyError(
+                            "Could not clean up the virtual root",
+                            "The native registration exists without its saved binding.",
+                        ) from start_error
+                    self._backend.detach(failed_binding.root_path, root_marker_id)
                 raise
             with self._lock:
                 self._connected = not self._remote_polling
@@ -917,7 +1103,70 @@ class VirtualFileController:
                 self.hydrate(provider_id)
             except Exception:
                 pass
+        assert binding is not None
         return binding
+
+    def accept_pending_binding(
+        self,
+        root_path: str,
+        root_marker_id: str,
+        binding_validator: RootBindingValidator,
+        binding_adopter: RootBindingAdopter,
+    ) -> VirtualFileRootBinding:
+        """Finish a crash-interrupted binding proof without remote recovery."""
+        with self._lock:
+            self._raise_if_closed()
+        with self._lifecycle_lock:
+            with self._lock:
+                if self.running or self._backend_started or self._active_operations:
+                    raise VirtualFileBusyError(
+                        "Cannot accept the virtual root",
+                        "Stop the native root before binding recovery.",
+                    )
+            binding: VirtualFileRootBinding | None = None
+            accepted = self._backend.binding_accepted(root_marker_id)
+            try:
+                with self._lock:
+                    self._get_store().bind_source(self._remote_source_identity())
+                binding = self._backend.start(root_path, self._hydrate_on_open)
+                self._backend_started = True
+                self._root_binding = binding
+                proof = binding_validator(binding)
+                self._backend.accept_binding(root_marker_id)
+                accepted = True
+                binding_adopter(binding, proof)
+            except BaseException as start_error:
+                if self._backend_started:
+                    try:
+                        self._backend.stop()
+                    except BaseException as stop_error:
+                        raise VirtualFileBusyError(
+                            "Could not clean up the virtual root",
+                            "Native cleanup failed after binding recovery.",
+                        ) from stop_error
+                    else:
+                        self._backend_started = False
+                        self._root_binding = None
+                if not accepted and self._backend.registration_committed(
+                    root_marker_id
+                ):
+                    failed_binding = binding or self._backend.binding_for_root(
+                        root_marker_id
+                    )
+                    if failed_binding is None:
+                        raise VirtualFileBusyError(
+                            "Could not clean up the virtual root",
+                            "The native registration has no saved binding.",
+                        ) from start_error
+                    self._backend.detach(failed_binding.root_path, root_marker_id)
+                raise
+
+            self._backend.stop()
+            with self._lock:
+                self._backend_started = False
+                self._root_binding = None
+            assert binding is not None
+            return binding
 
     def stop(self) -> None:
         """Stop remote polling and the native root."""
@@ -1147,7 +1396,7 @@ class VirtualFileController:
                 "supported": self.supported,
                 "running": self.running,
                 "connected": self.connected,
-                "cursor": self.cursor if self.supported else "",
+                "indexed": bool(self.cursor) if self.supported else False,
                 "items": items,
                 "pinned": pinned,
                 "states": {
@@ -1765,9 +2014,10 @@ class VirtualFileController:
             ),
         )
         native_before = self._inspect_native(provider_id) if self.running else None
-        self._require_native_state_mutable(
-            native_before, "Cannot apply the remote file change"
-        )
+        if not recovered_matches:
+            self._require_native_state_mutable(
+                native_before, "Cannot apply the remote file change"
+            )
 
         moved_descendants: list[_VirtualFileRecord] = []
         previous_descendants: list[_VirtualFileRecord] = []
@@ -2113,11 +2363,17 @@ class VirtualFileController:
             for target in records:
                 current = self._get_store().get(target.provider_id)
                 if current is not None and current.generation == target.generation:
+                    recovered = self._snapshot_native_by_id.get(target.provider_id)
                     applied.append(
                         self._copy_record(
                             current,
                             native_applied_generation=current.generation,
-                            last_error=None,
+                            last_error=(
+                                current.last_error
+                                if recovered is not None
+                                and (recovered.dirty or recovered.open_count)
+                                else None
+                            ),
                         )
                     )
             self._get_store().records.update_many(applied)
@@ -2322,8 +2578,9 @@ class VirtualFileController:
 
     def evict(self, provider_id: str) -> dict[str, object]:
         """Evict clean, closed, unpinned content through the native backend."""
-        with self._native_operation() as operation_generation:
-            return self._evict_active(provider_id, operation_generation)
+        with self._remote_lock:
+            with self._native_operation() as operation_generation:
+                return self._evict_active(provider_id, operation_generation)
 
     def _evict_active(
         self, provider_id: str, operation_generation: int

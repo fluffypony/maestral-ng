@@ -338,8 +338,13 @@ def test_link_refuses_old_root_recovery_after_interrupted_unlink(
         "credentials_deleted": False,
         "vault_password_deleted": True,
         "virtual_files_reset": True,
+        "sync_mode": "mirror",
         "root_path": "/old/dropbox",
+        "source_root_path": "/old/dropbox",
+        "source_root_identity": None,
         "root_marker_id": "a" * 32,
+        "native_registration_committed": False,
+        "root_marker_removed": False,
     }
     m._state.set("recovery", "local_paths", {"/old.txt": {}})
     m._state.set("recovery", "sync_reset", journal)
@@ -353,7 +358,14 @@ def test_link_refuses_old_root_recovery_after_interrupted_unlink(
 
     link.assert_not_called()
     delete_creds.assert_not_called()
-    assert m._state.get("recovery", "sync_reset") == journal
+    assert m._state.get("recovery", "sync_reset") == {
+        **journal,
+        "sync_mode": "mirror",
+        "source_root_path": "/old/dropbox",
+        "source_root_identity": None,
+        "native_registration_committed": False,
+        "root_marker_removed": False,
+    }
 
 
 def test_reset_marker_remains_until_root_bound_recovery_is_clear(m: Maestral) -> None:
@@ -374,7 +386,14 @@ def test_reset_marker_remains_until_root_bound_recovery_is_clear(m: Maestral) ->
 
     m.sync._finish_sync_reset_queue()
 
-    assert m._state.get("recovery", "sync_reset") == journal
+    assert m._state.get("recovery", "sync_reset") == {
+        **journal,
+        "sync_mode": "mirror",
+        "source_root_path": "/old/dropbox",
+        "source_root_identity": None,
+        "native_registration_committed": False,
+        "root_marker_removed": False,
+    }
     with pytest.raises(MaestralApiError, match="pending reset"):
         m.manager.start()
 

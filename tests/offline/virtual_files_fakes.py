@@ -146,6 +146,10 @@ class FakeVirtualFileBackend:
         self.calls: list[tuple[object, ...]] = []
         self.request_hydration: HydrationRequest | None = None
         self.started = False
+        self.root_binding: VirtualFileRootBinding | None = None
+        self._registration_committed = False
+        self._binding_accepted = False
+        self._binding_detached = False
         self.require_empty_directories = False
         self.cascade_directory_removals = False
 
@@ -156,16 +160,21 @@ class FakeVirtualFileBackend:
         self.request_hydration = request_hydration
         self.started = True
         status = os.lstat(root_path)
-        return VirtualFileRootBinding(
+        identity = VirtualFileRootIdentity(
+            device=str(status.st_dev),
+            inode=str(status.st_ino),
+            mode=status.st_mode,
+        )
+        self.root_binding = VirtualFileRootBinding(
             source_root_path=root_path,
             root_path=root_path,
             cache_path="/fake-cache",
-            root_identity=VirtualFileRootIdentity(
-                device=str(status.st_dev),
-                inode=str(status.st_ino),
-                mode=status.st_mode,
-            ),
+            source_root_identity=identity,
+            root_identity=identity,
         )
+        self._registration_committed = True
+        self._binding_detached = False
+        return self.root_binding
 
     def stop(self) -> None:
         self.calls.append(("stop",))
@@ -175,9 +184,27 @@ class FakeVirtualFileBackend:
     def cache_path_for_root(self, root_marker_id: str) -> str:
         return f"/fake-cache/{root_marker_id}"
 
+    def binding_for_root(self, root_marker_id: str) -> VirtualFileRootBinding | None:
+        del root_marker_id
+        return self.root_binding
+
     def registration_committed(self, root_marker_id: str) -> bool:
         del root_marker_id
-        return self.started
+        return self._registration_committed
+
+    def binding_accepted(self, root_marker_id: str) -> bool:
+        del root_marker_id
+        return self._binding_accepted
+
+    def binding_detached(self, root_marker_id: str) -> bool:
+        del root_marker_id
+        return self._binding_detached
+
+    def accept_binding(self, root_marker_id: str) -> None:
+        del root_marker_id
+        if not self._registration_committed:
+            raise RuntimeError("The fake registration is not active")
+        self._binding_accepted = True
 
     def validate_root(self, root_path: str, root_marker_id: str) -> None:
         self.calls.append(("validate_root", root_path, root_marker_id))
@@ -194,6 +221,9 @@ class FakeVirtualFileBackend:
             if item.content is not None or item.descriptor.is_directory
         }
         self.started = False
+        self._registration_committed = False
+        self._binding_accepted = False
+        self._binding_detached = True
         self.request_hydration = None
         return root_path
 
