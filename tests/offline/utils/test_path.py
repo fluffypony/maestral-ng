@@ -100,7 +100,7 @@ def test_multiple_existing_equivalent_paths(tmp_path):
 
     # find matches for children
     candidates = get_existing_equivalent_paths(
-        "/test folder/subfolder", root=str(tmp_path)
+        "test folder/subfolder", root=str(tmp_path)
     )
 
     assert set(candidates) == {dir0, dir1}
