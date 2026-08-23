@@ -3260,11 +3260,13 @@ class SyncEngine:
                 marker_file.write(marker_content)
                 marker_file.flush()
                 os.fsync(marker_file.fileno())
-                temp_identity = self._local_stat_identity(
-                    os.fstat(marker_file.fileno())
-                )[:6]
 
             temp_file.close()
+            temp_identity = rooted_item_snapshot(
+                temp_file.path,
+                self.dropbox_path,
+                expected_root_identity=self.confirmed_root_identity,
+            )[:6]
             with self.fs_events.ignore(
                 FileCreatedEvent(marker_path),
                 FileModifiedEvent(marker_path),

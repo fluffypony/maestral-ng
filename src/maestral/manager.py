@@ -73,6 +73,9 @@ from .utils.path import (
     normalize,
 )
 from .utils.path import rmdir as rooted_rmdir
+from .utils.path import (
+    rooted_item_snapshot,
+)
 from .utils.path import unlink as rooted_unlink
 
 __all__ = ["SyncManager"]
@@ -1118,8 +1121,12 @@ class SyncManager:
                     proof_file.write(expected_proof.encode("ascii"))
                     proof_file.flush()
                     os.fsync(proof_file.fileno())
-                    temp_identity = os.fstat(proof_file.fileno())
                 temp_file.close()
+                temp_identity = rooted_item_snapshot(
+                    temp_file.path,
+                    self.sync.dropbox_path,
+                    expected_root_identity=self.sync.confirmed_root_identity,
+                )[:6]
                 move(
                     temp_file.path,
                     proof_path,
@@ -1127,14 +1134,7 @@ class SyncManager:
                     raise_error=True,
                     root_path=self.sync.dropbox_path,
                     expected_root_identity=self.sync.confirmed_root_identity,
-                    expected_source_identity=(
-                        temp_identity.st_dev,
-                        temp_identity.st_ino,
-                        temp_identity.st_mode,
-                        temp_identity.st_size,
-                        temp_identity.st_mtime_ns,
-                        temp_identity.st_ctime_ns,
-                    ),
+                    expected_source_identity=temp_identity,
                 )
             finally:
                 temp_file.close()
