@@ -190,7 +190,22 @@ def test_rooted_walk_rejects_file_changed_before_final_child_check(
     child.write_text("original")
 
     real_lstat = os.lstat
+    real_open_windows_handle = path_module._open_windows_handle
     raced = False
+
+    def share_writes_while_opening(
+        path: str,
+        *,
+        delete_access: bool = False,
+        read_access: bool = False,
+        share_write: bool = True,
+    ):
+        return real_open_windows_handle(
+            path,
+            delete_access=delete_access,
+            read_access=read_access,
+            share_write=True,
+        )
 
     def racing_lstat(path: str) -> os.stat_result:
         nonlocal raced
@@ -200,6 +215,11 @@ def test_rooted_walk_rejects_file_changed_before_final_child_check(
             raced = True
         return stat_result
 
+    monkeypatch.setattr(
+        path_module,
+        "_open_windows_handle",
+        share_writes_while_opening,
+    )
     monkeypatch.setattr(path_module.os, "lstat", racing_lstat)
 
     with pytest.raises(OSError) as exc_info:

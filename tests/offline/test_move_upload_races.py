@@ -1,4 +1,5 @@
 import os
+import platform
 import time
 from collections.abc import Iterator
 from datetime import datetime, timezone
@@ -227,6 +228,10 @@ def test_folder_move_rejects_changed_remote_child(sync_engine: SyncEngine) -> No
     sync_engine.rescan.assert_called_once_with(str(destination))
 
 
+@pytest.mark.skipif(
+    platform.system() == "Windows",
+    reason="Windows rooted readers prevent path replacement",
+)
 def test_upload_rescans_path_replaced_after_open_with_old_mtime(
     sync_engine: SyncEngine,
     tmp_path: Path,
@@ -309,6 +314,10 @@ def test_upload_rescans_path_replaced_after_open_with_old_mtime(
     sync_engine.rescan.assert_called_once_with(str(local_path))
 
 
+@pytest.mark.skipif(
+    platform.system() == "Windows",
+    reason="Windows rooted readers prevent path replacement",
+)
 def test_identical_upload_shortcut_does_not_index_replacement(
     sync_engine: SyncEngine,
     tmp_path: Path,
