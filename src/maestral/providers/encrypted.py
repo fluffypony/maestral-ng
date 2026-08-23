@@ -135,6 +135,23 @@ _WINDOWS_RESERVED_NAMES = {
 }
 
 
+def _is_link_or_junction(path: Path) -> bool:
+    """Return whether *path* is a symbolic link or Windows junction."""
+    if path.is_symlink():
+        return True
+    is_junction = getattr(os.path, "isjunction", None)
+    return bool(is_junction is not None and is_junction(path))
+
+
+def _has_link_or_junction_ancestor(path: Path) -> bool:
+    """Check each existing path component without resolving through it."""
+    absolute = path.absolute()
+    return any(
+        os.path.lexists(candidate) and _is_link_or_junction(candidate)
+        for candidate in (absolute, *absolute.parents)
+    )
+
+
 @dataclass(frozen=True)
 class _LocalPhysicalEntry:
     kind: _PhysicalKind
@@ -277,11 +294,16 @@ class PhysicalVaultMirror:
     def claim_local_root(self, *, allow_nonempty: bool) -> None:
         """Claim a cache root before any code may replace its contents."""
         parent = self.local_root.parent
-        parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        if parent.is_symlink() or self.local_root.is_symlink():
+        if _has_link_or_junction_ancestor(parent):
             raise EncryptedVaultError(
                 "Encrypted vault mirror is unsafe",
-                "The ciphertext cache cannot use a symbolic link.",
+                "The ciphertext cache cannot use a symbolic link or junction.",
+            )
+        parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if _has_link_or_junction_ancestor(self.local_root):
+            raise EncryptedVaultError(
+                "Encrypted vault mirror is unsafe",
+                "The ciphertext cache cannot use a symbolic link or junction.",
             )
         if self.local_root.exists() and not self.local_root.is_dir():
             raise EncryptedVaultError(
@@ -373,7 +395,11 @@ class PhysicalVaultMirror:
     ) -> dict[str, _LocalPhysicalEntry]:
         """Return a no-follow snapshot of every local ciphertext object."""
         root_stat = os.lstat(self.local_root)
-        if not stat.S_ISDIR(root_stat.st_mode) or stat.S_ISLNK(root_stat.st_mode):
+        if (
+            not stat.S_ISDIR(root_stat.st_mode)
+            or stat.S_ISLNK(root_stat.st_mode)
+            or _is_link_or_junction(self.local_root)
+        ):
             raise EncryptedVaultError(
                 "Encrypted vault mirror is unsafe",
                 "The local ciphertext root must be a private directory.",
@@ -389,7 +415,7 @@ class PhysicalVaultMirror:
                 path = current_path / name
                 file_stat = os.lstat(path)
                 relative = path.relative_to(self.local_root).as_posix()
-                if stat.S_ISLNK(file_stat.st_mode):
+                if stat.S_ISLNK(file_stat.st_mode) or _is_link_or_junction(path):
                     raise EncryptedVaultError(
                         "Encrypted vault mirror is unsafe",
                         "The ciphertext tree contains a symbolic link.",
@@ -1170,7 +1196,17 @@ class PhysicalVaultMirror:
 
     def _write_json(self, path: Path, value: Mapping[str, object]) -> None:
         parent = path.parent
+        if _has_link_or_junction_ancestor(parent):
+            raise EncryptedVaultError(
+                "Encrypted vault mirror is unsafe",
+                "The ciphertext cache state cannot use a symbolic link or junction.",
+            )
         parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if _has_link_or_junction_ancestor(parent):
+            raise EncryptedVaultError(
+                "Encrypted vault mirror is unsafe",
+                "The ciphertext cache state cannot use a symbolic link or junction.",
+            )
         payload = json.dumps(
             value, ensure_ascii=True, sort_keys=True, separators=(",", ":")
         ).encode("utf-8")
@@ -1330,11 +1366,16 @@ class PhysicalVaultMirror:
     def _materialise(self, remote: Mapping[str, FileMetadata | FolderMetadata]) -> None:
         self.claim_local_root(allow_nonempty=False)
         parent = self.local_root.parent
-        parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        if parent.is_symlink():
+        if _has_link_or_junction_ancestor(parent):
             raise EncryptedVaultError(
                 "Encrypted vault mirror is unsafe",
-                "The ciphertext cache parent cannot be a symbolic link.",
+                "The ciphertext cache parent cannot be a symbolic link or junction.",
+            )
+        parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if _has_link_or_junction_ancestor(parent):
+            raise EncryptedVaultError(
+                "Encrypted vault mirror is unsafe",
+                "The ciphertext cache parent cannot be a symbolic link or junction.",
             )
         candidate = Path(
             tempfile.mkdtemp(prefix=".maestral-vault-download-", dir=parent)
@@ -1397,10 +1438,14 @@ class PhysicalVaultMirror:
             f".{self.local_root.name}.old-{uuid.uuid4().hex}"
         )
         had_root = self.local_root.exists()
-        if self.local_root.is_symlink():
+        if (
+            _has_link_or_junction_ancestor(self.local_root)
+            or _has_link_or_junction_ancestor(candidate)
+            or not candidate.is_dir()
+        ):
             raise EncryptedVaultError(
                 "Encrypted vault mirror is unsafe",
-                "The ciphertext cache root cannot be a symbolic link.",
+                "The ciphertext cache root cannot be a symbolic link or junction.",
             )
         if had_root:
             os.replace(self.local_root, backup)
@@ -3450,13 +3495,23 @@ class EncryptedRemoteProvider:
     @contextmanager
     def _temporary_plaintext_file(self, purpose: str) -> Iterator[Path]:
         transfer_root = self._mirror.local_root.parent / ".plaintext-transfers"
-        transfer_root.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        if transfer_root.is_symlink():
+        if _has_link_or_junction_ancestor(transfer_root.parent):
             raise EncryptedVaultError(
                 "Encrypted transfer cache is unsafe",
-                "The private plaintext cache cannot be a symbolic link.",
+                "The private plaintext cache cannot use a symbolic link or junction.",
+            )
+        transfer_root.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if _has_link_or_junction_ancestor(transfer_root):
+            raise EncryptedVaultError(
+                "Encrypted transfer cache is unsafe",
+                "The private plaintext cache cannot use a symbolic link or junction.",
             )
         transfer_root.mkdir(mode=0o700, exist_ok=True)
+        if _has_link_or_junction_ancestor(transfer_root):
+            raise EncryptedVaultError(
+                "Encrypted transfer cache is unsafe",
+                "The private plaintext cache cannot use a symbolic link or junction.",
+            )
         os.chmod(transfer_root, 0o700)
         descriptor, name = tempfile.mkstemp(
             prefix=f"maestral-{purpose}-", dir=transfer_root

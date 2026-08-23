@@ -616,6 +616,42 @@ def test_local_ciphertext_snapshot_rejects_symbolic_links(tmp_path: Path) -> Non
         mirror.snapshot_local()
 
 
+def test_ciphertext_cache_rejects_a_symbolic_link_ancestor(tmp_path: Path) -> None:
+    real_parent = tmp_path / "real-parent"
+    real_parent.mkdir()
+    linked_parent = tmp_path / "linked-parent"
+    os.symlink(real_parent, linked_parent, target_is_directory=True)
+    mirror = PhysicalVaultMirror(
+        FakeRemoteProvider(tmp_path / "remote"),
+        "/Encrypted",
+        linked_parent / "ciphertext-cache",
+    )
+
+    with pytest.raises(EncryptedVaultError, match="symbolic link or junction"):
+        mirror.claim_local_root(allow_nonempty=False)
+
+
+def test_ciphertext_cache_rejects_a_windows_junction_ancestor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    junction = tmp_path / "junction"
+    junction.mkdir()
+    monkeypatch.setattr(
+        os.path,
+        "isjunction",
+        lambda path: Path(path) == junction,
+        raising=False,
+    )
+    mirror = PhysicalVaultMirror(
+        FakeRemoteProvider(tmp_path / "remote"),
+        "/Encrypted",
+        junction / "ciphertext-cache",
+    )
+
+    with pytest.raises(EncryptedVaultError, match="symbolic link or junction"):
+        mirror.claim_local_root(allow_nonempty=False)
+
+
 def test_remote_vault_root_must_be_dedicated() -> None:
     with pytest.raises(ValueError, match="account root"):
         PhysicalVaultMirror._normalise_remote_root("/")
