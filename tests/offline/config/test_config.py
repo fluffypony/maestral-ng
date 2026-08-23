@@ -1,6 +1,10 @@
 from unittest import mock
 
+import pytest
+
 import maestral.config as config_module
+from maestral.config import MaestralConfig, MaestralState
+from maestral.config.user import ConfigLoadError
 
 
 def test_remove_configuration_does_not_remove_prefix_matches(
@@ -30,3 +34,11 @@ def test_remove_configuration_does_not_remove_prefix_matches(
     assert not (tmp_path / "work.db-wal").exists()
     assert (tmp_path / "work2.state").exists()
     assert (tmp_path / "workshop.db").exists()
+
+
+def test_missing_state_fails_closed_for_linked_profile(config_name: str) -> None:
+    config = MaestralConfig(config_name)
+    config.set("auth", "account_id", "linked-account")
+
+    with pytest.raises(ConfigLoadError, match="Cannot safely recreate"):
+        MaestralState(config_name)

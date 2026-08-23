@@ -1,11 +1,13 @@
 import configparser as cp
+import copy
 import os
+import stat
 from unittest import mock
 
 import pytest
 from packaging.version import Version
 
-from maestral.config.user import UserConfig
+from maestral.config.user import ConfigLoadError, UserConfig
 
 from .conftest import CONF_VERSION, DEFAULTS_CONFIG
 
@@ -104,9 +106,15 @@ def test_save_is_atomic_when_replace_fails(tmp_path):
         backup=True,
     )
     original_contents = config_path.read_bytes()
+    original_replace = os.replace
+
+    def fail_primary_replace(source, destination):
+        if os.fspath(destination) == os.fspath(config_path):
+            raise OSError("replace failed")
+        return original_replace(source, destination)
 
     with mock.patch(
-        "maestral.config.user.os.replace", side_effect=OSError("replace failed")
+        "maestral.config.user.os.replace", side_effect=fail_primary_replace
     ):
         with pytest.raises(OSError, match="replace failed"):
             config.set("auth", "account_id", "new value")
@@ -116,8 +124,134 @@ def test_save_is_atomic_when_replace_fails(tmp_path):
 
 
 @pytest.mark.parametrize(
+    "operation",
+    [
+        "set_existing",
+        "set_new",
+        "remove_option",
+        "remove_section",
+        "reset_to_defaults",
+    ],
+)
+def test_precommit_save_failure_restores_all_in_memory_state(tmp_path, operation):
+    config_path = tmp_path / "rollback.ini"
+    config = UserConfig(
+        str(config_path),
+        defaults=fresh_defaults(),
+        version=CONF_VERSION,
+        backup=True,
+    )
+    config.set("auth", "account_id", "custom", save=False)
+    sections_before = copy.deepcopy(config._sections)
+    parser_defaults_before = copy.deepcopy(config._defaults)
+    defaults_before = copy.deepcopy(config.default_config)
+    contents_before = config_path.read_bytes()
+    original_replace = os.replace
+
+    def fail_primary_replace(source, destination):
+        if os.fspath(destination) == os.fspath(config_path):
+            raise OSError("replace failed")
+        return original_replace(source, destination)
+
+    with mock.patch(
+        "maestral.config.user.os.replace", side_effect=fail_primary_replace
+    ):
+        with pytest.raises(OSError, match="replace failed"):
+            if operation == "set_existing":
+                config.set("auth", "account_id", "new value")
+            elif operation == "set_new":
+                config.set("new_section", "new_option", {"new value"})
+            elif operation == "remove_option":
+                config.remove_option("auth", "account_id")
+            elif operation == "remove_section":
+                config.remove_section("auth")
+            else:
+                config.reset_to_defaults()
+
+    assert config._sections == sections_before
+    assert config._defaults == parser_defaults_before
+    assert config.default_config == defaults_before
+    assert config_path.read_bytes() == contents_before
+    assert list(tmp_path.glob(".rollback.ini.*")) == []
+
+
+def test_directory_fsync_failure_keeps_committed_memory_and_disk(tmp_path):
+    if os.name == "nt":
+        pytest.skip("Windows does not fsync the configuration directory")
+
+    config_path = tmp_path / "committed.ini"
+    defaults = fresh_defaults()
+    config = UserConfig(
+        str(config_path),
+        defaults=defaults,
+        version=CONF_VERSION,
+        backup=True,
+    )
+    original_fsync = os.fsync
+
+    def fail_for_directory(file_descriptor):
+        if stat.S_ISDIR(os.fstat(file_descriptor).st_mode):
+            raise OSError("directory fsync failed")
+        original_fsync(file_descriptor)
+
+    with mock.patch("maestral.config.user.os.fsync", side_effect=fail_for_directory):
+        config.set("auth", "account_id", "published")
+
+    assert config.get("auth", "account_id") == "published"
+    reloaded = UserConfig(
+        str(config_path),
+        defaults=defaults,
+        version=CONF_VERSION,
+        backup=False,
+    )
+    assert reloaded.get("auth", "account_id") == "published"
+
+
+def test_postcommit_proof_is_not_reused_by_later_failed_save(tmp_path):
+    config_path = tmp_path / "commit-proof.ini"
+    defaults = fresh_defaults()
+    config = UserConfig(
+        str(config_path),
+        defaults=defaults,
+        version=CONF_VERSION,
+        backup=True,
+    )
+    original_replace = os.replace
+
+    def replace_then_interrupt(source, destination):
+        original_replace(source, destination)
+        if os.fspath(destination) == os.fspath(config_path):
+            raise KeyboardInterrupt("after replace")
+
+    def fail_primary_replace(source, destination):
+        if os.fspath(destination) == os.fspath(config_path):
+            raise OSError("before replace")
+        return original_replace(source, destination)
+
+    with mock.patch(
+        "maestral.config.user.os.replace", side_effect=replace_then_interrupt
+    ):
+        with pytest.raises(KeyboardInterrupt, match="after replace"):
+            config.set("auth", "account_id", "published")
+
+    committed_contents = config_path.read_bytes()
+    assert config.get("auth", "account_id") == "published"
+
+    with mock.patch(
+        "maestral.config.user.os.replace", side_effect=fail_primary_replace
+    ):
+        with pytest.raises(OSError, match="before replace"):
+            config.set("auth", "account_id", "must roll back")
+
+    assert config.get("auth", "account_id") == "published"
+    assert config_path.read_bytes() == committed_contents
+
+
+@pytest.mark.parametrize(
     "corrupt_contents",
     [
+        "",
+        "[sync]\npath = /partial/path\n",
         "[main]\nversion = invalid-version\n",
         "[main]\nversion = 1.0.0\n[auth]\naccount_id = first\n"
         "[auth]\naccount_id = second\n",
@@ -133,13 +267,6 @@ def test_load_recovers_from_backup(tmp_path, corrupt_contents):
         backup=True,
     )
     config.set("auth", "account_id", "from backup")
-
-    UserConfig(
-        str(config_path),
-        defaults=defaults,
-        version=CONF_VERSION,
-        backup=True,
-    )
     config_path.write_text(corrupt_contents, encoding="utf-8")
 
     recovered = UserConfig(
@@ -166,6 +293,36 @@ def test_load_corrupt_config_without_backup_uses_defaults(tmp_path):
 
     assert config.get("auth", "account_id") == "default"
     assert config.get_version() == CONF_VERSION
+
+
+def test_corrupt_durable_state_does_not_load_a_stale_backup(tmp_path):
+    state_path = tmp_path / "durable.state"
+    defaults = fresh_defaults()
+    state = UserConfig(
+        str(state_path),
+        defaults=defaults,
+        version=CONF_VERSION,
+        backup=True,
+        recover_from_backup=False,
+    )
+    state.set("auth", "account_id", "current")
+    UserConfig(
+        str(state_path),
+        defaults=defaults,
+        version=CONF_VERSION,
+        backup=True,
+        recover_from_backup=False,
+    )
+    state_path.write_text("[main]\nversion = invalid-version\n", encoding="utf-8")
+
+    with pytest.raises(ConfigLoadError, match="Cannot safely recover"):
+        UserConfig(
+            str(state_path),
+            defaults=defaults,
+            version=CONF_VERSION,
+            backup=True,
+            recover_from_backup=False,
+        )
 
 
 def test_cleanup_preserves_other_config_backups(tmp_path):

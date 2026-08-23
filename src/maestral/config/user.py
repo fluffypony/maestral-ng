@@ -37,6 +37,10 @@ class NoDefault:
     pass
 
 
+class ConfigLoadError(RuntimeError):
+    """Raised when a persisted config cannot be loaded safely."""
+
+
 # =============================================================================
 # Defaults class
 # =============================================================================
@@ -57,6 +61,8 @@ class DefaultsConfig(cp.ConfigParser):
         self._dirname = dirname
         self._filename = filename
         self._suffix = ext
+        self._save_generation = 0
+        self._pending_save: tuple[str, tuple[int, int]] | None = None
 
     def _set(self, section: str, option: str, value: Any) -> None:
         """Private set method"""
@@ -67,7 +73,33 @@ class DefaultsConfig(cp.ConfigParser):
 
         super().set(section, option, value)
 
-    def save(self) -> None:
+    def _save_snapshot_to(self, path: str) -> None:
+        """Atomically write the current parser state to an auxiliary path."""
+        directory = osp.dirname(path)
+        os.makedirs(directory, exist_ok=True)
+        temp_path = ""
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=directory,
+                prefix=f".{osp.basename(path)}.",
+                delete=False,
+            ) as configfile:
+                temp_path = configfile.name
+                self.write(configfile)
+                configfile.flush()
+                os.fsync(configfile.fileno())
+            os.replace(temp_path, path)
+            temp_path = ""
+        finally:
+            if temp_path:
+                try:
+                    os.unlink(temp_path)
+                except FileNotFoundError:
+                    pass
+
+    def save(self) -> int:
         """Save config into the associated file."""
         os.makedirs(self._dirname, exist_ok=True)
 
@@ -85,14 +117,71 @@ class DefaultsConfig(cp.ConfigParser):
                 self.write(configfile)
                 configfile.flush()
                 os.fsync(configfile.fileno())
+                temp_stat = os.fstat(configfile.fileno())
 
+            self._pending_save = (
+                temp_path,
+                (temp_stat.st_dev, temp_stat.st_ino),
+            )
             os.replace(temp_path, self.config_path)
+            temp_path = ""
+            self._save_generation += 1
+            self._pending_save = None
+            if os.name != "nt":
+                try:
+                    directory_fd = os.open(
+                        self._dirname,
+                        os.O_RDONLY
+                        | getattr(os, "O_DIRECTORY", 0)
+                        | getattr(os, "O_CLOEXEC", 0),
+                    )
+                    try:
+                        os.fsync(directory_fd)
+                    finally:
+                        os.close(directory_fd)
+                except OSError:
+                    # The replace is the commit point. Do not report a published
+                    # configuration as uncommitted when directory fsync is unsupported.
+                    pass
         finally:
             if temp_path:
                 try:
                     os.unlink(temp_path)
                 except FileNotFoundError:
                     pass
+
+        return self._save_generation
+
+    @property
+    def save_generation(self) -> int:
+        """Return the number of file replacements completed by this instance."""
+        return self._save_generation
+
+    def save_committed_since(self, generation: int) -> bool:
+        """Return whether a save committed after ``generation`` was observed."""
+        if self._save_generation != generation:
+            self._pending_save = None
+            return True
+        if self._pending_save is None:
+            return False
+        temp_path, expected_identity = self._pending_save
+        if osp.lexists(temp_path):
+            return False
+        try:
+            target_stat = os.stat(self.config_path, follow_symlinks=False)
+        except OSError:
+            self._pending_save = None
+            return False
+        if (target_stat.st_dev, target_stat.st_ino) != expected_identity:
+            self._pending_save = None
+            return False
+
+        # A BaseException can land after os.replace but before save() records its
+        # generation. Consume that commit proof once so it cannot validate a later,
+        # failed save.
+        self._save_generation += 1
+        self._pending_save = None
+        return True
 
     @property
     def config_path(self) -> str:
@@ -131,6 +220,7 @@ class UserConfig(DefaultsConfig):
         version: Version = Version("0.0.0"),
         backup: bool = False,
         remove_obsolete: bool = False,
+        recover_from_backup: bool = True,
     ) -> None:
         super().__init__(path=path)
 
@@ -151,14 +241,22 @@ class UserConfig(DefaultsConfig):
 
         if load:
             # If config file already exists, it overrides Default options.
+            primary_exists = osp.lexists(self.config_path)
             loaded_from_primary = self._load_from_ini(self.config_path)
 
             if not loaded_from_primary:
                 backup_path = self.backup_path_for_version(None)
-                loaded_from_backup = self._load_from_ini(backup_path)
+                if not recover_from_backup and (
+                    primary_exists or osp.lexists(backup_path)
+                ):
+                    raise ConfigLoadError(
+                        f"Cannot safely recover persisted state from {self.config_path}"
+                    )
+                if recover_from_backup:
+                    loaded_from_backup = self._load_from_ini(backup_path)
 
-                if loaded_from_backup:
-                    logger.warning("Restored config from backup: %s", backup_path)
+                    if loaded_from_backup:
+                        logger.warning("Restored config from backup: %s", backup_path)
             elif backup:
                 self._make_backup()
 
@@ -230,24 +328,69 @@ class UserConfig(DefaultsConfig):
         :returns: Whether a valid config file was loaded.
         """
         with self._lock:
+            parsed = cp.ConfigParser(interpolation=None)
+
             try:
-                loaded_paths = self.read(path, encoding="utf-8")
+                loaded_paths = parsed.read(path, encoding="utf-8")
                 if not loaded_paths:
                     return False
 
-                self.get_version()
+                Version(
+                    parsed.get(
+                        UserConfig.DEFAULT_SECTION_NAME,
+                        "version",
+                        raw=True,
+                    )
+                )
             except (cp.Error, InvalidVersion, UnicodeError):
                 logger.error("Could not load config file: %s", path, exc_info=True)
-                super().clear()
-                self.reset_to_defaults(save=False)
                 return False
 
+            merged = cp.ConfigParser(interpolation=None)
+            self._copy_parser_state(self, merged)
+            self._overlay_parser_state(parsed, merged)
+            self._copy_parser_state(merged, self)
             return True
 
-    def save(self) -> None:
+    @staticmethod
+    def _copy_parser_state(
+        source: cp.ConfigParser,
+        target: cp.ConfigParser,
+    ) -> None:
+        """Replace one parser's values without calling overridden mutators."""
+        for section in target.sections():
+            cp.RawConfigParser.remove_section(target, section)
+        target._defaults.clear()  # type: ignore[attr-defined]
+
+        UserConfig._overlay_parser_state(source, target)
+
+    @staticmethod
+    def _overlay_parser_state(
+        source: cp.ConfigParser,
+        target: cp.ConfigParser,
+    ) -> None:
+        """Overlay explicit parser values without calling overridden mutators."""
+
+        for option, value in source.defaults().items():
+            cp.RawConfigParser.set(
+                target,
+                target.default_section,
+                option,
+                value,
+            )
+
+        for section in source.sections():
+            if not target.has_section(section):
+                cp.RawConfigParser.add_section(target, section)
+            for option, value in source._sections[section].items():  # type: ignore[attr-defined]
+                cp.RawConfigParser.set(target, section, option, value)
+
+    def save(self) -> int:
         """Atomically save the config into its associated file."""
         with self._lock:
-            super().save()
+            if self._backup:
+                self._save_snapshot_to(self.backup_path_for_version(None))
+            return super().save()
 
     def remove_deprecated_options(self, save: bool = True) -> None:
         """
@@ -329,13 +472,39 @@ class UserConfig(DefaultsConfig):
         :param save: Whether to save the changes to the drive.
         """
         with self._lock:
-            for sec, options in self.default_config.items():
-                if section is None or section == sec:
-                    for option in options:
-                        value = options[option]
-                        self._set(sec, option, value)
-            if save:
-                self.save()
+            snapshot = self._configuration_snapshot() if save else None
+            save_generation = self.save_generation
+            try:
+                for sec, options in self.default_config.items():
+                    if section is None or section == sec:
+                        for option in options:
+                            value = options[option]
+                            self._set(sec, option, value)
+                if save:
+                    self.save()
+            except BaseException:
+                if snapshot is not None and not self.save_committed_since(
+                    save_generation
+                ):
+                    self._restore_configuration_snapshot(snapshot)
+                raise
+
+    def _configuration_snapshot(
+        self,
+    ) -> tuple[dict[str, Any], dict[str, Any], _DefaultsType]:
+        """Return parser state which can be restored after a failed save."""
+        return (
+            copy.deepcopy(self._sections),
+            copy.deepcopy(self._defaults),
+            copy.deepcopy(self.default_config),
+        )
+
+    def _restore_configuration_snapshot(
+        self,
+        snapshot: tuple[dict[str, Any], dict[str, Any], _DefaultsType],
+    ) -> None:
+        """Restore parser state after a save failed before its commit point."""
+        self._sections, self._defaults, self.default_config = snapshot
 
     def get_default(self, section: str, option: str) -> Any:
         """
@@ -422,26 +591,34 @@ class UserConfig(DefaultsConfig):
         :param save: Whether to save the changes to the drive.
         """
         with self._lock:
+            snapshot = self._configuration_snapshot() if save else None
+            save_generation = self.save_generation
             default_value = self.get_default(section, option)
+            try:
+                if default_value is NoDefault:
+                    default_value = value
+                    self.set_default(section, option, default_value)
 
-            if default_value is NoDefault:
-                default_value = value
-                self.set_default(section, option, default_value)
+                if isinstance(default_value, float) and isinstance(value, int):
+                    value = float(value)
 
-            if isinstance(default_value, float) and isinstance(value, int):
-                value = float(value)
+                if type(default_value) is not type(value):
+                    raise ValueError(
+                        f"Inconsistent type for config value [{section}][{option}]. "
+                        f"Expected {default_value.__class__.__name__} but "
+                        f"got {value.__class__.__name__}."
+                    )
 
-            if type(default_value) is not type(value):
-                raise ValueError(
-                    f"Inconsistent type for config value [{section}][{option}]. "
-                    f"Expected {default_value.__class__.__name__} but "
-                    f"got {value.__class__.__name__}."
-                )
+                self._set(section, option, value)
 
-            self._set(section, option, value)
-
-            if save:
-                self.save()
+                if save:
+                    self.save()
+            except BaseException:
+                if snapshot is not None and not self.save_committed_since(
+                    save_generation
+                ):
+                    self._restore_configuration_snapshot(snapshot)
+                raise
 
     def remove_section(self, section: str, save: bool = True) -> bool:
         """
@@ -452,10 +629,19 @@ class UserConfig(DefaultsConfig):
         :returns: Whether the section was removed successfully.
         """
         with self._lock:
-            res = super().remove_section(section)
-            if save:
-                self.save()
-            return res
+            snapshot = self._configuration_snapshot() if save else None
+            save_generation = self.save_generation
+            try:
+                res = super().remove_section(section)
+                if save:
+                    self.save()
+                return res
+            except BaseException:
+                if snapshot is not None and not self.save_committed_since(
+                    save_generation
+                ):
+                    self._restore_configuration_snapshot(snapshot)
+                raise
 
     def remove_option(self, section: str, option: str, save: bool = True) -> bool:
         """
@@ -467,10 +653,19 @@ class UserConfig(DefaultsConfig):
         :returns: Whether the section was removed successfully.
         """
         with self._lock:
-            res = super().remove_option(section, option)
-            if save:
-                self.save()
-            return res
+            snapshot = self._configuration_snapshot() if save else None
+            save_generation = self.save_generation
+            try:
+                res = super().remove_option(section, option)
+                if save:
+                    self.save()
+                return res
+            except BaseException:
+                if snapshot is not None and not self.save_committed_since(
+                    save_generation
+                ):
+                    self._restore_configuration_snapshot(snapshot)
+                raise
 
     def cleanup(self) -> None:
         """Remove files associated with config and reset to defaults."""
@@ -542,38 +737,42 @@ class PersistentMutableSet(MutableSet[_T]):
         with self._lock:
             return len(self._conf.get(self.section, self.option))
 
+    def _save_entries(self, entries: Iterable[_T]) -> None:
+        with self._conf._lock:
+            previous = self._conf.get(self.section, self.option)
+            updated = list(entries)
+            if set(previous) == set(updated):
+                return
+            self._conf.set(self.section, self.option, updated)
+
     def add(self, entry: _T) -> None:
         with self._lock:
-            state_list = self._conf.get(self.section, self.option)
-            state_list = set(state_list)
-            state_list.add(entry)
-            self._conf.set(self.section, self.option, list(state_list))
+            entries = set(self._conf.get(self.section, self.option))
+            entries.add(entry)
+            self._save_entries(entries)
 
     def discard(self, entry: _T) -> None:
         with self._lock:
-            state_list = self._conf.get(self.section, self.option)
-            state_list = set(state_list)
-            state_list.discard(entry)
-            self._conf.set(self.section, self.option, list(state_list))
+            entries = set(self._conf.get(self.section, self.option))
+            entries.discard(entry)
+            self._save_entries(entries)
 
     def update(self, *others: Iterable[_T]) -> None:
         with self._lock:
-            state_list = self._conf.get(self.section, self.option)
-            state_list = set(state_list)
-            state_list.update(*others)
-            self._conf.set(self.section, self.option, list(state_list))
+            entries = set(self._conf.get(self.section, self.option))
+            entries.update(*others)
+            self._save_entries(entries)
 
     def difference_update(self, *others: Iterable[_T]) -> None:
         with self._lock:
-            state_list = self._conf.get(self.section, self.option)
-            state_list = set(state_list)
-            state_list.difference_update(*others)
-            self._conf.set(self.section, self.option, list(state_list))
+            entries = set(self._conf.get(self.section, self.option))
+            entries.difference_update(*others)
+            self._save_entries(entries)
 
     def clear(self) -> None:
         """Clears all elements."""
         with self._lock:
-            self._conf.set(self.section, self.option, [])
+            self._save_entries([])
 
     def __repr__(self) -> str:
         return (

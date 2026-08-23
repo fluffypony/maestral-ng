@@ -5,9 +5,10 @@ from typing import List, TypeVar
 
 from ..utils.appdirs import get_conf_path, get_data_path
 from .main import MaestralConfig, MaestralState
-from .user import PersistentMutableSet
+from .user import ConfigLoadError, PersistentMutableSet, UserConfig
 
 __all__ = [
+    "ConfigLoadError",
     "MaestralConfig",
     "MaestralState",
     "PersistentMutableSet",
@@ -51,7 +52,11 @@ def remove_configuration(config_name: str) -> None:
     """
 
     MaestralConfig(config_name).cleanup()
-    MaestralState(config_name).cleanup()
+    try:
+        MaestralState(config_name).cleanup()
+    except ConfigLoadError:
+        state_path = get_data_path("maestral", f"{config_name}.state")
+        UserConfig(state_path, load=False).cleanup()
 
     data_path = get_data_path("maestral")
 

@@ -5,13 +5,14 @@ existing config or state instances for a specified config_name.
 
 from __future__ import annotations
 
+import os.path as osp
 import threading
 
 from packaging.version import Version
 
 from .. import __version__
 from ..utils.appdirs import get_conf_path, get_data_path
-from .user import UserConfig, _DefaultsType
+from .user import ConfigLoadError, UserConfig, _DefaultsType
 
 CONFIG_DIR_NAME = "maestral"
 
@@ -40,6 +41,7 @@ DEFAULTS_CONFIG: _DefaultsType = {
         "selective_sync_mode": "exclude",  # "exclude" or "include"
         "selective_sync_paths": [],  # paths selected by selective sync mode
         "ignore_symlinks": False,  # leave local symbolic links unmanaged
+        "root_marker_id": "",  # random identity stored in the local root marker
         "max_cpu_percent": 20.0,  # max CPU usage target (100% = all cores busy)
         "keep_history": 60 * 60 * 24 * 7,  # default: one week
         "upload": True,  # if download sync is enabled
@@ -60,6 +62,7 @@ DEFAULTS_STATE: _DefaultsType = {
         "path_root_type": "user",  # the root folder type: team or user
         "path_root_nsid": "",  # the namespace id of the root path
         "home_path": "",  # the path of the user folder if not the root path
+        "path_root_migration": {},  # durable root-layout migration journal
     },
     "app": {  # app state
         "updated_scripts_completed": __version__,
@@ -74,6 +77,14 @@ DEFAULTS_STATE: _DefaultsType = {
         "pending_uploads": [],  # incomplete uploads to retry on next sync
         "pending_downloads": [],  # incomplete downloads to retry on next sync
         "ignored_symlink_paths": [],  # local symlink overlays ignored by sync
+    },
+    "recovery": {
+        "sync_reset": {},  # durable sync-state or unlink reset journal
+        "local_evacuations": {},  # local items held during remote changes
+        "case_changes": {},  # local case-only renames awaiting index updates
+        "local_paths": {},  # recovered local items awaiting upload
+        "download_intents": {},  # targeted include and restore requests
+        "root_move": {},  # local Dropbox root move awaiting config update
     },
 }
 
@@ -105,25 +116,19 @@ def _get_conf(
     config_path: str,
     defaults: _DefaultsType,
     registry: dict[str, UserConfig],
+    *,
+    recover_from_backup: bool = True,
 ) -> UserConfig:
     try:
         conf = registry[config_name]
     except KeyError:
-        try:
-            conf = UserConfig(
-                config_path,
-                defaults=defaults,
-                version=CONF_VERSION,
-                backup=True,
-            )
-        except OSError:
-            conf = UserConfig(
-                config_path,
-                defaults=defaults,
-                version=CONF_VERSION,
-                backup=True,
-                load=False,
-            )
+        conf = UserConfig(
+            config_path,
+            defaults=defaults,
+            version=CONF_VERSION,
+            backup=recover_from_backup,
+            recover_from_backup=recover_from_backup,
+        )
 
         registry[config_name] = conf
 
@@ -149,18 +154,35 @@ def MaestralConfig(config_name: str) -> UserConfig:
         # Migrate the old exclusion list to the single selective-sync model. UserConfig
         # keeps unknown options until this point, so old data remains available even
         # though ``excluded_items`` is no longer a default option.
-        legacy_items: list[str] | None = None
-        for section in ("sync", "main"):
-            if conf.has_option(section, "excluded_items"):
-                legacy_items = conf.get(section, "excluded_items")
-                break
+        with conf._lock:
+            legacy_options = [
+                (section, conf.get(section, "excluded_items"))
+                for section in ("sync", "main")
+                if conf.has_option(section, "excluded_items")
+            ]
 
-        if legacy_items is not None:
-            conf.set("sync", "selective_sync_mode", "exclude", save=False)
-            conf.set("sync", "selective_sync_paths", legacy_items, save=False)
-            for section in ("sync", "main"):
-                conf.remove_option(section, "excluded_items", save=False)
-            conf.save()
+            if legacy_options:
+                old_mode = conf.get("sync", "selective_sync_mode")
+                old_paths = conf.get("sync", "selective_sync_paths")
+                save_generation = conf.save_generation
+                try:
+                    conf.set("sync", "selective_sync_mode", "exclude", save=False)
+                    conf.set(
+                        "sync",
+                        "selective_sync_paths",
+                        legacy_options[0][1],
+                        save=False,
+                    )
+                    for section, _ in legacy_options:
+                        conf.remove_option(section, "excluded_items", save=False)
+                    conf.save()
+                except BaseException:
+                    if not conf.save_committed_since(save_generation):
+                        conf._set("sync", "selective_sync_mode", old_mode)
+                        conf._set("sync", "selective_sync_paths", old_paths)
+                        for section, value in legacy_options:
+                            conf._set(section, "excluded_items", value)
+                    raise
 
         return conf
 
@@ -179,4 +201,26 @@ def MaestralState(config_name: str) -> UserConfig:
     """
     with _state_lock:
         state_path = get_data_path(CONFIG_DIR_NAME, f"{config_name}.state")
-        return _get_conf(config_name, state_path, DEFAULTS_STATE, _state_instances)
+        state_filename, state_suffix = osp.splitext(osp.basename(state_path))
+        state_backup_path = osp.join(
+            osp.dirname(state_path),
+            "backups",
+            f"{state_filename}.{state_suffix}.bak",
+        )
+        database_path = get_data_path(CONFIG_DIR_NAME, f"{config_name}.db")
+        linked_profile = bool(MaestralConfig(config_name).get("auth", "account_id"))
+        if (
+            not osp.lexists(state_path)
+            and not osp.lexists(state_backup_path)
+            and (linked_profile or osp.lexists(database_path))
+        ):
+            raise ConfigLoadError(
+                f"Cannot safely recreate missing state for profile {config_name}"
+            )
+        return _get_conf(
+            config_name,
+            state_path,
+            DEFAULTS_STATE,
+            _state_instances,
+            recover_from_backup=False,
+        )
