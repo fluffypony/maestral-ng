@@ -9,6 +9,7 @@ memory is constrained.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from typing import Any, Generator, Generic, Optional, TypeVar, Union, cast, overload
 from weakref import WeakValueDictionary
 
@@ -93,7 +94,7 @@ class Column(Generic[T, ST]):
 
         return cast(Optional[T], res)
 
-    def __set__(self, obj: Any, value: T) -> None:
+    def __set__(self, obj: Any, value: T | None) -> None:
         setattr(obj, self.private_name, value)
 
     def render_constraints(self) -> str:
@@ -398,6 +399,59 @@ class Manager(Generic[M]):
             self._cache[pk_sql] = obj
         else:
             self.save(obj)
+
+    def update_many(self, objs: Iterable[M]) -> None:
+        """Update existing model objects in one database transaction."""
+        items = list(objs)
+        if not items:
+            return
+
+        rows: list[list[SQLSafeType]] = []
+        cache_entries: list[tuple[SQLSafeType, M]] = []
+
+        for obj in items:
+            pk_sql = self._get_primary_key(obj)
+            if pk_sql is None:
+                raise ValueError("Primary key is required to update row")
+
+            sql_vals = [col.py_to_sql(getattr(obj, col.name)) for col in self._columns]
+            rows.append(sql_vals + [pk_sql])
+            cache_entries.append((pk_sql, obj))
+
+        try:
+            self.db.executemany(self._sql_update_template, rows)
+        except BaseException:
+            self.clear_cache()
+            raise
+
+        for pk_sql, obj in cache_entries:
+            self._cache[pk_sql] = obj
+
+    def replace_matching(self, query: Query, obj: M) -> None:
+        """Delete matching rows and insert one model object in one transaction."""
+        pk_sql = self._get_primary_key(obj)
+        if pk_sql is None:
+            raise ValueError("Primary key is required to replace rows")
+
+        clause, query_args = query.clause()
+        delete_sql = f"DELETE FROM {self.table_name} WHERE {clause}"
+        insert_args = tuple(
+            col.py_to_sql(getattr(obj, col.name)) for col in self._columns
+        )
+
+        try:
+            self.db.execute_batch(
+                (
+                    (delete_sql, tuple(query_args)),
+                    (self._sql_insert_template, insert_args),
+                )
+            )
+        except BaseException:
+            self.clear_cache()
+            raise
+
+        self.clear_cache()
+        self._cache[pk_sql] = obj
 
     def count(self) -> int:
         """Returns the number of rows in the table."""

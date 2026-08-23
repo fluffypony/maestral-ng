@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import difflib
+import errno
 import gc
 import logging
 import mimetypes
@@ -12,7 +13,6 @@ import mimetypes
 import os
 import os.path as osp
 import random
-import shutil
 import sqlite3
 import tempfile
 import threading
@@ -20,12 +20,12 @@ import time
 from asyncio import AbstractEventLoop, Future
 from collections import deque
 from datetime import datetime, timezone
+from stat import S_ISDIR
 from typing import Any, Collection, Iterator, Sequence
 
 # external imports
 import requests
 from packaging.version import Version
-from watchdog.events import DirDeletedEvent, FileDeletedEvent
 
 try:
     from systemd import journal
@@ -45,6 +45,7 @@ from .constants import (
     IS_MACOS,
     IS_WINDOWS,
     PAUSED,
+    ROOT_MARKER_FILE,
     FileStatus,
 )
 from .core import (
@@ -66,6 +67,7 @@ from .exceptions import (
     NoDropboxDirError,
     NotFoundError,
     NotLinkedError,
+    SymlinkError,
     UnsupportedFileTypeForDiff,
     UpdateCheckError,
 )
@@ -80,13 +82,19 @@ from .logging import (
 from .manager import SyncManager
 from .models import SyncErrorEntry, SyncEvent, SyncStatus
 from .sync import SyncDirection, SyncEngine
-from .utils import get_newer_version
+from .utils import exc_info_tuple, get_newer_version
 from .utils.appdirs import get_cache_path, get_data_path
 from .utils.path import (
-    delete,
-    isdir,
-    to_existing_unnormalized_path,
+    create_rooted_tempfile,
+    is_fs_link,
 )
+from .utils.path import makedirs as rooted_makedirs
+from .utils.path import mkdir as rooted_mkdir
+from .utils.path import (
+    move,
+    rooted_tree_snapshot,
+)
+from .utils.path import unlink as rooted_unlink
 
 __all__ = ["Maestral"]
 
@@ -170,6 +178,7 @@ class Maestral:
         self._state = MaestralState(self.config_name)
         self._logger = scoped_logger(__name__, self.config_name)
         self.cred_storage = CredentialStorage(self.config_name)
+        self._resume_pending_unlink_credentials()
         self._notification_snooze_until = 0.0
 
         # Set up logging.
@@ -196,6 +205,7 @@ class Maestral:
             maxlen=100
         )
         self._sync_event_stream_closed = False
+        self._recover_pending_dropbox_root_move()
         self.sync = SyncEngine(self.client, event_callback=self._publish_sync_events)
         self.manager = SyncManager(self.sync)
 
@@ -290,12 +300,29 @@ class Maestral:
             plain text when no secure keyring is available.
         :returns: 0 on success, 1 for an invalid token and 2 for connection errors.
         """
-        return self.client.link(
-            code=code,
-            refresh_token=refresh_token,
-            access_token=access_token,
-            allow_plaintext_keyring=allow_plaintext_keyring,
-        )
+        with self.sync.sync_lock:
+            reset = self._state.get("recovery", "sync_reset")
+            if isinstance(reset, dict) and reset.get("kind") == "unlink":
+                pending = self._root_bound_recovery_names()
+                if pending:
+                    raise MaestralApiError(
+                        "Cannot link Dropbox account",
+                        "Finish the old account recovery first: " + ", ".join(pending),
+                    )
+                self._resume_pending_unlink_credentials()
+                self.sync._complete_pending_sync_reset()
+                self.manager.reload_download_queue()
+                if self._state.get("recovery", "sync_reset"):
+                    raise MaestralApiError(
+                        "Cannot link Dropbox account",
+                        "Unlock the old credential store and try again.",
+                    )
+            return self.client.link(
+                code=code,
+                refresh_token=refresh_token,
+                access_token=access_token,
+                allow_plaintext_keyring=allow_plaintext_keyring,
+            )
 
     def unlink(self) -> None:
         """
@@ -307,27 +334,83 @@ class Maestral:
         :raises NotLinkedError: if no Dropbox account is linked.
         """
         self._check_linked()
-        self.stop_sync()
-
+        self.sync._ensure_unlink_recovery_clear()
+        stop_state = self.manager.pause_for_internal_operation()
         try:
-            self.client.unlink()
-        except (ConnectionError, MaestralApiError):
-            self._logger.debug("Could not invalidate token with Dropbox", exc_info=True)
-        except KeyringAccessError:
-            self._logger.debug("Could not remove token from keyring", exc_info=True)
+            with self.sync.sync_lock:
+                self.sync._ensure_unlink_recovery_clear()
+                self.manager.begin_unlink_reset(
+                    stop_state,
+                    account_id=self._conf.get("auth", "account_id"),
+                    keyring=self._conf.get("auth", "keyring"),
+                    root_path=self._conf.get("sync", "path"),
+                    root_marker_id=self._conf.get("sync", "root_marker_id"),
+                )
 
-        try:
-            self.cred_storage.delete_creds()
-        except KeyringAccessError:
-            self._logger.debug("Could not remove token from keyring", exc_info=True)
+                try:
+                    self.client.unlink()
+                except (ConnectionError, MaestralApiError):
+                    self._logger.debug(
+                        "Could not invalidate token with Dropbox", exc_info=True
+                    )
+                except KeyringAccessError:
+                    self._logger.debug(
+                        "Could not remove token from keyring", exc_info=True
+                    )
 
-        # Clean up config and state files.
-        self._conf.cleanup()
-        self._state.cleanup()
-        self.sync.reset_sync_state()
-        self.sync.reload_cached_config()
+                self._resume_pending_unlink_credentials()
 
+                self.sync._complete_pending_sync_reset()
+                self.manager.reload_download_queue()
+        except BaseException:
+            if not self._state.get("recovery", "sync_reset"):
+                self.manager.resume_after_internal_stop(stop_state)
+            else:
+                self.manager._finish_internal_operation(stop_state)
+            raise
+
+        self.manager._finish_internal_operation(stop_state)
         self._logger.info("Unlinked Dropbox account.")
+
+    def _root_bound_recovery_names(self) -> tuple[str, ...]:
+        """Return saved work which belongs to the configured account root."""
+        values = {
+            "local evacuations": self._state.get("recovery", "local_evacuations"),
+            "local paths": self._state.get("recovery", "local_paths"),
+            "case changes": self._state.get("recovery", "case_changes"),
+            "root move": self._state.get("recovery", "root_move"),
+            "path-root migration": self._state.get("account", "path_root_migration"),
+        }
+        return tuple(name for name, value in values.items() if value != {})
+
+    def _resume_pending_unlink_credentials(self) -> bool:
+        """Retry credential deletion recorded before an interrupted unlink."""
+        journal = self._state.get("recovery", "sync_reset")
+        if not isinstance(journal, dict) or journal.get("kind") != "unlink":
+            return True
+        if self._root_bound_recovery_names():
+            return False
+        if journal.get("credentials_deleted") is True:
+            return True
+        account_id = journal.get("account_id")
+        keyring_name = journal.get("keyring")
+        if not isinstance(account_id, str) or not isinstance(keyring_name, str):
+            return False
+
+        try:
+            self.cred_storage.delete_creds(account_id, keyring_name)
+        except KeyringAccessError:
+            self._logger.debug("Could not remove token from keyring", exc_info=True)
+            return False
+
+        with self._state._lock:
+            current = self._state.get("recovery", "sync_reset")
+            if current != journal:
+                return False
+            journal = journal.copy()
+            journal["credentials_deleted"] = True
+            self._state.set("recovery", "sync_reset", journal)
+        return True
 
     # ==== Methods to access config and saved state ====================================
 
@@ -344,13 +427,27 @@ class Maestral:
         :param name: Name of config option.
         :param value: Config value. May be any type accepted by :obj:`ast.literal_eval`.
         """
-        if section == "sync" and name in {
-            "selective_sync_mode",
-            "selective_sync_paths",
+        normalised_section = section.lower()
+        normalised_name = name.lower()
+
+        if (
+            normalised_section == "sync"
+            and normalised_name
+            in {
+                "selective_sync_mode",
+                "selective_sync_paths",
+                "ignore_symlinks",
+            }
+        ) or (
+            normalised_section in {"main", "sync"}
+            and normalised_name == "excluded_items"
+        ):
+            raise ValueError("Use the selective-sync or symlink API for this setting")
+        if normalised_section == "sync" and normalised_name in {
+            "path",
+            "root_marker_id",
         }:
-            raise ValueError(
-                "Use set_selective_sync to update the mode and paths together"
-            )
+            raise ValueError("Use the Dropbox root API for this setting")
         self._conf.set(section, name, value)
 
     def get_conf(self, section: str, name: str) -> Any:
@@ -866,9 +963,77 @@ class Maestral:
         if account_info.profile_photo_url:
             with convert_api_errors():
                 res = requests.get(account_info.profile_photo_url)
-                with open(self.account_profile_pic_path, "wb") as f:
-                    f.write(res.content)
-            return self.account_profile_pic_path
+                cache = self._profile_pic_cache_dir()
+                if cache is None:
+                    raise SymlinkError(
+                        "Cannot cache profile picture",
+                        "The profile picture cache is not a safe directory.",
+                        local_path=get_cache_path("maestral"),
+                    )
+                cache_path, cache_stat = cache
+                profile_path = osp.join(
+                    cache_path,
+                    f"{self._config_name}_profile_pic.jpeg",
+                )
+                cache_identity = (
+                    cache_stat.st_dev,
+                    cache_stat.st_ino,
+                    cache_stat.st_mode,
+                )
+                temporary_file = create_rooted_tempfile(
+                    cache_path,
+                    cache_path,
+                    expected_root_identity=cache_identity,
+                    prefix=f".{self._config_name}_profile_pic-",
+                )
+                try:
+                    with temporary_file.open("wb") as file:
+                        file.write(res.content)
+                        file.flush()
+                        os.fsync(file.fileno())
+                    temporary_file.close()
+
+                    try:
+                        target_snapshot = rooted_tree_snapshot(
+                            profile_path,
+                            cache_path,
+                            expected_root_identity=cache_identity,
+                        )
+                    except (FileNotFoundError, NotADirectoryError):
+                        target_snapshot = {}
+                    target_identity = target_snapshot.get(profile_path)
+                    if target_identity is not None:
+                        try:
+                            rooted_unlink(
+                                profile_path,
+                                root_path=cache_path,
+                                expected_root_identity=cache_identity,
+                                expected_target_identity=target_identity[:6],
+                            )
+                        except FileNotFoundError:
+                            pass
+
+                    move(
+                        temporary_file.path,
+                        profile_path,
+                        replace=False,
+                        raise_error=True,
+                        root_path=cache_path,
+                        expected_root_identity=cache_identity,
+                        expected_source_identity=temporary_file.identity,
+                    )
+                finally:
+                    temporary_file.close()
+                    try:
+                        rooted_unlink(
+                            temporary_file.path,
+                            root_path=cache_path,
+                            expected_root_identity=cache_identity,
+                            expected_target_identity=temporary_file.identity,
+                        )
+                    except (FileNotFoundError, NotADirectoryError):
+                        pass
+            return profile_path
         else:
             self._delete_old_profile_pics()
             return None
@@ -1116,11 +1281,41 @@ class Maestral:
         self._logger.info(IDLE)
         return res
 
+    def _profile_pic_cache_dir(self) -> tuple[str, os.stat_result] | None:
+        cache_path = get_cache_path("maestral")
+        try:
+            cache_stat = os.lstat(cache_path)
+        except (FileNotFoundError, NotADirectoryError):
+            return None
+        if is_fs_link(cache_stat) or not S_ISDIR(cache_stat.st_mode):
+            return None
+        return cache_path, cache_stat
+
     def _delete_old_profile_pics(self) -> None:
-        for file in os.listdir(get_cache_path("maestral")):
-            if file.startswith(f"{self._config_name}_profile_pic"):
+        cache = self._profile_pic_cache_dir()
+        if cache is None:
+            return
+        cache_path, cache_stat = cache
+        cache_identity = (
+            cache_stat.st_dev,
+            cache_stat.st_ino,
+            cache_stat.st_mode,
+        )
+
+        for entry in os.scandir(cache_path):
+            if entry.name.startswith(f"{self._config_name}_profile_pic"):
                 try:
-                    os.unlink(osp.join(get_cache_path("maestral"), file))
+                    entry_stat = entry.stat(follow_symlinks=False)
+                    rooted_unlink(
+                        entry.path,
+                        root_path=cache_path,
+                        expected_root_identity=cache_identity,
+                        expected_target_identity=(
+                            entry_stat.st_dev,
+                            entry_stat.st_ino,
+                            entry_stat.st_mode,
+                        ),
+                    )
                 except OSError:
                     pass
 
@@ -1187,12 +1382,10 @@ class Maestral:
         self._check_linked()
         self._check_dropbox_dir()
 
-        selected_paths = self.sync.clean_selective_sync_paths(dbx_paths)
-        old_mode = self.selective_sync_mode
-        old_paths = self.selective_sync_paths
-
-        if mode == old_mode and selected_paths == old_paths:
-            return
+        selected_paths = self.sync.clean_selective_sync_paths(
+            dbx_paths,
+            validate_local=mode != "exclude",
+        )
 
         if not self.sync.sync_lock.acquire(blocking=False):
             raise BusyError(
@@ -1200,58 +1393,82 @@ class Maestral:
             )
 
         try:
-            paths_to_remove = {
-                entry.dbx_path_lower
-                for entry in self.sync.iter_index()
+            self._check_linked()
+            self.sync._ensure_unlink_not_pending()
+            old_mode = self.selective_sync_mode
+            old_paths = self.selective_sync_paths
+
+            if mode == old_mode and selected_paths == old_paths:
+                return
+
+            indexed_entries = list(self.sync.iter_index())
+            newly_excluded_entries = [
+                entry
+                for entry in indexed_entries
                 if not self.sync._is_path_excluded(
                     entry.dbx_path_lower, old_mode, old_paths
                 )
                 and self.sync._is_path_excluded(
                     entry.dbx_path_lower, mode, selected_paths
                 )
+            ]
+            newly_excluded_paths = {
+                entry.dbx_path_lower for entry in newly_excluded_entries
             }
-            if mode == "exclude":
-                paths_to_remove.update(
+            paths_to_unindex = self.sync.clean_selective_sync_paths(
+                newly_excluded_paths,
+                validate_local=False,
+            )
+            locally_mappable_paths: set[str] = set()
+            for entry in newly_excluded_entries:
+                try:
+                    self.sync.to_local_path_from_cased(entry.dbx_path_cased)
+                except ValueError:
+                    continue
+                locally_mappable_paths.add(entry.dbx_path_lower)
+            paths_to_remove = self.sync.clean_selective_sync_paths(
+                {
                     path
-                    for path in selected_paths
+                    for path in newly_excluded_paths
                     if path != "/"
-                    and not self.sync._is_path_excluded(path, old_mode, old_paths)
-                )
-            paths_to_remove = self.sync.clean_selective_sync_paths(paths_to_remove)
-
-            self.sync.set_selective_sync(mode, selected_paths)
-
-            if self.pending_first_download:
-                return
-
-            for dbx_path_lower in paths_to_remove:
-                self._remove_after_selective_sync(dbx_path_lower)
-                self._logger.info("Excluded %s", dbx_path_lower)
+                    and path in locally_mappable_paths
+                    and self.sync._is_path_managed(path, old_mode, old_paths)
+                }
+            )
+            cased_paths_to_remove = {
+                entry.dbx_path_lower: entry.dbx_path_cased
+                for entry in newly_excluded_entries
+                if entry.dbx_path_lower in paths_to_remove
+            }
 
             paths_to_download = selected_paths if mode == "include" else {"/"}
-            for dbx_path_lower in paths_to_download:
-                self.manager.download_queue.put(dbx_path_lower)
+            recovery_paths = paths_to_download | paths_to_unindex
+            for dbx_path_lower in recovery_paths:
+                if mode == "include" and dbx_path_lower in paths_to_download:
+                    self.sync.queue_targeted_download(dbx_path_lower, "include")
+                else:
+                    self.manager.download_queue.put(dbx_path_lower)
+
+            for dbx_path_lower, dbx_path_cased in cased_paths_to_remove.items():
+                self._remove_local_after_selective_sync(dbx_path_cased)
+                self.sync.clear_sync_errors_for_path(
+                    dbx_path_lower,
+                    recursive=True,
+                )
+                self._logger.info("Excluded %s", dbx_path_lower)
+
+            for dbx_path_lower in paths_to_unindex - cased_paths_to_remove.keys():
+                self.sync.remove_node_from_index(dbx_path_lower)
+                self.sync.clear_sync_errors_for_path(dbx_path_lower, recursive=True)
+
+            self.sync.set_selective_sync(mode, selected_paths)
 
             self._logger.info(IDLE)
         finally:
             self.sync.sync_lock.release()
 
-    def _remove_after_selective_sync(self, dbx_path_lower: str) -> None:
-        # Perform housekeeping.
-        self.sync.remove_node_from_index(dbx_path_lower)
-        self.sync.clear_sync_errors_for_path(dbx_path_lower, recursive=True)
-
-        # Remove item from local drive.
-        local_path_uncased = f"{self.dropbox_path}{dbx_path_lower}"
-
-        try:
-            local_path = to_existing_unnormalized_path(local_path_uncased)
-        except FileNotFoundError:
-            return
-
-        event_cls = DirDeletedEvent if isdir(local_path) else FileDeletedEvent
-        with self.manager.sync.fs_events.ignore(event_cls(local_path)):
-            delete(local_path)
+    def _remove_local_after_selective_sync(self, dbx_path_cased: str) -> None:
+        self.sync.remove_local_after_selective_sync(dbx_path_cased)
 
     def selective_sync_status(self, dbx_path: str) -> str:
         """
@@ -1263,6 +1480,103 @@ class Maestral:
         """
         self._check_linked()
         return self.sync.selective_sync_status(dbx_path)
+
+    def _validated_dropbox_root_move(self) -> dict[str, Any]:
+        """Return the validated durable Dropbox-root move journal."""
+        journal = self._state.get("recovery", "root_move")
+        if journal == {}:
+            return {}
+        if not isinstance(journal, dict):
+            raise MaestralApiError(
+                "Cannot recover Dropbox folder move",
+                "The saved root-move journal is invalid.",
+            )
+        old_path = journal.get("old_path")
+        new_path = journal.get("new_path")
+        identity = journal.get("identity")
+        phase = journal.get("phase")
+        if (
+            not isinstance(old_path, str)
+            or not osp.isabs(old_path)
+            or osp.normpath(old_path) != old_path
+            or not isinstance(new_path, str)
+            or not osp.isabs(new_path)
+            or osp.normpath(new_path) != new_path
+            or old_path == new_path
+            or not isinstance(identity, list)
+            or len(identity) != 3
+            or any(not isinstance(value, int) for value in identity)
+            or phase not in {"planned", "moved"}
+        ):
+            raise MaestralApiError(
+                "Cannot recover Dropbox folder move",
+                "The saved root-move journal has an unsafe entry.",
+            )
+        return {
+            "old_path": old_path,
+            "new_path": new_path,
+            "identity": identity,
+            "phase": phase,
+        }
+
+    def _confirmed_root_identity_at(
+        self,
+        path: str,
+    ) -> tuple[int, int, int] | None:
+        """Return a marker-validated identity for a possible Dropbox root."""
+        try:
+            root_stat = os.lstat(path)
+        except (FileNotFoundError, NotADirectoryError):
+            return None
+        if not S_ISDIR(root_stat.st_mode) or is_fs_link(root_stat):
+            return None
+        identity = (root_stat.st_dev, root_stat.st_ino, root_stat.st_mode)
+        marker_id = self._conf.get("sync", "root_marker_id")
+        if not (
+            isinstance(marker_id, str)
+            and len(marker_id) == 32
+            and all(char in "0123456789abcdef" for char in marker_id)
+        ):
+            return None
+        marker_content = f"maestral-root-v1:{marker_id}\n".encode("ascii")
+        if not SyncEngine._root_marker_matches(
+            osp.join(path, ROOT_MARKER_FILE),
+            marker_content,
+            root_path=path,
+            expected_root_identity=identity,
+        ):
+            return None
+        return identity
+
+    def _recover_pending_dropbox_root_move(self) -> None:
+        """Finish a root move which completed before its config save."""
+        journal = self._validated_dropbox_root_move()
+        if not journal:
+            return
+        expected_identity = tuple(journal["identity"])
+        old_identity = self._confirmed_root_identity_at(journal["old_path"])
+        new_identity = self._confirmed_root_identity_at(journal["new_path"])
+        old_matches = old_identity == expected_identity
+        new_matches = new_identity == expected_identity
+
+        if old_matches and new_identity is None and journal["phase"] == "planned":
+            self._state.set("recovery", "root_move", {})
+            return
+        if new_matches and old_identity is None:
+            journal["phase"] = "moved"
+            self._state.set("recovery", "root_move", journal)
+            sync = getattr(self, "sync", None)
+            if sync is None:
+                self._conf.set("sync", "path", journal["new_path"])
+            else:
+                sync.dropbox_path = journal["new_path"]
+                sync.ensure_dropbox_folder_present()
+            self._state.set("recovery", "root_move", {})
+            return
+        raise MaestralApiError(
+            "Cannot recover Dropbox folder move",
+            "The old and new Dropbox roots do not match the move journal.",
+        )
 
     def move_dropbox_directory(self, new_path: str) -> None:
         """
@@ -1277,6 +1591,16 @@ class Maestral:
         """
         self._check_linked()
         self._check_dropbox_dir()
+        if self._state.get("recovery", "sync_reset"):
+            raise MaestralApiError(
+                "Cannot move Dropbox folder",
+                "Finish the pending sync reset first.",
+            )
+        if self._state.get("account", "path_root_migration"):
+            raise MaestralApiError(
+                "Cannot move Dropbox folder",
+                "Finish the pending Dropbox path-root migration first.",
+            )
 
         self._logger.info("Moving Dropbox folder...")
 
@@ -1290,27 +1614,130 @@ class Maestral:
         except FileNotFoundError:
             pass
 
-        if osp.exists(new_path):
-            raise FileExistsError(f'Path "{new_path}" already exists.')
+        try:
+            common_root = osp.commonpath((old_path, new_path))
+        except ValueError as exc:
+            raise OSError(
+                errno.EXDEV,
+                "The Dropbox root move must stay on one file system.",
+            ) from exc
+        if common_root in {old_path, new_path}:
+            raise ValueError("The old and new Dropbox paths cannot contain each other.")
+        if common_root == osp.abspath(osp.sep):
+            raise OSError(
+                errno.EXDEV,
+                "The Dropbox root move must stay below one safe parent.",
+            )
+        common_stat = os.lstat(common_root)
+        if not S_ISDIR(common_stat.st_mode) or is_fs_link(common_stat):
+            raise OSError("The common path root is not a safe directory.")
+        common_identity = (
+            common_stat.st_dev,
+            common_stat.st_ino,
+            common_stat.st_mode,
+        )
 
         # Pause syncing.
-        was_syncing = self.running
-        self.stop_sync()
+        stop_state = self.manager.pause_for_internal_operation()
+        try:
+            if self._state.get("recovery", "sync_reset"):
+                raise MaestralApiError(
+                    "Cannot move Dropbox folder",
+                    "Finish the pending sync reset first.",
+                )
+            if self._state.get("account", "path_root_migration"):
+                raise MaestralApiError(
+                    "Cannot move Dropbox folder",
+                    "Finish the pending Dropbox path-root migration first.",
+                )
+            self.sync.ensure_dropbox_folder_present()
+            root_identity = self.sync.confirmed_root_identity
+            if not S_ISDIR(root_identity[2]):
+                raise NoDropboxDirError(
+                    "Dropbox folder missing",
+                    "The configured Dropbox root is not a directory.",
+                )
 
-        if osp.isdir(old_path):
-            # Will also create ancestors of new_path if required.
-            shutil.move(old_path, new_path)
+            root_snapshot = rooted_tree_snapshot(
+                old_path,
+                common_root,
+                expected_root_identity=common_identity,
+            )
+            if root_snapshot[old_path][:3] != root_identity:
+                raise OSError(
+                    errno.ESTALE,
+                    "The Dropbox root changed before the move.",
+                    old_path,
+                )
+            symlink_path = next(
+                (
+                    self.sync.to_dbx_path_lower(path)
+                    for path, identity in root_snapshot.items()
+                    if isinstance(identity[6], str)
+                    and identity[6].startswith("symlink:")
+                ),
+                None,
+            )
+            if symlink_path:
+                raise SymlinkError(
+                    "Cannot move Dropbox folder",
+                    "The Dropbox folder contains the symbolic link "
+                    f'"{symlink_path}".',
+                    dbx_path=symlink_path,
+                    local_path=old_path,
+                )
+
+            destination_parent = osp.dirname(new_path)
+            relative_parent = osp.relpath(destination_parent, common_root)
+            current_parent = common_root
+            if relative_parent != osp.curdir:
+                for name in relative_parent.split(osp.sep):
+                    current_parent = osp.join(current_parent, name)
+                    try:
+                        rooted_mkdir(
+                            current_parent,
+                            root_path=common_root,
+                            expected_root_identity=common_identity,
+                        )
+                    except FileExistsError:
+                        pass
+
+            if osp.lexists(new_path):
+                raise FileExistsError(f'Path "{new_path}" already exists.')
+            journal = {
+                "old_path": old_path,
+                "new_path": new_path,
+                "identity": list(root_identity),
+                "phase": "planned",
+            }
+            self.manager.begin_root_move(journal)
+
+            move(
+                old_path,
+                new_path,
+                replace=False,
+                raise_error=True,
+                root_path=common_root,
+                expected_root_identity=common_identity,
+                expected_source_identity=root_identity,
+            )
+            journal["phase"] = "moved"
+            self._state.set("recovery", "root_move", journal)
+
+            self.sync.dropbox_path = new_path
+            self.sync.ensure_dropbox_folder_present()
+            self._state.set("recovery", "root_move", {})
+        except BaseException:
+            try:
+                self._recover_pending_dropbox_root_move()
+            except BaseException:
+                self.manager._finish_internal_operation(stop_state)
+                raise
+            self.manager.resume_after_internal_stop(stop_state)
+            raise
         else:
-            os.makedirs(new_path)
-
-        # Update config file and client.
-        self.sync.dropbox_path = new_path
-
-        self._logger.info(f'Dropbox folder moved to "{new_path}"')
-
-        # Resume syncing.
-        if was_syncing:
-            self.start_sync()
+            self.manager.resume_after_internal_stop(stop_state)
+            self._logger.info(f'Dropbox folder moved to "{new_path}"')
 
     def create_dropbox_directory(self, path: str) -> None:
         """
@@ -1322,27 +1749,71 @@ class Maestral:
         :raises NotLinkedError: if no Dropbox account is linked.
         """
         self._check_linked()
+        if self._state.get("recovery", "sync_reset"):
+            raise MaestralApiError(
+                "Cannot create Dropbox folder",
+                "Finish the pending sync reset first.",
+            )
+        if self._state.get("account", "path_root_migration"):
+            raise MaestralApiError(
+                "Cannot create Dropbox folder",
+                "Finish the pending Dropbox path-root migration first.",
+            )
 
-        # Pause syncing.
-        resume = False
-        if self.running:
-            self.stop_sync()
-            resume = True
+        stop_state = None
 
-        # Perform housekeeping.
-        path = osp.realpath(osp.expanduser(path))
-        self.manager.reset_sync_state()
+        try:
+            stop_state = self.manager.pause_for_internal_operation()
+            if self._state.get("recovery", "sync_reset"):
+                raise MaestralApiError(
+                    "Cannot create Dropbox folder",
+                    "Finish the pending sync reset first.",
+                )
+            if self._state.get("account", "path_root_migration"):
+                raise MaestralApiError(
+                    "Cannot create Dropbox folder",
+                    "Finish the pending Dropbox path-root migration first.",
+                )
 
-        # Create new folder.
-        os.makedirs(path, exist_ok=True)
+            path = osp.normpath(osp.abspath(osp.expanduser(path)))
+            root_identity = rooted_makedirs(path, exist_ok=True)
+            self.manager.reset_sync_state()
+            self.sync.set_dropbox_path(
+                path,
+                expected_root_identity=root_identity,
+            )
+            self.sync.create_root_marker()
+        except BaseException:
+            replay_error: BaseException | None = None
+            try:
+                reset_pending = bool(self._state.get("recovery", "sync_reset"))
+                if reset_pending:
+                    self.sync._complete_pending_sync_reset()
+                    self.manager.reload_download_queue()
+                reset_pending = bool(self._state.get("recovery", "sync_reset"))
+            except BaseException as error:
+                replay_error = error
+                try:
+                    reset_pending = bool(self._state.get("recovery", "sync_reset"))
+                except BaseException:
+                    if stop_state is not None:
+                        self.manager._finish_internal_operation(stop_state)
+                    raise
 
-        # Update config file and client.
-        self.sync.dropbox_path = path
-        self.sync.create_root_marker()
-
-        # Resume syncing.
-        if resume:
-            self.start_sync()
+            if stop_state is not None:
+                if reset_pending:
+                    self.manager._finish_internal_operation(stop_state)
+                else:
+                    self.manager.resume_after_internal_stop(stop_state)
+            if replay_error is not None:
+                self._logger.debug(
+                    "Could not finish the interrupted sync reset",
+                    exc_info=exc_info_tuple(replay_error),
+                )
+            raise
+        else:
+            assert stop_state is not None
+            self.manager.resume_after_internal_stop(stop_state)
 
     def confirm_dropbox_directory(self) -> None:
         """Confirms the configured Dropbox folder as the intended sync root.
@@ -1424,13 +1895,14 @@ class Maestral:
         self.client.revoke_shared_link(url)
 
     def list_shared_links(
-        self, dbx_path: str | None = None
+        self, dbx_path: str | None = None, *, direct_only: bool = False
     ) -> list[SharedLinkMetadata]:
         """
         Returns a list of all shared links for the given Dropbox path. If no path is
         given, return all shared links for the account, up to a maximum of 1,000 links.
 
         :param dbx_path: Path to item on Dropbox.
+        :param direct_only: Only return links which point directly to ``dbx_path``.
         :returns: List of shared link information as dictionaries. See
             :class:`dropbox.sharing.SharedLinkMetadata` for keys and values.
         :raises DropboxAuthError: in case of an invalid access token.
@@ -1439,7 +1911,7 @@ class Maestral:
         :raises NotLinkedError: if no Dropbox account is linked.
         """
         self._check_linked()
-        return self.client.list_shared_links(dbx_path)
+        return self.client.list_shared_links(dbx_path, direct_only=direct_only)
 
     # ==== Utility methods for front ends ==============================================
 
@@ -1522,7 +1994,7 @@ class Maestral:
         """
         Stop syncing and notify anyone monitoring ``shutdown_future`` that we are done.
         """
-        self.stop_sync()
+        self.manager.shutdown()
 
         with self._sync_event_condition:
             self._sync_event_stream_closed = True

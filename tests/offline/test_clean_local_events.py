@@ -1,5 +1,6 @@
 import os.path as osp
 import platform
+from unittest.mock import Mock
 
 import pytest
 from watchdog.events import (
@@ -22,6 +23,7 @@ from maestral.sync import SyncEngine
 def sync():
     sync = SyncEngine(DropboxClient("test-config", CredentialStorage("test-config")))
     sync.dropbox_path = osp.abspath(osp.sep)
+    sync.rescan = Mock()
 
     yield sync
 

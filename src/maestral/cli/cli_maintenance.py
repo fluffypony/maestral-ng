@@ -374,9 +374,6 @@ Currently available config keys are:
 
 \b
 - path: the location of the local Dropbox folder
-- selective_sync_mode: whether selected paths are included or excluded
-- selective_sync_paths: paths selected by the selective-sync mode
-- ignore_symlinks: whether local symbolic links remain unmanaged
 - account_id: the ID of the linked Dropbox account
 - notification_level: the level for desktop notifications
 - log_level: the log level.

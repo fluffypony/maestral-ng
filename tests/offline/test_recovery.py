@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from threading import Event, Thread
 from unittest.mock import Mock
 
 import pytest
@@ -68,28 +69,63 @@ def test_transient_dropbox_error_schedules_sync_restart(
 def test_connection_monitor_restarts_after_server_error(
     m: Maestral, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    m.manager.shutdown()
     m.manager.running.clear()
     m.manager.autostart.set()
     m.manager.connected = True
-    m.manager._connection_helper_running = True
-    m.manager.start = Mock()  # type: ignore[method-assign]
+    m.manager._connection_helper_stop.clear()
+    m.manager.start = Mock(  # type: ignore[method-assign]
+        side_effect=m.manager._connection_helper_stop.set
+    )
 
     def connected_once(*_args, **_kwargs) -> bool:
-        m.manager._connection_helper_running = False
         return True
 
     monkeypatch.setattr(manager_module, "check_connection", connected_once)
-    monkeypatch.setattr(manager_module.time, "sleep", Mock())
 
     m.manager.connection_monitor()
 
     m.manager.start.assert_called_once_with()
 
 
+def test_shutdown_blocks_pending_connection_restart(
+    m: Maestral, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager = m.manager
+    manager.shutdown()
+    manager._connection_helper_stop.clear()
+    manager.autostart.set()
+    manager.start = Mock()  # type: ignore[method-assign]
+    check_started = Event()
+    finish_check = Event()
+
+    def delayed_connection_check(*_args, **_kwargs) -> bool:
+        check_started.set()
+        assert finish_check.wait(timeout=2)
+        return True
+
+    monkeypatch.setattr(manager_module, "check_connection", delayed_connection_check)
+    manager.connection_helper = Thread(target=manager.connection_monitor)
+    manager.connection_helper.start()
+    assert check_started.wait(timeout=2)
+
+    shutdown_thread = Thread(target=manager.shutdown)
+    shutdown_thread.start()
+    assert manager._connection_helper_stop.wait(timeout=2)
+    finish_check.set()
+    shutdown_thread.join(timeout=2)
+    manager.connection_helper.join(timeout=2)
+
+    assert not shutdown_thread.is_alive()
+    assert not manager.connection_helper.is_alive()
+    manager.start.assert_not_called()
+
+
 def test_external_drive_can_retry_same_configured_root(
     m: Maestral, monkeypatch: pytest.MonkeyPatch, tmp_path
 ) -> None:
-    m.manager._connection_helper_running = False
+    m.manager._connection_helper_stop.set()
+    m.manager.connection_helper.join(timeout=2)
     dropbox_path = tmp_path / "External Dropbox"
     m.sync.dropbox_path = str(dropbox_path)
     m.sync.remote_cursor = "saved-cursor"

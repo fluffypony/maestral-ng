@@ -288,6 +288,7 @@ def ls(m: Maestral, long: bool, dropbox_path: str, include_deleted: bool) -> Non
 )
 def config_files(clean: bool) -> None:
     from ..config import (
+        ConfigLoadError,
         MaestralConfig,
         MaestralState,
         list_configs,
@@ -298,10 +299,25 @@ def config_files(clean: bool) -> None:
     if clean:
         # Clean up stale config files.
         for name in list_configs():
-            conf = MaestralConfig(name)
+            try:
+                conf = MaestralConfig(name)
+                state = MaestralState(name)
+            except ConfigLoadError:
+                continue
             dbid = conf.get("auth", "account_id")
+            has_recovery = any(
+                state.get("recovery", option)
+                for option in (
+                    "sync_reset",
+                    "local_evacuations",
+                    "case_changes",
+                    "local_paths",
+                    "download_intents",
+                    "root_move",
+                )
+            ) or bool(state.get("account", "path_root_migration"))
 
-            if dbid == "" and not is_running(name):
+            if dbid == "" and not has_recovery and not is_running(name):
                 remove_configuration(name)
                 echo(f"Removed: {conf.config_path}")
 
@@ -309,8 +325,11 @@ def config_files(clean: bool) -> None:
         # Display config files.
         table = rich_table("Config name", "Account", "Path")
         for name in list_configs():
-            conf = MaestralConfig(name)
-            state = MaestralState(name)
+            try:
+                conf = MaestralConfig(name)
+                state = MaestralState(name)
+            except ConfigLoadError:
+                continue
 
             table.add_row(
                 name,

@@ -1,5 +1,8 @@
+import ntpath
 import os
+from datetime import datetime, timezone
 from pathlib import Path
+from threading import Event, Thread
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -10,10 +13,9 @@ import maestral.config.main as config_main_module
 import maestral.sync as sync_module
 from maestral.client import DropboxClient
 from maestral.config import MaestralConfig
-from maestral.core import ListFolderResult
-from maestral.exceptions import InsufficientPermissionsError
+from maestral.core import FileMetadata, FolderMetadata, ListFolderResult
 from maestral.keyring import CredentialStorage
-from maestral.models import ChangeType, ItemType, SyncEvent, SyncStatus
+from maestral.models import ChangeType, IndexEntry, ItemType, SyncEvent, SyncStatus
 from maestral.sync import Conflict, SyncDirection, SyncEngine
 from maestral.utils.appdirs import get_conf_path
 
@@ -28,6 +30,7 @@ def make_sync_engine(config_name: str, dropbox_path: Path) -> SyncEngine:
 @pytest.fixture
 def sync_engine(config_name: str, tmp_path: Path):
     sync = make_sync_engine(config_name, tmp_path)
+    sync.create_root_marker()
     yield sync
     sync._connection.close()
 
@@ -82,27 +85,98 @@ def test_legacy_exclusions_migrate_to_selective_sync(config_name: str) -> None:
     assert "excluded_items" not in config_path.read_text()
 
 
+def test_legacy_windows_invalid_exclusion_loads(
+    config_name: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_main_module._config_instances.pop(config_name, None)
+    config_path = Path(get_conf_path("maestral", f"{config_name}.ini"))
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(
+        "[main]\nversion = 20.0\n\n[sync]\n" "excluded_items = ['/name:stream']\n"
+    )
+    monkeypatch.setattr(sync_module, "osp", ntpath)
+    conf = MaestralConfig(config_name)
+    sync = SyncEngine(DropboxClient(config_name, CredentialStorage(config_name)))
+
+    try:
+        assert conf.get("sync", "selective_sync_mode") == "exclude"
+        assert sync.selective_sync_paths == {"/name:stream"}
+    finally:
+        sync._connection.close()
+
+
 def prepare_local_move(sync: SyncEngine) -> None:
     sync._handle_selective_sync_conflict = Mock(return_value=False)
     sync._handle_normalization_conflict = Mock(return_value=False)
-    sync.remove_node_from_index = Mock()
-    sync._handle_upload_conflict = Mock(return_value=False)
-    sync._update_index_recursive = Mock()
+
+
+def add_move_file_index_entry(
+    sync: SyncEngine,
+    dbx_path: str,
+    content_hash: str,
+    *,
+    dbx_id: str = "id:source",
+    rev: str = "source-rev",
+) -> None:
+    with sync._database_access():
+        sync._index_table.update(
+            IndexEntry(
+                dbx_path_lower=dbx_path.lower(),
+                dbx_path_cased=dbx_path,
+                dbx_id=dbx_id,
+                item_type=ItemType.File,
+                last_sync=1,
+                rev=rev,
+                content_hash=content_hash,
+                symlink_target=None,
+            )
+        )
+
+
+def make_moved_file_metadata(
+    dbx_path: str,
+    content_hash: str,
+    *,
+    dbx_id: str = "id:source",
+    rev: str = "source-rev",
+) -> FileMetadata:
+    now = datetime.now(tz=timezone.utc)
+    return FileMetadata(
+        name=dbx_path.rsplit("/", maxsplit=1)[-1],
+        path_lower=dbx_path.lower(),
+        path_display=dbx_path,
+        id=dbx_id,
+        client_modified=now,
+        server_modified=now,
+        rev=rev,
+        size=0,
+        symlink_target=None,
+        shared=False,
+        modified_by="id:user",
+        is_downloadable=True,
+        content_hash=content_hash,
+    )
 
 
 def test_case_only_move_does_not_remove_remote_destination(
     sync_engine: SyncEngine, tmp_path: Path
 ) -> None:
     prepare_local_move(sync_engine)
-    sync_engine.get_index_entry = Mock(
-        return_value=SimpleNamespace(
-            is_file=True, dbx_path_lower="/readme.txt", rev="old-rev"
-        )
+    destination_path = tmp_path / "README.txt"
+    destination_path.write_text("local move")
+    content_hash = sync_engine.get_local_hash(str(destination_path))
+    assert content_hash is not None
+    add_move_file_index_entry(
+        sync_engine,
+        "/readme.txt",
+        content_hash,
     )
     sync_engine.client.remove = Mock()
-    sync_engine.client.move = Mock(return_value=Mock())
+    sync_engine.client.move = Mock(
+        return_value=make_moved_file_metadata("/README.txt", content_hash)
+    )
     event = make_event(
-        str(tmp_path / "README.txt"),
+        str(destination_path),
         "/README.txt",
         direction=SyncDirection.Up,
         change_type=ChangeType.Moved,
@@ -122,14 +196,24 @@ def test_move_to_different_path_still_removes_remote_destination(
     sync_engine: SyncEngine, tmp_path: Path
 ) -> None:
     prepare_local_move(sync_engine)
-    destination = SimpleNamespace(
-        is_file=True, dbx_path_lower="/destination.txt", rev="old-rev"
+    destination_path = tmp_path / "destination.txt"
+    destination_path.write_text("local move")
+    content_hash = sync_engine.get_local_hash(str(destination_path))
+    assert content_hash is not None
+    add_move_file_index_entry(sync_engine, "/source.txt", content_hash)
+    add_move_file_index_entry(
+        sync_engine,
+        "/destination.txt",
+        "old-destination-hash",
+        dbx_id="id:destination",
+        rev="old-rev",
     )
-    sync_engine.get_index_entry = Mock(return_value=destination)
     sync_engine.client.remove = Mock()
-    sync_engine.client.move = Mock(return_value=Mock())
+    sync_engine.client.move = Mock(
+        return_value=make_moved_file_metadata("/destination.txt", content_hash)
+    )
     event = make_event(
-        str(tmp_path / "destination.txt"),
+        str(destination_path),
         "/destination.txt",
         direction=SyncDirection.Up,
         change_type=ChangeType.Moved,
@@ -142,6 +226,134 @@ def test_move_to_different_path_still_removes_remote_destination(
     sync_engine.client.remove.assert_called_once_with(
         "/destination.txt", parent_rev="old-rev"
     )
+
+
+def test_local_move_records_destination_before_remote_replacement_failure(
+    sync_engine: SyncEngine, tmp_path: Path
+) -> None:
+    prepare_local_move(sync_engine)
+    destination_path = tmp_path / "destination.txt"
+    destination_path.write_text("local move")
+    content_hash = sync_engine.get_local_hash(str(destination_path))
+    assert content_hash is not None
+    add_move_file_index_entry(sync_engine, "/source.txt", content_hash)
+    add_move_file_index_entry(
+        sync_engine,
+        "/destination.txt",
+        "old-destination-hash",
+        dbx_id="id:destination",
+        rev="old-rev",
+    )
+
+    def fail_remote_replacement(*_args: object, **_kwargs: object) -> None:
+        recovered = sync_engine._validated_recovered_local_paths()
+        assert recovered["/destination.txt"]["path"] == "/destination.txt"
+        raise RuntimeError("remote replacement failed")
+
+    sync_engine.client.remove = Mock(side_effect=fail_remote_replacement)
+    sync_engine.client.move = Mock()
+    event = make_event(
+        str(destination_path),
+        "/destination.txt",
+        direction=SyncDirection.Up,
+        change_type=ChangeType.Moved,
+        local_path_from=str(tmp_path / "source.txt"),
+        dbx_path_from="/source.txt",
+        dbx_path_from_lower="/source.txt",
+    )
+
+    with pytest.raises(RuntimeError, match="remote replacement failed"):
+        sync_engine._on_local_moved(event)
+
+    recovered = sync_engine._validated_recovered_local_paths()
+    assert recovered["/destination.txt"]["path"] == "/destination.txt"
+    sync_engine.client.move.assert_not_called()
+
+
+def test_successful_local_move_clears_recovery_after_matching_index_proof(
+    sync_engine: SyncEngine, tmp_path: Path
+) -> None:
+    prepare_local_move(sync_engine)
+    destination_path = tmp_path / "destination.txt"
+    destination_path.write_text("local move")
+    content_hash = sync_engine.get_local_hash(str(destination_path))
+    assert content_hash is not None
+    add_move_file_index_entry(sync_engine, "/source.txt", content_hash)
+    sync_engine.client.move = Mock(
+        return_value=make_moved_file_metadata("/destination.txt", content_hash)
+    )
+    event = make_event(
+        str(destination_path),
+        "/destination.txt",
+        direction=SyncDirection.Up,
+        change_type=ChangeType.Moved,
+        local_path_from=str(tmp_path / "source.txt"),
+        dbx_path_from="/source.txt",
+        dbx_path_from_lower="/source.txt",
+    )
+
+    assert sync_engine._on_local_moved(event) is SyncStatus.Done
+    recovered = sync_engine._validated_recovered_local_paths()
+    assert recovered["/destination.txt"]["path"] == "/destination.txt"
+
+    sync_engine._maybe_finish_recovered_local_path("/destination.txt")
+    assert sync_engine._validated_recovered_local_paths() == {}
+
+
+def test_local_folder_deletion_always_queues_durable_restore(
+    sync_engine: SyncEngine,
+    tmp_path: Path,
+) -> None:
+    root_metadata = FolderMetadata(
+        name="folder",
+        path_lower="/folder",
+        path_display="/folder",
+        id="id:folder",
+        shared=False,
+    )
+    with sync_engine._database_access():
+        sync_engine._index_table.update(
+            IndexEntry(
+                dbx_path_lower="/folder",
+                dbx_path_cased="/folder",
+                dbx_id="id:folder",
+                item_type=ItemType.Folder,
+                last_sync=1,
+                rev="folder",
+                content_hash="folder",
+                symlink_target=None,
+            )
+        )
+        sync_engine._index_table.update(
+            IndexEntry(
+                dbx_path_lower="/folder/child.txt",
+                dbx_path_cased="/folder/child.txt",
+                dbx_id="id:child",
+                item_type=ItemType.File,
+                last_sync=1,
+                rev="indexed-rev",
+                content_hash="indexed-hash",
+                symlink_target=None,
+            )
+        )
+    sync_engine.client.get_metadata = Mock(return_value=root_metadata)
+    sync_engine.client.list_folder = Mock()
+    sync_engine.client.remove = Mock()
+    event = make_event(
+        str(tmp_path / "folder"),
+        "/folder",
+        direction=SyncDirection.Up,
+        item_type=ItemType.Folder,
+        change_type=ChangeType.Removed,
+    )
+
+    assert sync_engine._on_local_deleted(event) is SyncStatus.Conflict
+
+    sync_engine.client.remove.assert_not_called()
+    sync_engine.client.list_folder.assert_not_called()
+    assert sync_engine._validated_download_intents() == {"/folder": "restore"}
+    assert sync_engine.get_index_entry("/folder") is None
+    assert sync_engine.get_index_entry("/folder/child.txt") is None
 
 
 def test_unicode_normalization_only_move_is_skipped(
@@ -222,6 +434,105 @@ def test_selective_sync_mode_and_paths_roll_back_together_on_save_failure(
     assert sync_engine._conf.get("sync", "selective_sync_mode") == "exclude"
     assert sync_engine._conf.get("sync", "selective_sync_paths") == ["/archive"]
     assert Path(sync_engine._conf.config_path).read_bytes() == config_before
+
+
+def test_selective_sync_postcommit_base_exception_keeps_parser_and_cache(
+    sync_engine: SyncEngine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original_save = sync_engine._conf.save
+
+    def save_then_interrupt() -> int:
+        original_save()
+        raise KeyboardInterrupt("after config commit")
+
+    monkeypatch.setattr(sync_engine._conf, "save", save_then_interrupt)
+
+    with pytest.raises(KeyboardInterrupt, match="after config commit"):
+        sync_engine.set_selective_sync("include", ["/Projects"])
+
+    assert sync_engine._conf.get("sync", "selective_sync_mode") == "include"
+    assert sync_engine._conf.get("sync", "selective_sync_paths") == ["/projects"]
+    assert sync_engine.selective_sync_mode == "include"
+    assert sync_engine.selective_sync_paths == {"/projects"}
+
+
+@pytest.mark.parametrize("setting", ["dropbox_path", "ignore_symlinks"])
+def test_single_config_setter_does_not_reuse_concurrent_commit(
+    sync_engine: SyncEngine,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    setting: str,
+) -> None:
+    old_path = sync_engine.dropbox_path
+    new_path = str(tmp_path / "new-dropbox")
+    target_option = "path" if setting == "dropbox_path" else "ignore_symlinks"
+    target_failed = Event()
+    other_started = Event()
+    other_saved = Event()
+    errors: list[BaseException] = []
+    original_set = sync_engine._conf.set
+    original_save = sync_engine._conf.save
+    fail_next_save = True
+
+    def fail_first_save() -> int:
+        nonlocal fail_next_save
+        if fail_next_save:
+            fail_next_save = False
+            raise OSError("cannot save target")
+        return original_save()
+
+    def pause_failed_target(
+        section: str,
+        option: str,
+        value: object,
+        save: bool = True,
+    ) -> None:
+        try:
+            original_set(section, option, value, save)
+        except OSError:
+            if option == target_option:
+                target_failed.set()
+                other_started.wait(5)
+                other_saved.wait(0.2)
+            raise
+
+    monkeypatch.setattr(sync_engine._conf, "save", fail_first_save)
+    monkeypatch.setattr(sync_engine._conf, "set", pause_failed_target)
+
+    def set_target() -> None:
+        try:
+            if setting == "dropbox_path":
+                sync_engine.dropbox_path = new_path
+            else:
+                sync_engine.ignore_symlinks = True
+        except BaseException as exc:
+            errors.append(exc)
+
+    def save_unrelated_value() -> None:
+        other_started.set()
+        original_set("main", "log_level", 10)
+        other_saved.set()
+
+    target_thread = Thread(target=set_target)
+    target_thread.start()
+    assert target_failed.wait(5)
+    other_thread = Thread(target=save_unrelated_value)
+    other_thread.start()
+    target_thread.join(5)
+    other_thread.join(5)
+
+    assert not target_thread.is_alive()
+    assert not other_thread.is_alive()
+    assert other_saved.is_set()
+    assert len(errors) == 1
+    assert isinstance(errors[0], OSError)
+    assert sync_engine._conf.get("main", "log_level") == 10
+    if setting == "dropbox_path":
+        assert sync_engine.dropbox_path == old_path
+        assert sync_engine._conf.get("sync", "path") == old_path
+    else:
+        assert sync_engine.ignore_symlinks is False
+        assert sync_engine._conf.get("sync", "ignore_symlinks") is False
 
 
 def test_ignored_symlink_hides_its_subtree_from_local_events(
@@ -330,7 +641,7 @@ def test_downloaded_symlink_replaces_existing_file(
     sync_engine.client.download.assert_not_called()
 
 
-def test_remote_folder_fails_when_conflicting_file_cannot_be_deleted(
+def test_remote_folder_does_not_index_when_file_evacuation_fails(
     sync_engine: SyncEngine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     destination = tmp_path / "folder"
@@ -341,13 +652,19 @@ def test_remote_folder_fails_when_conflicting_file_cannot_be_deleted(
         item_type=ItemType.Folder,
     )
     sync_engine._apply_case_change = Mock()
-    sync_engine._check_download_conflict = Mock(return_value=Conflict.RemoteNewer)
+    expected_snapshot = sync_engine._snapshot_local_tree(str(destination))
+    sync_engine._stable_download_conflict = Mock(
+        return_value=(Conflict.RemoteNewer, expected_snapshot)
+    )
     sync_engine._ensure_parent = Mock()
     sync_engine.update_index_from_sync_event = Mock()
-    permission_error = PermissionError("cannot delete")
-    monkeypatch.setattr(sync_module, "delete", Mock(return_value=permission_error))
+    monkeypatch.setattr(
+        sync_module,
+        "move",
+        Mock(side_effect=PermissionError("cannot evacuate")),
+    )
 
-    with pytest.raises(InsufficientPermissionsError):
+    with pytest.raises(PermissionError, match="cannot evacuate"):
         sync_engine._on_remote_folder(event)
 
     assert destination.is_file()
@@ -407,6 +724,7 @@ def test_unicode_conflict_uses_unicode_suffix(
 ) -> None:
     decomposed = str(tmp_path / "cafe\N{COMBINING ACUTE ACCENT}.txt")
     composed = str(tmp_path / "caf\N{LATIN SMALL LETTER E WITH ACUTE}.txt")
+    Path(decomposed).write_text("local")
     event = make_event(
         decomposed,
         "/caf\N{LATIN SMALL LETTER E WITH ACUTE}.txt",

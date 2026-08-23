@@ -234,6 +234,22 @@ def test_selective_sync_api_is_available_over_rpc(m, monkeypatch):
     setter.assert_called_once_with(mode="include", dbx_paths=["/Notes/todo.txt"])
 
 
+def test_direct_shared_link_lookup_is_available_over_rpc(m, monkeypatch):
+    lookup = Mock(return_value=[])
+    monkeypatch.setattr(m, "list_shared_links", lookup)
+    dispatcher = JsonRpcDispatcher(m)
+
+    response = dispatcher.dispatch(
+        rpc_request(
+            "list_shared_links",
+            {"dbx_path": "/Notes/todo.txt", "direct_only": True},
+        )
+    )
+
+    assert response["result"] == []
+    lookup.assert_called_once_with(dbx_path="/Notes/todo.txt", direct_only=True)
+
+
 def test_sync_event_longpoll(m):
     result = {}
 

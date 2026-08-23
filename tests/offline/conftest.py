@@ -20,6 +20,7 @@ def m():
     m = Maestral("test-config")
     m.log_level = logging.DEBUG
     yield m
+    m.manager.shutdown()
     remove_configuration(m.config_name)
 
 

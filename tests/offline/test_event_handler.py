@@ -5,13 +5,15 @@ from watchdog.events import (
     DirCreatedEvent,
     DirModifiedEvent,
     DirMovedEvent,
+    FileDeletedEvent,
     FileModifiedEvent,
     FileMovedEvent,
 )
 
+from maestral.constants import MOVE_TEMP_PREFIX, REMOVE_TEMP_PREFIX
 from maestral.models import ChangeType, ItemType
 from maestral.sync import FSEventHandler, SyncDirection, SyncEngine
-from maestral.utils.path import move
+from maestral.utils.path import get_local_change_time, move
 
 
 def ipath(i: int) -> str:
@@ -28,16 +30,13 @@ def test_receiving_events(sync: SyncEngine) -> None:
 
     assert len(sync_events) == 1
 
-    try:
-        ctime = os.stat(new_dir).st_birthtime  # type: ignore
-    except AttributeError:
-        ctime = None
+    change_time = get_local_change_time(os.stat(new_dir))
 
     event = sync_events[0]
     assert event.direction == SyncDirection.Up
     assert event.item_type == ItemType.Folder
     assert event.change_type == ChangeType.Added
-    assert event.change_time == ctime
+    assert event.change_time == change_time
     assert event.local_path == str(new_dir)
 
 
@@ -47,6 +46,22 @@ def test_always_ignored_events(sync: SyncEngine) -> None:
     sync.fs_events.on_any_event(FileMovedEvent("/test", "/test"))
 
     assert sync.fs_events.local_file_event_queue.empty()
+
+
+def test_sync_root_creation_event_is_ignored(sync: SyncEngine) -> None:
+    event = DirCreatedEvent(sync.dropbox_path)
+
+    assert sync._filter_local_events([event]) == []
+
+
+def test_rooted_mutation_temporary_events_are_ignored() -> None:
+    handler = FSEventHandler()
+    handler.enable()
+
+    handler.on_any_event(FileDeletedEvent(f"/{MOVE_TEMP_PREFIX}backup"))
+    handler.on_any_event(DirCreatedEvent(f"/{REMOVE_TEMP_PREFIX}quarantine"))
+
+    assert handler.local_file_event_queue.empty()
 
 
 def test_fs_ignore_tree_creation(sync: SyncEngine) -> None:

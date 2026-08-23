@@ -10,11 +10,12 @@ from click.testing import CliRunner
 import maestral.cli.cli_core as cli_core_module
 import maestral.cli.cli_info as cli_info_module
 import maestral.cli.cli_maintenance as cli_maintenance_module
+import maestral.config as config_module
 import maestral.daemon as daemon_module
 from maestral.autostart import AutoStart
 from maestral.cli import main
 from maestral.cli.core import OrderedGroup
-from maestral.config import MaestralConfig
+from maestral.config import MaestralConfig, MaestralState
 from maestral.daemon import MaestralClient, Start, start_maestral_daemon_process
 from maestral.logging import scoped_logger
 from maestral.main import Maestral
@@ -65,6 +66,75 @@ def test_help() -> None:
     assert result_no_arg.output.startswith("Usage: main [OPTIONS] COMMAND [ARGS]")
 
     assert result_no_arg.output == result_help_arg.output
+
+
+def test_config_cleanup_keeps_unlinked_recovery_journal(
+    config_name: str, monkeypatch
+) -> None:
+    MaestralConfig(config_name)
+    state = MaestralState(config_name)
+    state.set(
+        "recovery",
+        "local_paths",
+        {
+            "/local.txt": {
+                "path": "/local.txt",
+                "identity": [1, 2, 3],
+                "phase": "tracked",
+                "source": "",
+            }
+        },
+    )
+    remove_configuration = Mock()
+    monkeypatch.setattr(config_module, "list_configs", lambda: [config_name])
+    monkeypatch.setattr(config_module, "remove_configuration", remove_configuration)
+    monkeypatch.setattr(daemon_module, "is_running", lambda _name: False)
+
+    callback = inspect.unwrap(cli_info_module.config_files.callback)
+    callback(clean=True)
+
+    remove_configuration.assert_not_called()
+
+
+def test_config_list_skips_profile_which_cannot_load(
+    config_name: str, monkeypatch
+) -> None:
+    good_conf = MaestralConfig(config_name)
+    good_state = MaestralState(config_name)
+    original_conf = config_module.MaestralConfig
+    original_state = config_module.MaestralState
+    table = Mock()
+    console = Mock()
+
+    def load_conf(name: str):
+        if name == "broken":
+            raise config_module.ConfigLoadError("cannot load")
+        return original_conf(name)
+
+    def load_state(name: str):
+        if name == "broken":
+            raise config_module.ConfigLoadError("cannot load")
+        return original_state(name)
+
+    monkeypatch.setattr(config_module, "list_configs", lambda: ["broken", config_name])
+    monkeypatch.setattr(config_module, "MaestralConfig", load_conf)
+    monkeypatch.setattr(config_module, "MaestralState", load_state)
+    monkeypatch.setattr(cli_info_module, "rich_table", Mock(return_value=table))
+    monkeypatch.setattr(cli_info_module, "Console", Mock(return_value=console))
+
+    callback = inspect.unwrap(cli_info_module.config_files.callback)
+    callback(clean=False)
+
+    table.add_row.assert_called_once_with(
+        config_name,
+        good_state.get("account", "email"),
+        cli_info_module.Text(
+            good_conf.config_path,
+            overflow="ellipsis",
+            no_wrap=True,
+        ),
+    )
+    console.print.assert_called_once_with(table)
 
 
 def test_ordered_group_sections_are_per_instance() -> None:
@@ -297,9 +367,7 @@ def test_config_command_cannot_split_selective_sync_update(m: Maestral) -> None:
     )
 
     assert result.exit_code == 0, result.output
-    assert (
-        "Use set_selective_sync to update the mode and paths together" in result.output
-    )
+    assert "Use the selective-sync or symlink API" in result.output
     assert m.selective_sync_mode == "exclude"
 
 
@@ -401,8 +469,7 @@ def test_log_clear(m: Maestral) -> None:
     assert "Hello from pytest!" in result.output
 
     # Stop connection helper to prevent spurious log messages.
-    m.manager._connection_helper_running = False
-    m.manager.connection_helper.join()
+    m.manager.shutdown()
 
     # clear the logs
     result = runner.invoke(main, ["log", "clear", "-c", m.config_name])

@@ -1,10 +1,88 @@
+import stat
+from pathlib import Path
+from threading import Event, Thread
+from types import SimpleNamespace
+from unittest.mock import Mock
+
 import pytest
 import requests
 
 import maestral.main
 from maestral.constants import GITHUB_RELEASES_API
-from maestral.exceptions import NotLinkedError
+from maestral.exceptions import MaestralApiError, NotLinkedError
 from maestral.main import Maestral
+
+
+def test_root_creation_reservation_blocks_a_concurrent_start(
+    m: Maestral,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    m.manager._connection_helper_stop.set()
+    m.manager.connection_helper.join(timeout=2)
+    root_update_started = Event()
+    finish_root_update = Event()
+    errors: list[BaseException] = []
+    monkeypatch.setattr(m, "_check_linked", Mock())
+    monkeypatch.setattr(m.manager, "reset_sync_state", Mock())
+    monkeypatch.setattr(m.sync, "create_root_marker", Mock())
+
+    def set_dropbox_path(*args: object, **kwargs: object) -> None:
+        root_update_started.set()
+        finish_root_update.wait(5)
+
+    monkeypatch.setattr(m.sync, "set_dropbox_path", set_dropbox_path)
+
+    def create_root() -> None:
+        try:
+            m.create_dropbox_directory(str(tmp_path / "new-dropbox"))
+        except BaseException as exc:
+            errors.append(exc)
+
+    thread = Thread(target=create_root)
+    thread.start()
+    assert root_update_started.wait(5)
+
+    with pytest.raises(MaestralApiError, match="internal operation"):
+        m.manager.start()
+
+    finish_root_update.set()
+    thread.join(5)
+
+    assert not thread.is_alive()
+    assert errors == []
+
+
+def test_root_creation_releases_its_reservation_before_replay_logging(
+    m: Maestral,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(m, "_check_linked", Mock())
+
+    def fail_reset() -> None:
+        m._state.set("recovery", "sync_reset", {"kind": "sync"})
+        raise OSError("injected reset failure")
+
+    monkeypatch.setattr(m.manager, "reset_sync_state", fail_reset)
+    monkeypatch.setattr(
+        m.sync,
+        "_complete_pending_sync_reset",
+        Mock(side_effect=RuntimeError("injected replay failure")),
+    )
+    monkeypatch.setattr(
+        m._logger,
+        "debug",
+        Mock(side_effect=KeyboardInterrupt("injected logging failure")),
+    )
+
+    try:
+        with pytest.raises(KeyboardInterrupt, match="injected logging failure"):
+            m.create_dropbox_directory(str(tmp_path / "new-dropbox"))
+
+        assert m.manager._active_internal_operation is None
+    finally:
+        m._state.set("recovery", "sync_reset", {})
 
 
 def test_check_for_updates(m: Maestral) -> None:
@@ -47,3 +125,260 @@ def test_check_for_updates(m: Maestral) -> None:
 def test_not_linked_error(m: Maestral) -> None:
     with pytest.raises(NotLinkedError):
         m.get_metadata("/test")
+
+
+def test_unlink_keeps_valid_default_state_with_existing_database(
+    m: Maestral,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(m, "_check_linked", Mock())
+    monkeypatch.setattr(m.client, "unlink", Mock())
+    monkeypatch.setattr(m.cred_storage, "delete_creds", Mock())
+    m._conf.set("auth", "account_id", "linked-account")
+    m._conf.set("sync", "path", "/old/dropbox")
+    m._state.set("account", "path_root_nsid", "old-root")
+
+    m.unlink()
+
+    assert Path(m._conf.config_path).is_file()
+    assert Path(m._state.config_path).is_file()
+    assert Path(m.sync._db_path).is_file()
+    assert m._conf.get("auth", "account_id") == ""
+    assert m._conf.get("sync", "path") == ""
+    assert m._state.get("account", "path_root_nsid") == ""
+    backup_path = Path(m._conf.backup_path_for_version(None))
+    assert "linked-account" not in backup_path.read_text()
+
+
+def test_unlink_reservation_does_not_wait_for_a_concurrent_stop(
+    m: Maestral,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    m.manager._connection_helper_stop.set()
+    m.manager.connection_helper.join(timeout=2)
+    begin_entered = Event()
+    allow_begin = Event()
+    stop_started = Event()
+    unlink_errors: list[BaseException] = []
+    stop_errors: list[BaseException] = []
+    monkeypatch.setattr(m, "_check_linked", Mock())
+    monkeypatch.setattr(m.client, "unlink", Mock())
+    monkeypatch.setattr(m.cred_storage, "delete_creds", Mock())
+    m._conf.set("auth", "account_id", "linked-account")
+    m._conf.set("sync", "path", "/old/dropbox")
+    original_begin = m.manager.begin_unlink_reset
+
+    def delayed_begin(*args: object, **kwargs: object) -> None:
+        begin_entered.set()
+        allow_begin.wait(5)
+        original_begin(*args, **kwargs)
+
+    monkeypatch.setattr(m.manager, "begin_unlink_reset", delayed_begin)
+
+    def unlink() -> None:
+        try:
+            m.unlink()
+        except BaseException as exc:
+            unlink_errors.append(exc)
+
+    unlink_thread = Thread(target=unlink)
+    unlink_thread.start()
+    assert begin_entered.wait(5)
+
+    original_request_cancel = m.sync.request_cancel
+
+    def request_cancel() -> None:
+        stop_started.set()
+        original_request_cancel()
+
+    monkeypatch.setattr(m.sync, "request_cancel", request_cancel)
+
+    def stop() -> None:
+        try:
+            m.manager.stop()
+        except BaseException as exc:
+            stop_errors.append(exc)
+
+    stop_thread = Thread(target=stop)
+    stop_thread.start()
+    assert stop_started.wait(5)
+    allow_begin.set()
+    unlink_thread.join(5)
+    stop_thread.join(5)
+
+    assert not unlink_thread.is_alive()
+    assert not stop_thread.is_alive()
+    assert unlink_errors == []
+    assert stop_errors == []
+
+
+def test_interrupted_unlink_keeps_a_reopenable_state_file(
+    m: Maestral,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(m, "_check_linked", Mock())
+    monkeypatch.setattr(m.client, "unlink", Mock())
+    monkeypatch.setattr(m.cred_storage, "delete_creds", Mock())
+    m._conf.set("auth", "account_id", "linked-account")
+    original_reset = m._state.reset_to_defaults
+
+    def reset_then_interrupt(*args, **kwargs) -> None:
+        original_reset(*args, **kwargs)
+        raise KeyboardInterrupt("after state reset")
+
+    monkeypatch.setattr(m._state, "reset_to_defaults", reset_then_interrupt)
+
+    with pytest.raises(KeyboardInterrupt, match="after state reset"):
+        m.unlink()
+
+    assert Path(m._state.config_path).is_file()
+    assert Path(m.sync._db_path).is_file()
+    assert m._conf.get("auth", "account_id") == "linked-account"
+
+
+@pytest.mark.parametrize(
+    ("section", "name"),
+    [
+        ("recovery", "local_evacuations"),
+        ("recovery", "local_paths"),
+        ("recovery", "case_changes"),
+        ("recovery", "root_move"),
+        ("account", "path_root_migration"),
+    ],
+)
+def test_unlink_refuses_root_bound_recovery_before_credential_deletion(
+    m: Maestral,
+    monkeypatch: pytest.MonkeyPatch,
+    section: str,
+    name: str,
+) -> None:
+    monkeypatch.setattr(m, "_check_linked", Mock())
+    unlink = Mock()
+    delete_creds = Mock()
+    monkeypatch.setattr(m.client, "unlink", unlink)
+    monkeypatch.setattr(m.cred_storage, "delete_creds", delete_creds)
+    m._state.set(section, name, {"pending": True})
+
+    with pytest.raises(MaestralApiError, match="pending local recovery"):
+        m.unlink()
+
+    unlink.assert_not_called()
+    delete_creds.assert_not_called()
+    assert m._state.get("recovery", "sync_reset") == {}
+
+
+def test_link_refuses_old_root_recovery_after_interrupted_unlink(
+    m: Maestral,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    journal = {
+        "kind": "unlink",
+        "phase": "queue",
+        "account_id": "old-account",
+        "keyring": "automatic",
+        "credentials_deleted": False,
+        "root_path": "/old/dropbox",
+        "root_marker_id": "a" * 32,
+    }
+    m._state.set("recovery", "local_paths", {"/old.txt": {}})
+    m._state.set("recovery", "sync_reset", journal)
+    link = Mock()
+    delete_creds = Mock()
+    monkeypatch.setattr(m.client, "link", link)
+    monkeypatch.setattr(m.cred_storage, "delete_creds", delete_creds)
+
+    with pytest.raises(MaestralApiError, match="old account recovery"):
+        m.link(access_token="new-token")
+
+    link.assert_not_called()
+    delete_creds.assert_not_called()
+    assert m._state.get("recovery", "sync_reset") == journal
+
+
+def test_reset_marker_remains_until_root_bound_recovery_is_clear(m: Maestral) -> None:
+    journal = {
+        "kind": "unlink",
+        "phase": "queue",
+        "account_id": "old-account",
+        "keyring": "automatic",
+        "credentials_deleted": True,
+        "root_path": "/old/dropbox",
+        "root_marker_id": "a" * 32,
+    }
+    m._state.set("recovery", "local_paths", {"/old.txt": {}})
+    m._state.set("recovery", "sync_reset", journal)
+
+    m.sync._finish_sync_reset_queue()
+
+    assert m._state.get("recovery", "sync_reset") == journal
+    with pytest.raises(MaestralApiError, match="pending reset"):
+        m.manager.start()
+
+
+def test_profile_cleanup_rejects_linked_cache(
+    m: Maestral, monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    cache_path = tmp_path / "cache"
+    cache_path.mkdir()
+    profile_pic = cache_path / f"{m.config_name}_profile_pic.jpeg"
+    profile_pic.write_text("external")
+    monkeypatch.setattr(
+        "maestral.main.get_cache_path",
+        Mock(return_value=str(cache_path)),
+    )
+    monkeypatch.setattr(
+        "maestral.main.os.lstat",
+        Mock(
+            return_value=SimpleNamespace(
+                st_mode=stat.S_IFDIR,
+                st_reparse_tag=0xA0000003,
+            )
+        ),
+    )
+    scandir = Mock(side_effect=AssertionError("linked cache was scanned"))
+    monkeypatch.setattr("maestral.main.os.scandir", scandir)
+
+    m._delete_old_profile_pics()
+
+    scandir.assert_not_called()
+    assert profile_pic.read_text() == "external"
+
+
+def test_profile_write_replaces_link_without_following_it(
+    m: Maestral, monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    cache_path = tmp_path / "cache"
+    cache_path.mkdir()
+    external_file = tmp_path / "external.jpeg"
+    external_file.write_bytes(b"keep me")
+    profile_path = cache_path / f"{m.config_name}_profile_pic.jpeg"
+    try:
+        profile_path.symlink_to(external_file)
+    except OSError as exc:
+        if getattr(exc, "winerror", None) == 1314:
+            pytest.skip("Windows did not grant symlink creation permission")
+        raise
+
+    monkeypatch.setattr(m, "_check_linked", Mock())
+    monkeypatch.setattr(
+        m.client,
+        "get_account_info",
+        Mock(
+            return_value=SimpleNamespace(profile_photo_url="https://example.test/pic")
+        ),
+    )
+    monkeypatch.setattr(
+        "maestral.main.get_cache_path",
+        Mock(return_value=str(cache_path)),
+    )
+    monkeypatch.setattr(
+        "maestral.main.requests.get",
+        Mock(return_value=SimpleNamespace(content=b"new picture")),
+    )
+
+    result = m.get_profile_pic()
+
+    assert Path(result) == profile_path
+    assert external_file.read_bytes() == b"keep me"
+    assert not profile_path.is_symlink()
+    assert profile_path.read_bytes() == b"new picture"

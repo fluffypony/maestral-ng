@@ -367,7 +367,11 @@ class SyncEvent(Model):
 
     @classmethod
     def from_file_system_event(
-        cls, event: FileSystemEvent, sync_engine: SyncEngine
+        cls,
+        event: FileSystemEvent,
+        sync_engine: SyncEngine,
+        *,
+        skip_local_access: bool = False,
     ) -> SyncEvent:
         """
         Initializes a SyncEvent from the given local file system event.
@@ -403,12 +407,16 @@ class SyncEvent(Model):
         stat: os.stat_result | None
 
         try:
-            stat = os.stat(to_path, follow_symlinks=False)
+            stat = (
+                None if skip_local_access else os.stat(to_path, follow_symlinks=False)
+            )
         except OSError:
             stat = None
 
         try:
-            content_hash = sync_engine.get_local_hash(to_path)
+            content_hash = (
+                None if skip_local_access else sync_engine.get_local_hash(to_path)
+            )
         except SyncError:
             content_hash = None
 
@@ -438,7 +446,11 @@ class SyncEvent(Model):
             change_time = get_local_change_time(stat) if stat else None
             size = stat.st_size if stat else 0
             try:
-                symlink_target = os.readlink(os.fsdecode(event.src_path))
+                symlink_target = (
+                    None
+                    if skip_local_access
+                    else os.readlink(os.fsdecode(event.src_path))
+                )
             except OSError:
                 symlink_target = None
 
