@@ -30,6 +30,7 @@ from maestral.core import (
 )
 from maestral.cryptomator import StorageMapEntry, VaultEntry, VaultInfo
 from maestral.exceptions import FileConflictError, NotFoundError
+from maestral.providers.base import MAX_LOGICAL_PAGE_SIZE
 from maestral.providers.encrypted import (
     EncryptedRemoteProvider,
     EncryptedVaultError,
@@ -1252,6 +1253,108 @@ def test_encrypted_provider_lists_deletions_after_remote_refresh(
     assert page.entries[0].path_display == "/one.txt"
     assert not isinstance(page.entries[0], FileMetadata)
     provider.close()
+
+
+def test_encrypted_provider_bounds_and_resumes_large_logical_pages(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    remote = FakeRemoteProvider(tmp_path / "remote-provider")
+    provider = EncryptedRemoteProvider(
+        remote,
+        FakeSecretStore(),
+        "/Encrypted",
+        tmp_path / "ciphertext-cache",
+        sidecar=FakeCryptomatorSession("password"),
+    )
+    provider.initialise_vault("password")
+    modified = datetime.fromtimestamp(0, timezone.utc)
+    metadata = [
+        FileMetadata(
+            name=f"File-{index:04d}.txt",
+            path_lower=f"/file-{index:04d}.txt",
+            path_display=f"/File-{index:04d}.txt",
+            id=f"logical-{index:04d}",
+            client_modified=modified,
+            server_modified=modified,
+            rev="1",
+            size=1,
+            symlink_target=None,
+            shared=False,
+            modified_by=None,
+            is_downloadable=True,
+            content_hash="a" * 64,
+        )
+        for index in range(8_193)
+    ]
+    provider._metadata_by_path = {item.path_lower: item for item in metadata}
+    provider._metadata_by_id = {item.id: item for item in metadata}
+
+    def refresh_logical_projection() -> None:
+        provider._cursor = f"cursor:{remote._cursor}"
+
+    monkeypatch.setattr(provider, "_refresh_locked", refresh_logical_projection)
+
+    def unexpected_wait(_cursor: str, _timeout: int = 40) -> bool:
+        raise AssertionError("An intermediate cursor reached the remote provider")
+
+    monkeypatch.setattr(remote, "wait_for_remote_changes", unexpected_wait)
+    try:
+        snapshot_pages = list(
+            provider.list_folder_iterator(
+                "/", recursive=True, limit=MAX_LOGICAL_PAGE_SIZE + 1
+            )
+        )
+        assert [len(page.entries) for page in snapshot_pages] == [4_096, 4_096, 1]
+        assert len({page.cursor for page in snapshot_pages}) == 3
+        assert [page.has_more for page in snapshot_pages] == [True, True, False]
+        assert [
+            provider._decode_logical_cursor(page.cursor).phase  # type: ignore[union-attr]
+            for page in snapshot_pages
+        ] == ["snapshot", "snapshot", "steady"]
+        assert provider.wait_for_remote_changes(snapshot_pages[0].cursor) is True
+
+        resumed_snapshot = list(
+            provider.list_remote_changes_iterator(snapshot_pages[0].cursor)
+        )
+        assert [page.entries for page in resumed_snapshot] == [
+            page.entries for page in snapshot_pages[1:]
+        ]
+        flattened = provider.list_folder("/", recursive=True)
+        assert len(flattened.entries) == 8_193
+        assert flattened.has_more is False
+        with pytest.raises(ValueError, match="positive integer"):
+            list(provider.list_folder_iterator("/", recursive=True, limit=False))
+
+        indexed = {item.id: item.path_display for item in metadata}
+        remote._touch_cursor()
+        change_pages = list(
+            provider.list_remote_changes_iterator(snapshot_pages[-1].cursor, indexed)
+        )
+        assert [len(page.entries) for page in change_pages] == [4_096, 4_096, 1]
+        assert len({page.cursor for page in change_pages}) == 3
+        assert [
+            provider._decode_logical_cursor(page.cursor).phase  # type: ignore[union-attr]
+            for page in change_pages
+        ] == ["changes", "changes", "steady"]
+
+        resumed_changes = list(
+            provider.list_remote_changes_iterator(change_pages[0].cursor, indexed)
+        )
+        assert [page.entries for page in resumed_changes] == [
+            page.entries for page in change_pages[1:]
+        ]
+
+        remote._touch_cursor()
+        reset_changes = list(
+            provider.list_remote_changes_iterator(change_pages[0].cursor, indexed)
+        )
+        assert reset_changes[0].entries == change_pages[0].entries
+        saved_cursor = provider._decode_logical_cursor(change_pages[0].cursor)
+        reset_cursor = provider._decode_logical_cursor(reset_changes[0].cursor)
+        assert saved_cursor is not None and reset_cursor is not None
+        assert reset_cursor.final_cursor != saved_cursor.final_cursor
+    finally:
+        provider.close()
 
 
 def test_encrypted_virtual_sync_accepts_a_long_provider_cursor(

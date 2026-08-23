@@ -20,6 +20,7 @@ import requests
 from maestral.config import MaestralConfig, remove_configuration
 from maestral.core import DeletedMetadata, FileMetadata, FolderMetadata, WriteMode
 from maestral.exceptions import NotFoundError, UnsupportedProviderOperationError
+from maestral.providers.base import MAX_LOGICAL_PAGE_SIZE
 from maestral.providers.google_drive import (
     GOOGLE_DRIVE_SCOPE,
     DriveChange,
@@ -711,7 +712,11 @@ def test_provider_initial_listing_projects_duplicates_and_native_stubs(
     assert "(Drive " in paths["first"]
     assert "(Drive " in paths["second"]
     assert paths["native"] == "/Plan.gdoc"
-    assert result.cursor.startswith("opaque/")
+    decoded_cursor = provider._decode_cursor(result.cursor)
+    assert decoded_cursor is not None
+    assert decoded_cursor.phase == "steady"
+    assert decoded_cursor.cursor is not None
+    assert decoded_cursor.cursor.startswith("opaque/")
 
     destination = io.BytesIO()
     metadata = provider.download("/Plan.gdoc", destination)
@@ -864,6 +869,101 @@ def test_provider_folder_move_reprojects_the_full_subtree(config_name: str) -> N
         for entry in page.entries
         if isinstance(entry, (FileMetadata, FolderMetadata))
     } == {"/New", "/New/Child.txt"}
+
+
+def test_provider_bounds_and_resumes_large_logical_pages(config_name: str) -> None:
+    folder = drive_item(
+        "folder",
+        "Old",
+        mime_type="application/vnd.google-apps.folder",
+    )
+    children = [
+        drive_item(
+            f"child-{index:04d}",
+            f"Child-{index:04d}.txt",
+            parent="folder",
+            md5Checksum="a" * 32,
+        )
+        for index in range(4_100)
+    ]
+    api = FakeDriveAPI([folder, *children], {})
+    provider = provider_with_fake_api(config_name, api)
+
+    snapshot_pages = list(
+        provider.list_folder_iterator(
+            "/", recursive=True, limit=MAX_LOGICAL_PAGE_SIZE + 100
+        )
+    )
+    assert [len(page.entries) for page in snapshot_pages] == [4_096, 5]
+    assert snapshot_pages[0].has_more is True
+    assert snapshot_pages[-1].has_more is False
+    snapshot_cursor = provider._decode_cursor(snapshot_pages[0].cursor)
+    assert snapshot_cursor is not None
+    assert snapshot_cursor.phase == "snapshot"
+    assert provider.wait_for_remote_changes(snapshot_pages[0].cursor) is True
+
+    resumed_snapshot = list(
+        provider.list_remote_changes_iterator(snapshot_pages[0].cursor)
+    )
+    assert [page.entries for page in resumed_snapshot] == [
+        page.entries for page in snapshot_pages[1:]
+    ]
+    flattened = provider.list_folder("/", recursive=True)
+    assert len(flattened.entries) == 4_101
+    assert flattened.has_more is False
+    with pytest.raises(ValueError, match="positive integer"):
+        list(provider.list_folder_iterator("/", recursive=True, limit=0))
+
+    indexed = {
+        entry.id: entry.path_display
+        for page in snapshot_pages
+        for entry in page.entries
+        if isinstance(entry, (FileMetadata, FolderMetadata))
+    }
+    api.external_move("folder", "root-id", "New")
+    change_pages = list(
+        provider.list_remote_changes_iterator(snapshot_pages[-1].cursor, indexed)
+    )
+    assert [len(page.entries) for page in change_pages] == [4_096, 4_096, 10]
+    assert len({page.cursor for page in change_pages}) == 3
+    assert [page.has_more for page in change_pages] == [True, True, False]
+    assert [
+        provider._decode_cursor(page.cursor).phase  # type: ignore[union-attr]
+        for page in change_pages
+    ] == ["changes", "changes", "steady"]
+
+    entries = [entry for page in change_pages for entry in page.entries]
+    first_upsert = next(
+        index
+        for index, entry in enumerate(entries)
+        if isinstance(entry, (FileMetadata, FolderMetadata))
+    )
+    assert all(isinstance(entry, DeletedMetadata) for entry in entries[:first_upsert])
+    upserts = entries[first_upsert:]
+    assert upserts[0].path_display == "/New"
+    assert all(entry.path_display.startswith("/New/") for entry in upserts[1:])
+
+    old_id_by_path = {path: file_id for file_id, path in indexed.items()}
+    resumed_index = indexed.copy()
+    for entry in change_pages[0].entries:
+        if isinstance(entry, DeletedMetadata):
+            resumed_index.pop(old_id_by_path[entry.path_display])
+    resumed_changes = list(
+        provider.list_remote_changes_iterator(change_pages[0].cursor, resumed_index)
+    )
+    assert [page.entries for page in resumed_changes] == [
+        page.entries for page in change_pages[1:]
+    ]
+
+    api.create_folder("A new folder", "root-id")
+    reset_changes = list(
+        provider.list_remote_changes_iterator(change_pages[0].cursor, indexed)
+    )
+    assert reset_changes[0].entries == change_pages[0].entries
+    saved_cursor = provider._decode_cursor(change_pages[0].cursor)
+    reset_cursor = provider._decode_cursor(reset_changes[0].cursor)
+    assert saved_cursor is not None and reset_cursor is not None
+    assert reset_cursor.final_cursor != saved_cursor.final_cursor
 
 
 def test_provider_native_stub_rejects_content_updates(config_name: str) -> None:

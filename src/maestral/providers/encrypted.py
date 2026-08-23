@@ -59,7 +59,16 @@ from maestral.exceptions import (
     NotFoundError,
     UnsupportedProviderOperationError,
 )
-from maestral.providers.base import RemoteProvider
+from maestral.providers.base import (
+    MAX_LOGICAL_PAGE_SIZE,
+    LogicalCursor,
+    LogicalListingScope,
+    LogicalOperationKey,
+    RemoteProvider,
+    iter_logical_pages,
+    logical_operation_key,
+    validate_logical_page_limit,
+)
 from maestral.utils.hashing import ContentHasherFactory, sha256_content_hasher
 from maestral.utils.path import create_rooted_tempfile, normalize
 from maestral.utils.path import unlink as rooted_unlink
@@ -1845,7 +1854,8 @@ class EncryptedRemoteProvider:
     """Expose an official Cryptomator vault as a logical remote provider."""
 
     content_hasher_factory: ContentHasherFactory = sha256_content_hasher
-    _CURSOR_PREFIX = "cryptomator-v1:"
+    _CURSOR_PREFIX = "cryptomator-v2:"
+    _MAX_CURSOR_BYTES = 4 * 1024 * 1024
     _IDENTITY_SCHEMA = 1
     _IDENTITY_DIRECTORY = "/.maestral"
     _IDENTITY_MANIFEST = "/.maestral/identity-manifest.json"
@@ -2145,15 +2155,139 @@ class EncryptedRemoteProvider:
         include_mounted_folders: bool = True,
         include_non_downloadable_files: bool = False,
     ) -> ListFolderResult:
-        return next(
-            self.list_folder_iterator(
-                remote_path,
-                recursive,
-                include_deleted,
-                include_mounted_folders,
-                include_non_downloadable_files=include_non_downloadable_files,
+        entries: list[Metadata] = []
+        final_page: ListFolderResult | None = None
+        for page in self.list_folder_iterator(
+            remote_path,
+            recursive,
+            include_deleted,
+            include_mounted_folders,
+            include_non_downloadable_files=include_non_downloadable_files,
+        ):
+            entries.extend(page.entries)
+            final_page = page
+        if final_page is None:
+            raise EncryptedVaultError(
+                "Encrypted vault listing failed",
+                "The vault listing did not return a page.",
             )
+        return ListFolderResult(entries, False, final_page.cursor)
+
+    def _logical_snapshot(
+        self,
+        path: str,
+        recursive: bool,
+    ) -> tuple[str, str, list[tuple[LogicalOperationKey, Metadata]]]:
+        origin_cursor = self._cursor
+        self._refresh_locked()
+        final_cursor = self._cursor
+        if not origin_cursor:
+            origin_cursor = final_cursor
+        operations: list[tuple[LogicalOperationKey, Metadata]] = [
+            (logical_operation_key("upsert", entry.path_display, entry.id), entry)
+            for entry in self._listed_metadata(path, recursive)
+            if isinstance(entry, (FileMetadata, FolderMetadata))
+        ]
+        return origin_cursor, final_cursor, operations
+
+    def _logical_operations(
+        self,
+        indexed_paths: Mapping[str, str] | None,
+    ) -> list[tuple[LogicalOperationKey, Metadata]]:
+        known = dict(indexed_paths or {})
+        operations: list[tuple[LogicalOperationKey, Metadata]] = []
+        for provider_id, old_path in known.items():
+            current = self._metadata_by_id.get(provider_id)
+            if current is None or current.path_lower != normalize(old_path):
+                metadata = DeletedMetadata(
+                    posixpath.basename(old_path),
+                    normalize(old_path),
+                    old_path,
+                )
+                operations.append(
+                    (logical_operation_key("delete", old_path, provider_id), metadata)
+                )
+        operations.extend(
+            (
+                logical_operation_key("upsert", metadata.path_display, metadata.id),
+                metadata,
+            )
+            for metadata in self._metadata_by_path.values()
         )
+        return operations
+
+    def _logical_changes(
+        self,
+        origin_cursor: str,
+        indexed_paths: Mapping[str, str] | None,
+        *,
+        force_projection: bool = False,
+    ) -> tuple[str, list[tuple[LogicalOperationKey, Metadata]], bool]:
+        stream_cursor = origin_cursor
+        saw_entries = False
+        physical_paths = {
+            metadata.id: self._mirror._remote_path(relative)
+            for relative, metadata in self._mirror.remote_entries.items()
+        }
+        for page in self._provider.list_remote_changes_iterator(
+            origin_cursor, indexed_paths=physical_paths
+        ):
+            stream_cursor = page.cursor
+            saw_entries = saw_entries or bool(page.entries)
+
+        if stream_cursor == origin_cursor and not saw_entries:
+            operations = (
+                self._logical_operations(indexed_paths) if force_projection else []
+            )
+            return stream_cursor, operations, True
+
+        self._refresh_locked()
+        final_cursor = self._cursor
+        return (
+            final_cursor,
+            self._logical_operations(indexed_paths),
+            stream_cursor == final_cursor,
+        )
+
+    def _logical_recovery_changes(
+        self,
+        indexed_paths: Mapping[str, str] | None,
+    ) -> tuple[str, str, list[tuple[LogicalOperationKey, Metadata]]]:
+        origin_cursor = self._cursor
+        self._refresh_locked()
+        final_cursor = self._cursor
+        if not origin_cursor:
+            origin_cursor = final_cursor
+        return origin_cursor, final_cursor, self._logical_operations(indexed_paths)
+
+    def _logical_pages(
+        self,
+        operations: list[tuple[LogicalOperationKey, Metadata]],
+        *,
+        phase: Literal["snapshot", "changes"],
+        origin_cursor: str,
+        final_cursor: str,
+        scope: LogicalListingScope,
+        last_key: LogicalOperationKey | None = None,
+    ) -> Iterator[ListFolderResult]:
+        limit = scope[2]
+        for entries, page_key, has_more in iter_logical_pages(
+            operations, limit, last_key
+        ):
+            if has_more:
+                assert page_key is not None
+                cursor = self._encode_logical_cursor(
+                    LogicalCursor.continuation(
+                        phase,
+                        origin_cursor,
+                        final_cursor,
+                        page_key,
+                        scope,
+                    )
+                )
+            else:
+                cursor = self._encode_logical_cursor(LogicalCursor.steady(final_cursor))
+            yield ListFolderResult(entries, has_more, cursor)
 
     def list_folder_iterator(
         self,
@@ -2164,16 +2298,24 @@ class EncryptedRemoteProvider:
         limit: int | None = None,
         include_non_downloadable_files: bool = False,
     ) -> Iterator[ListFolderResult]:
-        del include_deleted, include_mounted_folders, limit
+        del include_deleted, include_mounted_folders
         del include_non_downloadable_files
         with self._lock:
             self._ensure_loaded()
-            self._refresh_locked()
             path = self._normalise_logical_path(remote_path)
             self._require_public_logical_path(path)
-            entries = self._listed_metadata(path, recursive)
-            result = ListFolderResult(entries, False, self._encode_cursor(self._cursor))
-        yield result
+            page_limit = validate_logical_page_limit(limit)
+            origin_cursor, final_cursor, operations = self._logical_snapshot(
+                path, recursive
+            )
+            scope = (path, recursive, page_limit)
+        yield from self._logical_pages(
+            operations,
+            phase="snapshot",
+            origin_cursor=origin_cursor,
+            final_cursor=final_cursor,
+            scope=scope,
+        )
 
     def list_remote_changes_iterator(
         self,
@@ -2182,37 +2324,87 @@ class EncryptedRemoteProvider:
     ) -> Iterator[ListFolderResult]:
         with self._lock:
             self._ensure_loaded()
-            decoded_cursor = self._decode_cursor(last_cursor)
-            if decoded_cursor is None:
-                self._refresh_locked()
-                result = self._logical_change_page(indexed_paths)
-            else:
-                final_cursor = decoded_cursor
-                saw_entries = False
-                physical_paths = {
-                    metadata.id: self._mirror._remote_path(relative)
-                    for relative, metadata in self._mirror.remote_entries.items()
-                }
-                for page in self._provider.list_remote_changes_iterator(
-                    decoded_cursor, indexed_paths=physical_paths
-                ):
-                    final_cursor = page.cursor
-                    saw_entries = saw_entries or bool(page.entries)
-
-                if final_cursor == decoded_cursor and not saw_entries:
-                    result = ListFolderResult([], False, last_cursor)
+            cursor = self._decode_logical_cursor(last_cursor)
+            default_scope: LogicalListingScope = (
+                "/",
+                True,
+                MAX_LOGICAL_PAGE_SIZE,
+            )
+            if cursor is None:
+                origin, final, operations = self._logical_recovery_changes(
+                    indexed_paths
+                )
+                phase: Literal["snapshot", "changes"] = "changes"
+                scope = default_scope
+                last_key = None
+            elif cursor.phase == "snapshot":
+                assert cursor.origin_cursor is not None
+                assert cursor.final_cursor is not None
+                assert cursor.last_key is not None
+                assert cursor.scope is not None
+                path, recursive, _limit = cursor.scope
+                new_origin, new_final, operations = self._logical_snapshot(
+                    path, recursive
+                )
+                if new_final == cursor.final_cursor:
+                    origin = cursor.origin_cursor
+                    final = cursor.final_cursor
+                    last_key = cursor.last_key
                 else:
-                    self._refresh_locked()
-                    result = self._logical_change_page(indexed_paths)
-        yield result
+                    origin = new_origin
+                    final = new_final
+                    last_key = None
+                phase = "snapshot"
+                scope = cursor.scope
+            elif cursor.phase == "changes":
+                assert cursor.origin_cursor is not None
+                assert cursor.final_cursor is not None
+                assert cursor.last_key is not None
+                if cursor.scope != default_scope:
+                    origin, final, operations = self._logical_recovery_changes(
+                        indexed_paths
+                    )
+                    last_key = None
+                else:
+                    origin = cursor.origin_cursor
+                    final, operations, stream_is_stable = self._logical_changes(
+                        origin,
+                        indexed_paths,
+                        force_projection=True,
+                    )
+                    last_key = (
+                        cursor.last_key
+                        if stream_is_stable and final == cursor.final_cursor
+                        else None
+                    )
+                phase = "changes"
+                scope = default_scope
+            else:
+                assert cursor.cursor is not None
+                origin = cursor.cursor
+                final, operations, _stream_is_stable = self._logical_changes(
+                    origin, indexed_paths
+                )
+                phase = "changes"
+                scope = default_scope
+                last_key = None
+        yield from self._logical_pages(
+            operations,
+            phase=phase,
+            origin_cursor=origin,
+            final_cursor=final,
+            scope=scope,
+            last_key=last_key,
+        )
 
     def wait_for_remote_changes(self, last_cursor: str, timeout: int = 40) -> bool:
         with self._lock:
             self._ensure_loaded()
-            decoded_cursor = self._decode_cursor(last_cursor)
-        if decoded_cursor is None:
+            cursor = self._decode_logical_cursor(last_cursor)
+        if cursor is None or cursor.phase != "steady":
             return True
-        return self._provider.wait_for_remote_changes(decoded_cursor, timeout)
+        assert cursor.cursor is not None
+        return self._provider.wait_for_remote_changes(cursor.cursor, timeout)
 
     def download(
         self,
@@ -2652,38 +2844,18 @@ class EncryptedRemoteProvider:
             self._abort_sidecar(secret)
             raise
 
-    def _logical_change_page(
-        self, indexed_paths: Mapping[str, str] | None
-    ) -> ListFolderResult:
-        known = dict(indexed_paths or {})
-        entries: list[Metadata] = []
-        for provider_id, old_path in sorted(known.items()):
-            current = self._metadata_by_id.get(provider_id)
-            if current is None or current.path_lower != normalize(old_path):
-                entries.append(
-                    DeletedMetadata(
-                        posixpath.basename(old_path),
-                        normalize(old_path),
-                        old_path,
-                    )
-                )
-        entries.extend(
-            sorted(
-                self._metadata_by_path.values(),
-                key=lambda metadata: metadata.path_lower,
-            )
-        )
-        return ListFolderResult(entries, False, self._encode_cursor(self._cursor))
-
     def _encode_cursor(self, provider_cursor: str) -> str:
+        return self._encode_logical_cursor(LogicalCursor.steady(provider_cursor))
+
+    def _encode_logical_cursor(self, cursor: LogicalCursor) -> str:
         payload = {
-            "version": 1,
+            "version": 2,
             "provider": self._provider.provider_id,
             "namespace": self._provider.namespace_id,
             "vault_root": self._mirror.remote_root,
             "vault_root_id": self._mirror.remote_root_id,
             "vault_id": self._require_vault_identity(),
-            "cursor": provider_cursor,
+            "logical": cursor.to_payload(),
         }
         encoded = base64.urlsafe_b64encode(
             json.dumps(
@@ -2693,7 +2865,17 @@ class EncryptedRemoteProvider:
         return self._CURSOR_PREFIX + encoded.decode("ascii")
 
     def _decode_cursor(self, cursor: str) -> str | None:
-        if not cursor.startswith(self._CURSOR_PREFIX) or len(cursor) > 4 * 1024 * 1024:
+        decoded = self._decode_logical_cursor(cursor)
+        if decoded is None or decoded.phase != "steady":
+            return None
+        return decoded.cursor
+
+    def _decode_logical_cursor(self, cursor: str) -> LogicalCursor | None:
+        if (
+            not isinstance(cursor, str)
+            or not cursor.startswith(self._CURSOR_PREFIX)
+            or len(cursor.encode("utf-8")) > self._MAX_CURSOR_BYTES
+        ):
             return None
         try:
             encoded = cursor[len(self._CURSOR_PREFIX) :].encode("ascii", "strict")
@@ -2709,21 +2891,32 @@ class EncryptedRemoteProvider:
             "vault_root",
             "vault_root_id",
             "vault_id",
-            "cursor",
+            "logical",
         }:
             return None
         if (
-            payload["version"] != 1
+            payload["version"] != 2
             or payload["provider"] != self._provider.provider_id
             or payload["namespace"] != self._provider.namespace_id
             or payload["vault_root"] != self._mirror.remote_root
             or payload["vault_root_id"] != self._mirror.remote_root_id
             or payload["vault_id"] != self._require_vault_identity()
-            or not isinstance(payload["cursor"], str)
-            or not payload["cursor"]
         ):
             return None
-        return payload["cursor"]
+        decoded_cursor = LogicalCursor.from_payload(payload["logical"])
+        if decoded_cursor is None:
+            return None
+        if decoded_cursor.phase == "snapshot":
+            assert decoded_cursor.scope is not None
+            scope_path = decoded_cursor.scope[0]
+            try:
+                if self._normalise_logical_path(
+                    scope_path
+                ) != scope_path or self._is_reserved_logical_path(scope_path):
+                    return None
+            except ValueError:
+                return None
+        return decoded_cursor
 
     def _rebuild_logical_metadata(self) -> None:
         current, manifest_present = self._collect_current_logical_entries(

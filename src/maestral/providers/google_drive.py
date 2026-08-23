@@ -7,6 +7,7 @@ IDs as identity, and projects Drive's non-unique names to deterministic local pa
 from __future__ import annotations
 
 import base64
+import binascii
 import hashlib
 import html
 import json
@@ -32,6 +33,7 @@ from typing import (
     Any,
     BinaryIO,
     Final,
+    Literal,
     Protocol,
     TypeVar,
     cast,
@@ -78,6 +80,15 @@ from maestral.exceptions import (
 )
 from maestral.keyring import CredentialStorage
 from maestral.logging import scoped_logger
+from maestral.providers.base import (
+    MAX_LOGICAL_PAGE_SIZE,
+    LogicalCursor,
+    LogicalListingScope,
+    LogicalOperationKey,
+    iter_logical_pages,
+    logical_operation_key,
+    validate_logical_page_limit,
+)
 from maestral.utils import natural_size
 from maestral.utils.hashing import ContentHasherFactory, md5_content_hasher
 from maestral.utils.path import normalize, opener_no_symlink
@@ -1454,6 +1465,8 @@ class GoogleDriveProvider:
     provider_id = "google_drive"
     api_url = GOOGLE_DRIVE_API
     content_hasher_factory: ContentHasherFactory
+    _CURSOR_PREFIX = "google-drive-v1:"
+    _MAX_CURSOR_BYTES = 4 * 1024 * 1024
 
     def __init__(
         self,
@@ -1870,15 +1883,260 @@ class GoogleDriveProvider:
         include_mounted_folders: bool = True,
         include_non_downloadable_files: bool = False,
     ) -> ListFolderResult:
-        return next(
-            self.list_folder_iterator(
-                remote_path,
-                recursive,
-                include_deleted,
-                include_mounted_folders,
-                include_non_downloadable_files=include_non_downloadable_files,
+        entries: list[Metadata] = []
+        final_page: ListFolderResult | None = None
+        for page in self.list_folder_iterator(
+            remote_path,
+            recursive,
+            include_deleted,
+            include_mounted_folders,
+            include_non_downloadable_files=include_non_downloadable_files,
+        ):
+            entries.extend(page.entries)
+            final_page = page
+        if final_page is None:
+            raise GoogleDriveError(
+                "Google Drive returned invalid data",
+                "The folder listing did not return a page.",
             )
+        return ListFolderResult(entries, False, final_page.cursor)
+
+    def _logical_snapshot(
+        self,
+        remote_path: str,
+        recursive: bool,
+    ) -> tuple[str, str, list[tuple[LogicalOperationKey, Metadata]]]:
+        for _attempt in range(5):
+            origin_cursor = self.drive.get_start_page_token()
+            self._refresh_projection()
+            final_cursor = self.drive.get_start_page_token()
+            if final_cursor == origin_cursor:
+                break
+        else:
+            raise GoogleDriveError(
+                "Google Drive kept changing",
+                "Retry the folder listing after remote changes settle.",
+            )
+        self._projection_cursor = final_cursor
+        operations: list[tuple[LogicalOperationKey, Metadata]] = [
+            (logical_operation_key("upsert", entry.path_display, entry.id), entry)
+            for entry in self._listed_metadata(remote_path, recursive)
+            if isinstance(entry, (FileMetadata, FolderMetadata))
+        ]
+        return origin_cursor, final_cursor, operations
+
+    def _logical_changes(
+        self,
+        origin_cursor: str,
+        indexed_paths: Mapping[str, str] | None,
+        *,
+        use_cached_projection: bool = False,
+    ) -> tuple[str, list[tuple[LogicalOperationKey, Metadata]]]:
+        _validate_page_token(origin_cursor)
+        known_paths = dict(indexed_paths or {})
+
+        cached_projection = (
+            use_cached_projection
+            and self._projection is not None
+            and self._projection_cursor == origin_cursor
         )
+        attempts = 1 if cached_projection else 5
+        for _attempt in range(attempts):
+            final_cursor = origin_cursor
+            changed_ids: set[str] = set()
+            token = origin_cursor
+            seen_tokens = {token}
+            while True:
+                page = self.drive.list_changes(token)
+                changed_ids.update(change.file_id for change in page.changes)
+                if cached_projection:
+                    assert self._projection is not None
+                    self._projection.apply_changes(page.changes)
+                next_token = page.next_page_token or page.new_start_page_token
+                assert next_token is not None
+                final_cursor = next_token
+                if page.next_page_token is None:
+                    break
+                if next_token in seen_tokens:
+                    raise GoogleDriveError(
+                        "Google Drive returned invalid data",
+                        "A change page token was repeated.",
+                    )
+                seen_tokens.add(next_token)
+                token = next_token
+
+            if cached_projection:
+                break
+            self._refresh_projection()
+            projection_cursor = self.drive.get_start_page_token()
+            if projection_cursor == final_cursor:
+                break
+        else:
+            raise GoogleDriveError(
+                "Google Drive kept changing",
+                "Retry the remote changes after they settle.",
+            )
+
+        projection = self._ensure_projection()
+        current_paths = {
+            projected.item.id: projected.path
+            for projected in projection.projected_items()
+        }
+        operations: list[tuple[LogicalOperationKey, Metadata]] = []
+        for file_id, old_path in known_paths.items():
+            new_path = current_paths.get(file_id)
+            if new_path is None or self._path_lower(new_path) != self._path_lower(
+                old_path
+            ):
+                deleted = DeletedMetadata(
+                    posixpath.basename(old_path),
+                    self._path_lower(old_path),
+                    old_path,
+                )
+                operations.append(
+                    (logical_operation_key("delete", old_path, file_id), deleted)
+                )
+
+        for file_id, new_path in current_paths.items():
+            known_path = known_paths.get(file_id)
+            path_changed = known_path is not None and self._path_lower(
+                known_path
+            ) != self._path_lower(new_path)
+            if file_id in changed_ids or path_changed or known_path is None:
+                current_metadata = self._metadata_for_id(file_id)
+                if current_metadata is not None:
+                    operations.append(
+                        (
+                            logical_operation_key(
+                                "upsert", current_metadata.path_display, file_id
+                            ),
+                            current_metadata,
+                        )
+                    )
+        self._projection_cursor = final_cursor
+        return final_cursor, operations
+
+    def _logical_recovery_changes(
+        self,
+        indexed_paths: Mapping[str, str] | None,
+    ) -> tuple[str, str, list[tuple[LogicalOperationKey, Metadata]]]:
+        """Build a safe full diff when a durable cursor cannot be decoded."""
+        origin_cursor, final_cursor, current = self._logical_snapshot("/", True)
+        known_paths = dict(indexed_paths or {})
+        current_paths = {
+            entry.id: entry.path_display
+            for _, entry in current
+            if isinstance(entry, (FileMetadata, FolderMetadata))
+        }
+        deletions: list[tuple[LogicalOperationKey, Metadata]] = []
+        for file_id, old_path in known_paths.items():
+            new_path = current_paths.get(file_id)
+            if new_path is None or self._path_lower(new_path) != self._path_lower(
+                old_path
+            ):
+                metadata = DeletedMetadata(
+                    posixpath.basename(old_path),
+                    self._path_lower(old_path),
+                    old_path,
+                )
+                deletions.append(
+                    (logical_operation_key("delete", old_path, file_id), metadata)
+                )
+        return origin_cursor, final_cursor, [*deletions, *current]
+
+    def _logical_pages(
+        self,
+        operations: list[tuple[LogicalOperationKey, Metadata]],
+        *,
+        phase: Literal["snapshot", "changes"],
+        origin_cursor: str,
+        final_cursor: str,
+        scope: LogicalListingScope,
+        last_key: LogicalOperationKey | None = None,
+    ) -> Iterator[ListFolderResult]:
+        limit = scope[2]
+        for entries, page_key, has_more in iter_logical_pages(
+            operations, limit, last_key
+        ):
+            if has_more:
+                assert page_key is not None
+                cursor = self._encode_cursor(
+                    LogicalCursor.continuation(
+                        phase,
+                        origin_cursor,
+                        final_cursor,
+                        page_key,
+                        scope,
+                    )
+                )
+            else:
+                cursor = self._encode_cursor(LogicalCursor.steady(final_cursor))
+            yield ListFolderResult(entries, has_more, cursor)
+
+    def _encode_cursor(self, cursor: LogicalCursor) -> str:
+        payload = {
+            "version": 1,
+            "provider": self.provider_id,
+            "namespace": self.namespace_id,
+            "logical": cursor.to_payload(),
+        }
+        encoded = base64.urlsafe_b64encode(
+            json.dumps(
+                payload, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+            ).encode("utf-8")
+        ).rstrip(b"=")
+        return self._CURSOR_PREFIX + encoded.decode("ascii")
+
+    def _decode_cursor(self, cursor: str) -> LogicalCursor | None:
+        if (
+            not isinstance(cursor, str)
+            or not cursor.startswith(self._CURSOR_PREFIX)
+            or len(cursor.encode("utf-8")) > self._MAX_CURSOR_BYTES
+        ):
+            return None
+        try:
+            encoded = cursor[len(self._CURSOR_PREFIX) :].encode("ascii", "strict")
+            encoded += b"=" * (-len(encoded) % 4)
+            decoded = base64.b64decode(encoded, altchars=b"-_", validate=True)
+            payload = json.loads(decoded.decode("utf-8"))
+        except (binascii.Error, UnicodeError, json.JSONDecodeError, ValueError):
+            return None
+        if not isinstance(payload, dict) or set(payload) != {
+            "version",
+            "provider",
+            "namespace",
+            "logical",
+        }:
+            return None
+        if (
+            payload["version"] != 1
+            or payload["provider"] != self.provider_id
+            or payload["namespace"] != self.namespace_id
+        ):
+            return None
+        decoded_cursor = LogicalCursor.from_payload(payload["logical"])
+        if decoded_cursor is None:
+            return None
+        if decoded_cursor.phase == "snapshot":
+            assert decoded_cursor.scope is not None
+            scope_path = decoded_cursor.scope[0]
+            try:
+                if self._normalise_remote_path(scope_path) != scope_path:
+                    return None
+            except ValueError:
+                return None
+        raw_cursors = (
+            [decoded_cursor.cursor]
+            if decoded_cursor.phase == "steady"
+            else [decoded_cursor.origin_cursor, decoded_cursor.final_cursor]
+        )
+        try:
+            for raw_cursor in raw_cursors:
+                assert raw_cursor is not None
+                _validate_page_token(raw_cursor)
+        except (AssertionError, ValueError):
+            return None
+        return decoded_cursor
 
     def list_folder_iterator(
         self,
@@ -1889,16 +2147,20 @@ class GoogleDriveProvider:
         limit: int | None = None,
         include_non_downloadable_files: bool = False,
     ) -> Iterator[ListFolderResult]:
-        del include_deleted, include_mounted_folders, limit
+        del include_deleted, include_mounted_folders
         del include_non_downloadable_files
         remote_path = self._normalise_remote_path(remote_path)
-        cursor = self.drive.get_start_page_token()
-        self._refresh_projection()
-        self._projection_cursor = cursor
-        yield ListFolderResult(
-            self._listed_metadata(remote_path, recursive),
-            False,
-            cursor,
+        page_limit = validate_logical_page_limit(limit)
+        origin_cursor, final_cursor, operations = self._logical_snapshot(
+            remote_path, recursive
+        )
+        scope = (remote_path, recursive, page_limit)
+        yield from self._logical_pages(
+            operations,
+            phase="snapshot",
+            origin_cursor=origin_cursor,
+            final_cursor=final_cursor,
+            scope=scope,
         )
 
     def list_remote_changes_iterator(
@@ -1906,78 +2168,90 @@ class GoogleDriveProvider:
         last_cursor: str,
         indexed_paths: Mapping[str, str] | None = None,
     ) -> Iterator[ListFolderResult]:
-        _validate_page_token(last_cursor)
-        known_paths = dict(indexed_paths or {})
-        apply_pages = (
-            self._projection is not None and self._projection_cursor == last_cursor
-        )
-        if not apply_pages:
-            self._refresh_projection()
-
-        token = last_cursor
-        seen_tokens = {token}
-        while True:
-            page = self.drive.list_changes(token)
-            projection = self._ensure_projection()
-            if apply_pages:
-                projection.apply_changes(page.changes)
-            changed_ids = {change.file_id for change in page.changes}
-            current_paths = {
-                projected.item.id: projected.path
-                for projected in projection.projected_items()
-            }
-            entries: list[Metadata] = []
-            for file_id, old_path in sorted(known_paths.items()):
-                new_path = current_paths.get(file_id)
-                if new_path is None or self._path_lower(new_path) != self._path_lower(
-                    old_path
-                ):
-                    entries.append(
-                        DeletedMetadata(
-                            posixpath.basename(old_path),
-                            self._path_lower(old_path),
-                            old_path,
-                        )
-                    )
-            for file_id, new_path in sorted(current_paths.items()):
-                known_path = known_paths.get(file_id)
-                path_changed = known_path is not None and self._path_lower(
-                    known_path
-                ) != self._path_lower(new_path)
-                if file_id in changed_ids or path_changed:
-                    metadata = self._metadata_for_id(file_id)
-                    if metadata is not None:
-                        entries.append(metadata)
-
-            for file_id in tuple(known_paths):
-                if file_id not in current_paths:
-                    known_paths.pop(file_id, None)
-            for entry in entries:
-                if not isinstance(entry, DeletedMetadata):
-                    item_id = cast(FileMetadata | FolderMetadata, entry).id
-                    known_paths[item_id] = entry.path_display
-
-            next_token = page.next_page_token or page.new_start_page_token
-            assert next_token is not None
-            self._projection_cursor = next_token
-            yield ListFolderResult(
-                entries, page.next_page_token is not None, next_token
+        cursor = self._decode_cursor(last_cursor)
+        default_scope: LogicalListingScope = ("/", True, MAX_LOGICAL_PAGE_SIZE)
+        if cursor is None:
+            origin, final, operations = self._logical_recovery_changes(indexed_paths)
+            yield from self._logical_pages(
+                operations,
+                phase="changes",
+                origin_cursor=origin,
+                final_cursor=final,
+                scope=default_scope,
             )
-            if page.next_page_token is None:
-                break
-            if next_token in seen_tokens:
-                raise GoogleDriveError(
-                    "Google Drive returned invalid data",
-                    "A change page token was repeated.",
+            return
+
+        if cursor.phase == "snapshot":
+            assert cursor.origin_cursor is not None
+            assert cursor.final_cursor is not None
+            assert cursor.last_key is not None
+            assert cursor.scope is not None
+            path, recursive, _limit = cursor.scope
+            new_origin, new_final, operations = self._logical_snapshot(path, recursive)
+            if new_final == cursor.final_cursor:
+                origin = cursor.origin_cursor
+                final = cursor.final_cursor
+                last_key = cursor.last_key
+            else:
+                origin = new_origin
+                final = new_final
+                last_key = None
+            yield from self._logical_pages(
+                operations,
+                phase="snapshot",
+                origin_cursor=origin,
+                final_cursor=final,
+                scope=cursor.scope,
+                last_key=last_key,
+            )
+            return
+
+        if cursor.phase == "changes":
+            assert cursor.origin_cursor is not None
+            assert cursor.final_cursor is not None
+            assert cursor.last_key is not None
+            if cursor.scope != default_scope:
+                origin, final, operations = self._logical_recovery_changes(
+                    indexed_paths
                 )
-            seen_tokens.add(next_token)
-            token = next_token
+                last_key = None
+            else:
+                origin = cursor.origin_cursor
+                final, operations = self._logical_changes(origin, indexed_paths)
+                last_key = cursor.last_key if final == cursor.final_cursor else None
+            yield from self._logical_pages(
+                operations,
+                phase="changes",
+                origin_cursor=origin,
+                final_cursor=final,
+                scope=default_scope,
+                last_key=last_key,
+            )
+            return
+
+        assert cursor.cursor is not None
+        final, operations = self._logical_changes(
+            cursor.cursor,
+            indexed_paths,
+            use_cached_projection=True,
+        )
+        yield from self._logical_pages(
+            operations,
+            phase="changes",
+            origin_cursor=cursor.cursor,
+            final_cursor=final,
+            scope=default_scope,
+        )
 
     def wait_for_remote_changes(self, last_cursor: str, timeout: int = 40) -> bool:
         if timeout <= 0:
             raise ValueError("Timeout must be positive")
+        cursor = self._decode_cursor(last_cursor)
+        if cursor is None or cursor.phase != "steady":
+            return True
+        assert cursor.cursor is not None
         self._sleep(min(float(timeout), 5.0))
-        return bool(self.drive.list_changes(last_cursor).changes)
+        return bool(self.drive.list_changes(cursor.cursor).changes)
 
     def download(
         self,
