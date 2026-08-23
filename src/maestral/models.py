@@ -30,7 +30,7 @@ from .core import DeletedMetadata, FileMetadata, FolderMetadata, Metadata
 from .database.orm import Column, Model, NonNullColumn
 from .database.types import SqlEnum, SqlFloat, SqlInt, SqlLargeInt, SqlPath, SqlString
 from .exceptions import NotLinkedError, SyncError
-from .utils.path import get_local_change_time, normalize
+from .utils.path import get_local_change_time, get_symlink_target, normalize
 
 if TYPE_CHECKING:
     from .sync import SyncEngine
@@ -449,7 +449,7 @@ class SyncEvent(Model):
                 symlink_target = (
                     None
                     if skip_local_access
-                    else os.readlink(os.fsdecode(event.src_path))
+                    else get_symlink_target(os.fsdecode(event.src_path))
                 )
             except OSError:
                 symlink_target = None

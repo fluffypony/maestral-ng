@@ -20,6 +20,7 @@ from maestral.utils.path import (
     delete,
     fs_max_lengths_for_path,
     get_existing_equivalent_paths,
+    get_symlink_target,
     is_child,
     is_equal_or_child,
     is_fs_case_sensitive,
@@ -1500,7 +1501,7 @@ def test_rooted_tree_snapshot_does_not_follow_links(tmp_path):
     assert str(outside_file) not in snapshot
     assert snapshot[str(file)][5] == os.lstat(file).st_ctime_ns
     assert snapshot[str(file)][6] == content_hash(str(file))[0]
-    assert snapshot[str(link)][6] == f"symlink:{os.readlink(link)}"
+    assert snapshot[str(link)][6] == f"symlink:{get_symlink_target(str(link))}"
 
 
 def test_rooted_tree_snapshot_hash_detects_same_size_content_change(tmp_path):

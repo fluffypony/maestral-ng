@@ -692,6 +692,22 @@ def test_windows_symlink_permission_has_specific_error(tmp_path):
     assert error.local_path == str(local_path)
 
 
+@windows_only
+def test_windows_symlink_target_omits_win32_namespace_prefix(tmp_path):
+    target = tmp_path / "target"
+    target.write_text("target")
+    link = tmp_path / "link"
+
+    try:
+        link.symlink_to(target)
+    except OSError as exc:
+        if getattr(exc, "winerror", None) == 1314:
+            pytest.skip("Windows did not grant symlink creation permission")
+        raise
+
+    assert path_module.get_symlink_target(str(link)) == str(target)
+
+
 class _RecordingEventHandler(FileSystemEventHandler):
     def __init__(self) -> None:
         self.events: list[FileSystemEvent] = []

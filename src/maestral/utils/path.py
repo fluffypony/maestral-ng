@@ -1615,6 +1615,17 @@ def _snapshot_identity(stat_result: os.stat_result) -> TreeSnapshotIdentity:
     return _snapshot_identity_with_content(stat_result, None)
 
 
+def _normalize_windows_link_target(target: str) -> str:
+    """Remove the Win32 namespace prefix which ``os.readlink`` exposes."""
+    if not IS_WINDOWS:
+        return target
+    if target.startswith("\\\\?\\UNC\\"):
+        return "\\\\" + target[8:]
+    if target.startswith("\\\\?\\"):
+        return target[4:]
+    return target
+
+
 def _snapshot_identity_with_content(
     stat_result: os.stat_result, content_identity: str | None
 ) -> TreeSnapshotIdentity:
@@ -1796,7 +1807,7 @@ def _windows_snapshot_opened(
     is_reparse_point = bool(info.file_attributes & _FILE_ATTRIBUTE_REPARSE_POINT)
 
     if is_reparse_point:
-        target = os.readlink(path)
+        target = _normalize_windows_link_target(os.readlink(path))
         final_stat = os.lstat(path)
         if not _same_snapshot_stat(item_stat, final_stat):
             raise OSError(errno.ESTALE, os.strerror(errno.ESTALE), path)
@@ -1861,7 +1872,8 @@ def _windows_snapshot_item_opened(
     is_reparse_point = bool(info.file_attributes & _FILE_ATTRIBUTE_REPARSE_POINT)
 
     if is_reparse_point:
-        content_identity = f"symlink:{os.readlink(path)}"
+        target = _normalize_windows_link_target(os.readlink(path))
+        content_identity = f"symlink:{target}"
     elif not is_directory and stat.S_ISREG(item_stat.st_mode):
         content_identity = _hash_windows_handle(path, handle)
     else:
@@ -3600,7 +3612,7 @@ def get_symlink_target(local_path: str) -> Optional[str]:
         a symlink or does not exist.
     """
     try:
-        return os.readlink(local_path)
+        return _normalize_windows_link_target(os.readlink(local_path))
     except (FileNotFoundError, NotADirectoryError):
         return None
     except OSError as err:

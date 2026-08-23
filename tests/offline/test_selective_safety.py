@@ -51,6 +51,7 @@ from maestral.main import Maestral
 from maestral.models import ChangeType, IndexEntry, ItemType, SyncEvent, SyncStatus
 from maestral.sync import Conflict, SyncDirection, SyncEngine
 from maestral.utils.hashing import DropboxContentHasher
+from maestral.utils.path import get_symlink_target
 
 
 @pytest.fixture
@@ -1080,7 +1081,7 @@ def test_remote_ancestor_deletion_preserves_ignored_symlink(
 
     assert status is SyncStatus.Done
     assert link_path.is_symlink()
-    assert os.readlink(link_path) == str(target_path)
+    assert get_symlink_target(str(link_path)) == str(target_path)
     assert not managed_path.exists()
     assert parent_path.is_dir()
 
@@ -2416,7 +2417,7 @@ def test_case_change_moves_managed_symlink_with_ignore_policy(
     sync_engine._apply_case_change(event)
 
     assert new_path.is_symlink()
-    assert os.readlink(new_path) == str(target_path)
+    assert get_symlink_target(str(new_path)) == str(target_path)
     assert "item" in {path.name for path in Path(sync_engine.dropbox_path).iterdir()}
     assert "Item" not in {
         path.name for path in Path(sync_engine.dropbox_path).iterdir()

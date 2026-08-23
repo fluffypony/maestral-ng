@@ -138,6 +138,7 @@ from .utils.path import (
     generate_cc_name,
     get_existing_equivalent_paths,
     get_local_change_time,
+    get_symlink_target,
     getsize,
     is_child,
     is_equal_or_child,
@@ -1996,8 +1997,14 @@ class SyncEngine:
         if dbx_path_cased == "/":
             return SyncStatus.Skipped
         local_path = self.to_local_path_from_cased(dbx_path_cased)
-        snapshot = self._snapshot_local_tree(local_path)
         dbx_path_lower = normalize(dbx_path_cased)
+        try:
+            snapshot = self._snapshot_local_tree(local_path)
+        except OSError as exc:
+            if exc.errno != errno.ELOOP:
+                raise
+            self.remove_node_from_index(dbx_path_lower)
+            return SyncStatus.Skipped
         index_entries = {
             entry.dbx_path_lower: entry
             for entry in self.iter_index()
@@ -2317,7 +2324,7 @@ class SyncEngine:
                 remember=False,
             ):
                 return False
-            return os.readlink(local_path) == entry.symlink_target
+            return get_symlink_target(local_path) == entry.symlink_target
         except OSError:
             return False
 
