@@ -28,6 +28,7 @@ from maestral.daemon import (
 from maestral.exceptions import NotLinkedError
 from maestral.main import Maestral
 from maestral.rpc import JsonRpcConnection
+from maestral.utils.appdirs import get_data_path
 
 # locking tests
 
@@ -302,6 +303,20 @@ def test_connection(config_name: str) -> None:
     # stop daemon
     res_stop = stop_maestral_daemon_process(config_name)
     assert res_stop is Stop.Ok
+
+
+@pytest.mark.skipif(not daemon_module._is_windows(), reason="requires Windows")
+def test_windows_stop_releases_database_before_return(config_name: str) -> None:
+    assert start_maestral_daemon_process(config_name, timeout=20) is Start.Ok
+    database_path = get_data_path("maestral", f"{config_name}.db")
+    moved_path = f"{database_path}.moved"
+
+    assert stop_maestral_daemon_process(config_name) is Stop.Ok
+    try:
+        os.replace(database_path, moved_path)
+    finally:
+        if os.path.exists(moved_path):
+            os.replace(moved_path, database_path)
 
 
 def test_shutdown_closes_existing_clients(config_name: str) -> None:

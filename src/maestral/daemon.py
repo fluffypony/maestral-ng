@@ -506,6 +506,7 @@ def start_maestral_daemon(
     loop: asyncio.AbstractEventLoop | None = None
     socket_path: str | None = None
     endpoint_path: str | None = None
+    maestral_daemon: Maestral | None = None
 
     try:
         # Get the default event loop.
@@ -605,6 +606,10 @@ def start_maestral_daemon(
                 )
             loop.close()
             asyncio.set_event_loop(None)
+
+        if maestral_daemon is not None:
+            maestral_daemon.manager.shutdown()
+            maestral_daemon.sync._connection.close()
 
         lock.release()
 
