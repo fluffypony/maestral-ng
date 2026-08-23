@@ -1627,6 +1627,38 @@ def test_multibyte_component_over_filesystem_limit_fails_before_native_mutation(
     controller.close()
 
 
+@pytest.mark.parametrize("update_kind", ["direct", "batch", "snapshot"])
+@pytest.mark.parametrize("control", ["\n", "\x7f"])
+def test_control_characters_in_paths_fail_before_native_mutation(
+    config_name: str,
+    tmp_path: Path,
+    update_kind: str,
+    control: str,
+) -> None:
+    provider = FakeVirtualProvider()
+    backend = FakeVirtualFileBackend()
+    controller = make_controller(config_name, tmp_path, provider, backend)
+    metadata = provider.add_file(
+        "control-1", f"/unsafe{control}name.txt", "rev-1", b"bad"
+    )
+    call_count = len(backend.calls)
+
+    with pytest.raises(ValueError, match="normalised path"):
+        if update_kind == "direct":
+            controller.reconcile_remote_change(metadata)
+        elif update_kind == "batch":
+            controller.reconcile_remote_batch([metadata], "cursor-new")
+        else:
+            controller._set_checkpoint("")
+            provider.pages = [ListFolderResult([metadata], False, "cursor-new")]
+            controller.refresh_remote()
+
+    assert len(backend.calls) == call_count
+    assert backend.items == {}
+    assert controller.status_page()["items"] == []
+    controller.close()
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [("id", "é" * 513), ("rev", "revision\x7f")],

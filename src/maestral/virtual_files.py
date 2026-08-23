@@ -80,7 +80,7 @@ def _validate_virtual_path(
         or not path.startswith("/")
         or not _has_utf8_length_at_most(path, _MAX_VIRTUAL_PATH_LENGTH)
         or "\\" in path
-        or "\x00" in path
+        or any(unicodedata.category(character) == "Cc" for character in path)
         or posixpath.normpath(path) != path
     ):
         raise ValueError(f"The virtual-file {name} is invalid")
