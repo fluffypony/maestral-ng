@@ -5,7 +5,7 @@ Maestral Developer Documentation
 This documentation provides an API reference for the maestral daemon.
 It is built from the current dev branch and is intended for developers.
 For a user manual and an overview of Maestral's functionality, please
-refer to `maestral.app <https://maestral.app>`_.
+refer to `getmaestral.com <https://getmaestral.com>`_.
 
 .. toctree::
    :hidden:

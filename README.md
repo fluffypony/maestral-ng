@@ -3,18 +3,13 @@
 [![Documentation Status](https://readthedocs.org/projects/maestral/badge/?version=latest)](https://maestral.readthedocs.io/en/latest/?badge=latest)
 [![codecov](https://codecov.io/gh/SamSchott/maestral/branch/master/graph/badge.svg?token=V0C7IQ1MAU)](https://codecov.io/gh/SamSchott/maestral)
 
-# Archived
-
-As of 2026-07-28, this project is archived. It's been a fun challenge to develop a
-syncing client, but unfortunately, I find too little time to invest in Maestral these
-days. I've also moved away from using Dropbox myself.
-
-Maestral will still remain usable in the medium term, but will no longer be actively
-maintained or receive updates.
-
 # Maestral <img src="https://raw.githubusercontent.com/SamSchott/maestral/master/src/maestral/resources/maestral.png" align="right" title="Maestral" width="110" height="110">
 
-A light-weight and open-source Dropbox client for macOS and Linux.
+A light-weight and open-source Dropbox client for macOS, Linux, and Windows.
+
+This repository continues development of Maestral. The original project at
+[samschott/maestral](https://github.com/samschott/maestral) was archived in July 2026;
+thanks to Sam Schott for building and maintaining Maestral from 2018 until then.
 
 ## About
 
@@ -53,7 +48,7 @@ On other platforms, you can download and install Maestral as a Python package fr
 as a Docker image from Docker Hub.
 
 For more detailed information on the installation, setup and system requirements, please
-check the [documentation](https://maestral.app/docs/installation).
+check the [documentation](https://getmaestral.com/docs/installation).
 
 ### Homebrew
 
@@ -137,7 +132,7 @@ By default, the Dropbox folder names will contain the capitalised config-name in
 In the above case, this will be "Dropbox (Personal)" and "Dropbox (Work)".
 
 A full documentation of the CLI is available on the
-[website](https://maestral.app/cli).
+[website](https://getmaestral.com/cli).
 
 ## Contribute
 

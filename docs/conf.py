@@ -1,6 +1,5 @@
 import os
 import sys
-import time
 
 # -- Path setup ------------------------------------------------------------------------
 
@@ -13,7 +12,7 @@ version = "1.9.7.dev0"
 release = version
 project = "Maestral"
 title = "Maestral API Documentation"
-copyright = f"{time.localtime().tm_year}, {author}"
+copyright = '2018-2026, Sam Schott; 2026, Riccardo "fluffypony" Spagni'
 
 # -- General configuration -------------------------------------------------------------
 

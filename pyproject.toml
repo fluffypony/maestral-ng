@@ -20,7 +20,7 @@ classifiers = [
     "Programming Language :: Python :: 3.14",
     "Programming Language :: Python :: 3 :: Only",
 ]
-urls = { Homepage = "https://maestral.app" }
+urls = { Homepage = "https://getmaestral.com" }
 requires-python = ">=3.11"
 dependencies = [
     "click>=8.2.0",
