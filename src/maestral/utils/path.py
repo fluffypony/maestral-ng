@@ -640,8 +640,15 @@ def _windows_rooted_parent(
     path: str,
     root_path: str,
     expected_root_identity: tuple[int, ...] | None = None,
+    *,
+    share_ancestor_write: bool = False,
 ) -> Iterator[tuple[str, str]]:  # pragma: no cover - Windows only
-    """Hold non-reparse ancestors without delete sharing for one path operation."""
+    """Hold non-reparse ancestors without delete sharing for one path operation.
+
+    A rename or deletion must share writes on its ancestors because Windows treats
+    the child mutation as a write through each directory. Every ancestor still denies
+    delete sharing.
+    """
     absolute_root, absolute_path, components = _rooted_path_parts(path, root_path)
     handles: list[int] = []
 
@@ -651,7 +658,7 @@ def _windows_rooted_parent(
             handle, info = _open_windows_handle(
                 ancestor,
                 read_access=True,
-                share_write=False,
+                share_write=share_ancestor_write,
             )
             handles.append(handle)
 
@@ -1247,10 +1254,12 @@ def open_rooted_file(
 ) -> BinaryIO:
     """Open and hold a regular file below a validated root for binary reads."""
     if IS_WINDOWS:
-        with _windows_rooted_parent(path, root_path, expected_root_identity) as (
-            absolute_path,
-            _,
-        ):
+        with _windows_rooted_parent(
+            path,
+            root_path,
+            expected_root_identity,
+            share_ancestor_write=True,
+        ) as (absolute_path, _):
             handle, info = _open_windows_handle(
                 absolute_path,
                 read_access=True,
@@ -1525,10 +1534,12 @@ def unlink(
         return
 
     if IS_WINDOWS:
-        with _windows_rooted_parent(path, root_path, expected_root_identity) as (
-            absolute_path,
-            _,
-        ):
+        with _windows_rooted_parent(
+            path,
+            root_path,
+            expected_root_identity,
+            share_ancestor_write=True,
+        ) as (absolute_path, _):
             _windows_delete_path(
                 absolute_path,
                 recursive=False,
@@ -1569,10 +1580,12 @@ def rmdir(
         return
 
     if IS_WINDOWS:
-        with _windows_rooted_parent(path, root_path, expected_root_identity) as (
-            absolute_path,
-            _,
-        ):
+        with _windows_rooted_parent(
+            path,
+            root_path,
+            expected_root_identity,
+            share_ancestor_write=True,
+        ) as (absolute_path, _):
             _windows_delete_path(
                 absolute_path,
                 recursive=False,
@@ -2059,6 +2072,7 @@ def delete(
                             path,
                             root_path,
                             expected_root_identity,
+                            share_ancestor_write=True,
                         )
                     )
                     absolute_quarantine_path = None
@@ -2071,6 +2085,7 @@ def delete(
                                     quarantine_path,
                                     root_path,
                                     expected_root_identity,
+                                    share_ancestor_write=True,
                                 )
                             )
                     target_identity = expected_target_identity
@@ -2280,16 +2295,29 @@ def move(
         elif IS_WINDOWS:
             with ExitStack() as stack:
                 absolute_src, _ = stack.enter_context(
-                    _windows_rooted_parent(src_path, root_path, expected_root_identity)
+                    _windows_rooted_parent(
+                        src_path,
+                        root_path,
+                        expected_root_identity,
+                        share_ancestor_write=True,
+                    )
                 )
                 absolute_dest, _ = stack.enter_context(
-                    _windows_rooted_parent(dest_path, root_path, expected_root_identity)
+                    _windows_rooted_parent(
+                        dest_path,
+                        root_path,
+                        expected_root_identity,
+                        share_ancestor_write=True,
+                    )
                 )
                 absolute_metadata = metadata_path
                 if keep_target_permissions or keep_target_xattrs:
                     absolute_metadata, _ = stack.enter_context(
                         _windows_rooted_parent(
-                            metadata_path, root_path, expected_root_identity
+                            metadata_path,
+                            root_path,
+                            expected_root_identity,
+                            share_ancestor_write=True,
                         )
                     )
 
