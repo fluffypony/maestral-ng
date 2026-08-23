@@ -3401,6 +3401,8 @@ class EncryptedRemoteProvider:
 
     @staticmethod
     def _normalise_logical_path(path: str) -> str:
+        if path == "":
+            return "/"
         if (
             not isinstance(path, str)
             or not path.startswith("/")

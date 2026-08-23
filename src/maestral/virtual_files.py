@@ -46,6 +46,7 @@ VIRTUAL_MODE = "virtual"
 SYNC_MODES = (MIRROR_MODE, VIRTUAL_MODE)
 _MAX_VIRTUAL_PATH_LENGTH = 16_384
 _MAX_VIRTUAL_TOKEN_LENGTH = 1_024
+_MAX_VIRTUAL_CURSOR_LENGTH = 4 * 1_024 * 1_024
 _MAX_REMOTE_PAGE_ITEMS = 4_096
 _MAX_REMOTE_PAGES = 100_000
 _MAX_REMOTE_BATCH_ITEMS = 10_000_000
@@ -65,6 +66,19 @@ def _validate_virtual_token(value: object, name: str) -> str:
         not isinstance(value, str)
         or not value
         or not _has_utf8_length_at_most(value, _MAX_VIRTUAL_TOKEN_LENGTH)
+        or any(unicodedata.category(character) == "Cc" for character in value)
+    ):
+        raise ValueError(f"The virtual-file {name} is invalid")
+    return value
+
+
+def _validate_virtual_cursor(
+    value: object, name: str, *, allow_empty: bool = False
+) -> str:
+    if (
+        not isinstance(value, str)
+        or (not value and not allow_empty)
+        or not _has_utf8_length_at_most(value, _MAX_VIRTUAL_CURSOR_LENGTH)
         or any(unicodedata.category(character) == "Cc" for character in value)
     ):
         raise ValueError(f"The virtual-file {name} is invalid")
@@ -472,9 +486,11 @@ class _VirtualFileStore:
             f"SELECT cursor FROM {self._SENTINEL_TABLE} WHERE identity = ?",
             (self._SENTINEL_VALUE,),
         ).fetchone()
-        if row is None or not isinstance(row["cursor"], str):
+        if row is None:
             raise ValueError("The virtual-file cursor is invalid")
-        return row["cursor"]
+        return _validate_virtual_cursor(
+            row["cursor"], "cursor", allow_empty=True
+        )
 
     @property
     def needs_full_snapshot(self) -> bool:
@@ -489,8 +505,7 @@ class _VirtualFileStore:
 
     def set_checkpoint(self, cursor: str, needs_full_snapshot: bool) -> None:
         """Commit the remote checkpoint inside its indexed database."""
-        if not isinstance(cursor, str):
-            raise ValueError("The virtual-file cursor is invalid")
+        cursor = _validate_virtual_cursor(cursor, "cursor", allow_empty=True)
         if not isinstance(needs_full_snapshot, bool):
             raise ValueError("The virtual-file snapshot state is invalid")
         with self.connection:
@@ -1042,8 +1057,7 @@ class VirtualFileController:
 
     def reconcile_remote_batch(self, entries: Sequence[Metadata], cursor: str) -> None:
         """Apply one ordered remote page, then publish its opaque cursor."""
-        if not isinstance(cursor, str):
-            raise ValueError("The virtual-file cursor must be a string")
+        cursor = _validate_virtual_cursor(cursor, "cursor")
         with self._remote_lock:
             if not self.running or not self._ready.is_set():
                 raise VirtualFileBusyError(
@@ -1738,7 +1752,7 @@ class VirtualFileController:
             raise ValueError(f"The remote {page_name} has too many entries")
         if not isinstance(page.has_more, bool):
             raise ValueError(f"The remote {page_name} state is invalid")
-        cursor = _validate_virtual_token(page.cursor, f"{page_name} cursor")
+        cursor = _validate_virtual_cursor(page.cursor, f"{page_name} cursor")
         for metadata in page.entries:
             VirtualFileController._validate_remote_metadata(metadata)
         return page.entries, cursor, page.has_more

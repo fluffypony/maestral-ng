@@ -33,6 +33,9 @@ from maestral.providers.encrypted import (
 )
 from maestral.utils.hashing import sha256_content_hasher
 from maestral.utils.path import normalize
+from maestral.virtual_files import VirtualFileController
+
+from .virtual_files_fakes import FakeVirtualFileBackend
 
 
 class FakeRemoteProvider:
@@ -1121,6 +1124,43 @@ def test_encrypted_provider_lists_deletions_after_remote_refresh(
     assert page.entries[0].path_display == "/one.txt"
     assert not isinstance(page.entries[0], FileMetadata)
     provider.close()
+
+
+def test_encrypted_virtual_sync_accepts_a_long_provider_cursor(
+    config_name: str, tmp_path: Path
+) -> None:
+    remote = FakeRemoteProvider(tmp_path / "remote-provider")
+    provider = EncryptedRemoteProvider(
+        remote,
+        FakeSecretStore(),
+        "/Encrypted",
+        tmp_path / "ciphertext-cache",
+        sidecar=FakeCryptomatorSession("password"),
+    )
+    provider.initialise_vault("password")
+    provider.upload(io.BytesIO(b"one"), "/one.txt")
+    remote._cursor = "x" * 8_192  # type: ignore[assignment]
+
+    root = tmp_path / "virtual-root"
+    root.mkdir()
+    backend = FakeVirtualFileBackend()
+    controller = VirtualFileController(
+        config_name,
+        provider,
+        backend,
+        database_path=str(tmp_path / "virtual-files.db"),
+        remote_polling=False,
+    )
+    controller.start(str(root))
+    try:
+        controller.refresh_remote()
+
+        assert len(controller.cursor.encode("utf-8")) > 1_024
+        assert provider._decode_cursor(controller.cursor) == f"cursor:{remote._cursor}"
+        assert len(controller.status_page()["items"]) == 1
+    finally:
+        controller.close()
+        provider.close()
 
 
 def test_encrypted_provider_rejects_storage_map_mismatch(tmp_path: Path) -> None:
