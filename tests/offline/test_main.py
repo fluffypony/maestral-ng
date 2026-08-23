@@ -85,6 +85,64 @@ def test_root_creation_releases_its_reservation_before_replay_logging(
         m._state.set("recovery", "sync_reset", {})
 
 
+def test_mirror_only_operations_reject_virtual_mode(
+    m: Maestral, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    m._sync_mode = "virtual"
+    rebuild = Mock()
+    selective = Mock()
+    monkeypatch.setattr(m.manager, "rebuild_index", rebuild)
+    monkeypatch.setattr(m.sync, "clean_selective_sync_paths", selective)
+
+    with pytest.raises(MaestralApiError, match="only available for a mirror root"):
+        m.rebuild_index()
+    with pytest.raises(MaestralApiError, match="only available for a mirror root"):
+        m.set_selective_sync("exclude", ["/Folder"])
+
+    rebuild.assert_not_called()
+    selective.assert_not_called()
+
+
+def test_shutdown_retries_an_engine_before_shared_resource_close(
+    m: Maestral, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    virtual_close = m.virtual_files.close
+    manager_shutdown = m.manager.shutdown
+    client_close = m.client.close
+    calls: list[str] = []
+    virtual_attempts = 0
+
+    def close_virtual_files() -> None:
+        nonlocal virtual_attempts
+        virtual_attempts += 1
+        calls.append("virtual")
+        if virtual_attempts == 1:
+            raise OSError("native stop failed")
+        virtual_close()
+
+    def close_manager() -> None:
+        calls.append("manager")
+        manager_shutdown()
+
+    def close_client() -> None:
+        calls.append("client")
+        client_close()
+
+    monkeypatch.setattr(m.virtual_files, "close", close_virtual_files)
+    monkeypatch.setattr(m.manager, "shutdown", close_manager)
+    monkeypatch.setattr(m.client, "close", close_client)
+
+    with pytest.raises(OSError, match="native stop failed"):
+        m.shutdown_daemon()
+
+    assert calls == ["virtual"]
+
+    m.shutdown_daemon()
+    m.shutdown_daemon()
+
+    assert calls == ["virtual", "virtual", "manager", "client"]
+
+
 def test_check_for_updates(m: Maestral) -> None:
     # get current releases from GitHub
 
@@ -278,6 +336,8 @@ def test_link_refuses_old_root_recovery_after_interrupted_unlink(
         "account_id": "old-account",
         "keyring": "automatic",
         "credentials_deleted": False,
+        "vault_password_deleted": True,
+        "virtual_files_reset": True,
         "root_path": "/old/dropbox",
         "root_marker_id": "a" * 32,
     }
@@ -304,6 +364,8 @@ def test_reset_marker_remains_until_root_bound_recovery_is_clear(m: Maestral) ->
         "account_id": "old-account",
         "keyring": "automatic",
         "credentials_deleted": True,
+        "vault_password_deleted": True,
+        "virtual_files_reset": True,
         "root_path": "/old/dropbox",
         "root_marker_id": "a" * 32,
     }

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import difflib
 import errno
+import functools
 import gc
 import logging
 import mimetypes
@@ -127,6 +128,44 @@ def _sql_drop_table(db: Database, table: str) -> None:
         pass
 
 
+def _canonical_no_follow_path(path: str) -> str:
+    """Return a canonical local path after rejecting linked ancestors."""
+    absolute = osp.normpath(osp.abspath(osp.expanduser(path)))
+    candidate = absolute
+    while True:
+        if osp.lexists(candidate) and is_fs_link(os.lstat(candidate)):
+            raise ValueError("A local root cannot use a symbolic link or junction")
+        parent = osp.dirname(candidate)
+        if parent == candidate:
+            break
+        candidate = parent
+    return osp.realpath(absolute)
+
+
+def _local_roots_overlap(first: str, second: str) -> bool:
+    """Return whether two no-follow local roots contain each other."""
+    first_canonical = _canonical_no_follow_path(first)
+    second_canonical = _canonical_no_follow_path(second)
+    first_casefolded = osp.normcase(first_canonical).casefold()
+    second_casefolded = osp.normcase(second_canonical).casefold()
+    try:
+        common = osp.commonpath((first_casefolded, second_casefolded))
+    except ValueError:
+        return False
+    return common in {first_casefolded, second_casefolded}
+
+
+def _with_main_lifecycle(method: Any) -> Any:
+    """Serialize public operations which change the live sync topology."""
+
+    @functools.wraps(method)
+    def wrapped(self: Any, *args: Any, **kwargs: Any) -> Any:
+        with self._provider_selection_lock:
+            return method(self, *args, **kwargs)
+
+    return wrapped
+
+
 # ======================================================================================
 # Main API
 # ======================================================================================
@@ -192,6 +231,7 @@ class Maestral:
         self._config_name = validate_config_name(config_name)
         self._conf = MaestralConfig(self.config_name)
         self._provider_selection_lock = threading.RLock()
+        self._closed_resources: set[str] = set()
         configured_provider = normalise_provider_name(
             self._conf.get("auth", "provider")
         )
@@ -227,6 +267,7 @@ class Maestral:
         self.cred_storage = CredentialStorage(self.config_name, self.provider)
         self._migrate_pending_unlink_provider()
         self._resume_pending_unlink_credentials()
+        pending_unlink_recovery = self._pending_unlink_reset()
         self._notification_snooze_until = 0.0
 
         # Set up logging.
@@ -236,6 +277,7 @@ class Maestral:
         self._root_logger.handlers.clear()
         self._setup_logging_external()
         self._setup_logging_internal()
+        self._resume_vault_secret_cleanup()
 
         # Run update scripts after init of loggers and config / state.
         self._check_and_run_post_update_scripts()
@@ -260,6 +302,8 @@ class Maestral:
             selected_virtual_backend,
             remote_polling=virtual_file_remote_polling,
         )
+        if pending_unlink_recovery:
+            self._complete_pending_unlink_reset()
 
         # Create a future which will return once `shutdown_daemon` is called.
         # This can be used by an event loop to wait until maestral has been stopped.
@@ -364,9 +408,7 @@ class Maestral:
                         "Cannot link Dropbox account",
                         "Finish the old account recovery first: " + ", ".join(pending),
                     )
-                self._resume_pending_unlink_credentials()
-                self.sync._complete_pending_sync_reset()
-                self.manager.reload_download_queue()
+                self._complete_pending_unlink_reset()
                 if self._state.get("recovery", "sync_reset"):
                     raise MaestralApiError(
                         "Cannot link Dropbox account",
@@ -379,6 +421,7 @@ class Maestral:
                 allow_plaintext_keyring=allow_plaintext_keyring,
             )
 
+    @_with_main_lifecycle
     def unlink(self) -> None:
         """
         Unlinks the configured Dropbox account but leaves all downloaded files in place.
@@ -392,7 +435,7 @@ class Maestral:
         self.sync._ensure_unlink_recovery_clear()
         virtual_was_running = self.virtual_files.running
         if virtual_was_running:
-            self.virtual_files.reset()
+            self.virtual_files.stop()
         stop_state = self.manager.pause_for_internal_operation()
         try:
             with self.sync.sync_lock:
@@ -417,12 +460,7 @@ class Maestral:
                         "Could not remove token from keyring", exc_info=True
                     )
 
-                self._resume_pending_unlink_credentials()
-
-                if self.sync_mode == VIRTUAL_MODE:
-                    self.virtual_files.reset()
-                self.sync._complete_pending_sync_reset()
-                self.manager.reload_download_queue()
+                self._complete_pending_unlink_reset()
         except BaseException:
             if not self._state.get("recovery", "sync_reset"):
                 self.manager.resume_after_internal_stop(stop_state)
@@ -458,7 +496,10 @@ class Maestral:
             return True
         if self._root_bound_recovery_names():
             return False
-        if journal.get("credentials_deleted") is True:
+        if (
+            journal.get("credentials_deleted") is True
+            and journal.get("vault_password_deleted") is True
+        ):
             return True
         account_id = journal.get("account_id")
         keyring_name = journal.get("keyring")
@@ -471,14 +512,19 @@ class Maestral:
             return False
 
         try:
-            storage = (
-                self.cred_storage
-                if provider == self.provider
-                else CredentialStorage(self.config_name, provider)
-            )
-            storage.delete_creds(account_id, keyring_name)
+            if journal.get("credentials_deleted") is not True:
+                storage = (
+                    self.cred_storage
+                    if provider == self.provider
+                    else CredentialStorage(self.config_name, provider)
+                )
+                storage.delete_creds(account_id, keyring_name)
+            if journal.get("vault_password_deleted") is not True:
+                VaultSecretStorage(self.config_name).delete_password()
         except KeyringAccessError:
-            self._logger.debug("Could not remove token from keyring", exc_info=True)
+            self._logger.debug(
+                "Could not remove credentials from keyring", exc_info=True
+            )
             return False
 
         with self._state._lock:
@@ -487,8 +533,25 @@ class Maestral:
                 return False
             journal = journal.copy()
             journal["credentials_deleted"] = True
+            journal["vault_password_deleted"] = True
             self._state.set("recovery", "sync_reset", journal)
         return True
+
+    def _pending_unlink_reset(self) -> bool:
+        journal = self._state.get("recovery", "sync_reset")
+        return isinstance(journal, dict) and journal.get("kind") == "unlink"
+
+    def _complete_pending_unlink_reset(self) -> None:
+        """Replay every pending unlink phase after virtual files exist."""
+        if not self._pending_unlink_reset():
+            return
+        self._resume_pending_unlink_credentials()
+        self.sync._complete_pending_sync_reset()
+        journal = self.sync._validated_sync_reset()
+        if journal and journal["phase"] == "virtual":
+            self.virtual_files.detach()
+            self.sync._complete_pending_virtual_reset()
+        self.manager.reload_download_queue()
 
     def _migrate_pending_unlink_provider(self) -> None:
         """Scope an old pending unlink to its only supported provider."""
@@ -638,6 +701,49 @@ class Maestral:
                 operation, "Finish the pending account recovery first."
             )
 
+    def _check_encrypted_local_root(self, root_path: str, operation: str) -> None:
+        """Keep the plaintext sync root outside every encrypted cache path."""
+        if not self.encryption_enabled or not root_path:
+            return
+
+        cache_path = osp.normpath(
+            osp.abspath(osp.expanduser(self.encryption_cache_path))
+        )
+        cache_parent = osp.dirname(cache_path)
+        cache_name = osp.basename(cache_path)
+        protected_paths = (
+            cache_path,
+            osp.join(cache_parent, ".plaintext-transfers"),
+            osp.join(
+                cache_parent,
+                f".{cache_name}.maestral-cryptomator-cache",
+            ),
+            osp.join(
+                cache_parent,
+                f".{cache_name}.maestral-cryptomator-manifest.json",
+            ),
+            osp.join(
+                cache_parent,
+                f".{cache_name}.maestral-cryptomator-transaction.json",
+            ),
+        )
+        try:
+            overlaps = any(
+                _local_roots_overlap(root_path, protected_path)
+                for protected_path in protected_paths
+            )
+        except (OSError, ValueError) as exc:
+            raise MaestralApiError(
+                operation,
+                f"The plaintext root or an encrypted cache path is unsafe: {exc}.",
+            ) from None
+        if overlaps:
+            raise MaestralApiError(
+                operation,
+                "The plaintext sync root and an encrypted cache path cannot contain "
+                "each other.",
+            )
+
     def configure_encryption(
         self, remote_path: str, cache_path: str | None = None
     ) -> None:
@@ -653,6 +759,7 @@ class Maestral:
         if not osp.isabs(expanded_cache):
             raise ValueError("The encrypted cache path must be absolute")
         resolved_cache = osp.abspath(expanded_cache)
+        committed_error: BaseException | None = None
 
         with self._provider_selection_lock, self.sync.sync_lock:
             if (
@@ -675,22 +782,41 @@ class Maestral:
                 raise
             try:
                 self._save_encryption_settings(True, False, remote_path, resolved_cache)
-                self.client = new_client
-                self.sync.client = new_client
-            except BaseException:
-                self.virtual_files.replace_provider(old_client)
-                new_client.close()
-                raise
+            except BaseException as exc:
+                committed = (
+                    self.encryption_enabled
+                    and not self.encryption_vault_ready
+                    and self.encryption_vault_path == remote_path
+                    and self.encryption_cache_path == resolved_cache
+                )
+                if not committed:
+                    self.virtual_files.replace_provider(old_client)
+                    new_client.close()
+                    raise
+                committed_error = exc
+            self.client = new_client
+            self.sync.client = new_client
 
         try:
             old_client.close()
         except Exception:
             self._logger.debug("Could not close the old provider client", exc_info=True)
 
+        if committed_error is not None:
+            if not isinstance(committed_error, Exception):
+                raise committed_error
+            raise MaestralApiError(
+                "Remote encryption was configured",
+                "The encrypted provider was saved, but final configuration cleanup "
+                "reported an error.",
+            ) from committed_error
+
     def disable_encryption(self) -> None:
         """Remove the Cryptomator transform from this unlinked profile."""
+        committed_error: BaseException | None = None
         with self._provider_selection_lock, self.sync.sync_lock:
             if not self.encryption_enabled:
+                self._resume_vault_secret_cleanup()
                 return
             self._check_client_can_change("Cannot disable remote encryption")
             new_client = self._create_client(
@@ -699,25 +825,68 @@ class Maestral:
                 encryption=(False, "", ""),
             )
             old_client = self.client
+            self._state.set(
+                "recovery",
+                "vault_secret_cleanup",
+                {"kind": "disable_encryption"},
+            )
             try:
                 self.virtual_files.replace_provider(new_client)
             except BaseException:
+                self._state.set("recovery", "vault_secret_cleanup", {})
                 new_client.close()
                 raise
             try:
                 self._save_encryption_settings(False, False, "", "")
-                self.client = new_client
-                self.sync.client = new_client
-            except BaseException:
-                self.virtual_files.replace_provider(old_client)
-                new_client.close()
-                raise
+            except BaseException as exc:
+                if self.encryption_enabled:
+                    self.virtual_files.replace_provider(old_client)
+                    self._state.set("recovery", "vault_secret_cleanup", {})
+                    new_client.close()
+                    raise
+                committed_error = exc
+            self.client = new_client
+            self.sync.client = new_client
 
         try:
             old_client.close()
         except Exception:
             self._logger.debug("Could not close the old provider client", exc_info=True)
+        cleanup_complete = self._resume_vault_secret_cleanup()
 
+        if committed_error is not None:
+            if not isinstance(committed_error, Exception):
+                raise committed_error
+            cleanup_status = (
+                "The old vault password was removed."
+                if cleanup_complete
+                else "The old vault password will be removed after keyring access "
+                "returns."
+            )
+            raise MaestralApiError(
+                "Remote encryption was disabled",
+                "The plain provider was saved, but final configuration cleanup "
+                f"reported an error. {cleanup_status}",
+            ) from committed_error
+
+    def _resume_vault_secret_cleanup(self) -> bool:
+        """Delete an obsolete vault password only after encryption is disabled."""
+        journal = self._state.get("recovery", "vault_secret_cleanup")
+        if journal == {}:
+            return True
+        if journal != {"kind": "disable_encryption"}:
+            raise ValueError("The vault-secret cleanup journal is invalid")
+        if self._conf.get("encryption", "enabled"):
+            self._state.set("recovery", "vault_secret_cleanup", {})
+            return True
+        try:
+            VaultSecretStorage(self.config_name).delete_password()
+        except KeyringAccessError:
+            return False
+        self._state.set("recovery", "vault_secret_cleanup", {})
+        return True
+
+    @_with_main_lifecycle
     def initialise_encrypted_vault(self, password: str) -> None:
         """Create and open the configured remote Cryptomator vault."""
         with self.sync.sync_lock:
@@ -729,6 +898,7 @@ class Maestral:
                 self.encryption_cache_path,
             )
 
+    @_with_main_lifecycle
     def attach_encrypted_vault(self, password: str) -> None:
         """Open an existing remote Cryptomator vault and save its password."""
         with self.sync.sync_lock:
@@ -740,11 +910,13 @@ class Maestral:
                 self.encryption_cache_path,
             )
 
+    @_with_main_lifecycle
     def unlock_encrypted_vault(self) -> None:
         """Open the configured vault with its saved keyring password."""
         with self.sync.sync_lock:
             self._encrypted_client().unlock_vault()
 
+    @_with_main_lifecycle
     def lock_encrypted_vault(self) -> None:
         """Close the configured vault and wipe its in-memory password."""
         with self.manager._lock:
@@ -1181,10 +1353,12 @@ class Maestral:
         self._check_virtual_mode()
         return self.virtual_files.get_status(provider_id)
 
-    def get_virtual_file_statuses(self) -> list[dict[str, object]]:
-        """Return status for all items in the separate virtual root."""
+    def get_virtual_file_statuses(
+        self, cursor: str | None = None, limit: int = 200
+    ) -> dict[str, object]:
+        """Return one bounded status page for the separate virtual root."""
         self._check_virtual_mode()
-        return self.virtual_files.list_status()
+        return self.virtual_files.status_page(cursor, limit)
 
     def hydrate_virtual_file(self, provider_id: str) -> dict[str, object]:
         """Hydrate the newest revision of one virtual file."""
@@ -1893,6 +2067,7 @@ class Maestral:
                 except OSError:
                     pass
 
+    @_with_main_lifecycle
     def rebuild_index(self) -> None:
         """
         Rebuilds the rev file by comparing remote with local files and updating rev
@@ -1906,11 +2081,13 @@ class Maestral:
         :raises NotLinkedError: if no Dropbox account is linked.
         :raises NoDropboxDirError: if local Dropbox folder is not set up.
         """
+        self._check_mirror_mode("Cannot rebuild the mirror index")
         self._check_linked()
         self._check_dropbox_dir()
 
         self.manager.rebuild_index()
 
+    @_with_main_lifecycle
     def start_sync(self) -> None:
         """
         Creates syncing threads and starts syncing.
@@ -1920,12 +2097,16 @@ class Maestral:
         """
         self._check_linked()
         self._check_dropbox_dir()
+        self._check_encrypted_local_root(
+            self.sync.dropbox_path, "Cannot start encrypted sync"
+        )
 
         if self.sync_mode == VIRTUAL_MODE:
             self.virtual_files.start(self.sync.dropbox_path)
         else:
             self.manager.start()
 
+    @_with_main_lifecycle
     def stop_sync(self) -> None:
         """
         Stops all syncing threads if running. Call :meth:`start_sync` to restart
@@ -1936,6 +2117,7 @@ class Maestral:
         else:
             self.manager.stop()
 
+    @_with_main_lifecycle
     def reset_sync_state(self) -> None:
         """
         Resets the sync index and state. Only call this to clean up leftover state
@@ -1950,6 +2132,7 @@ class Maestral:
             return
         self.manager.reset_sync_state()
 
+    @_with_main_lifecycle
     def set_selective_sync(self, mode: str, dbx_paths: Collection[str]) -> None:
         """
         Atomically replace the selective-sync mode and selected paths.
@@ -1962,6 +2145,7 @@ class Maestral:
         :raises NotLinkedError: if no Dropbox account is linked.
         :raises NoDropboxDirError: if the local Dropbox folder is not set up.
         """
+        self._check_mirror_mode("Cannot change selective sync")
         self._check_linked()
         self._check_dropbox_dir()
 
@@ -2136,6 +2320,9 @@ class Maestral:
         journal = self._validated_dropbox_root_move()
         if not journal:
             return
+        self._check_encrypted_local_root(
+            journal["new_path"], "Cannot recover Dropbox folder move"
+        )
         expected_identity = tuple(journal["identity"])
         old_identity = self._confirmed_root_identity_at(journal["old_path"])
         new_identity = self._confirmed_root_identity_at(journal["new_path"])
@@ -2161,6 +2348,7 @@ class Maestral:
             "The old and new Dropbox roots do not match the move journal.",
         )
 
+    @_with_main_lifecycle
     def move_dropbox_directory(self, new_path: str) -> None:
         """
         Sets the local Dropbox directory. This moves all local files to the new location
@@ -2194,6 +2382,7 @@ class Maestral:
 
         old_path = self.sync.dropbox_path
         new_path = osp.realpath(osp.expanduser(new_path))
+        self._check_encrypted_local_root(new_path, "Cannot move Dropbox folder")
 
         try:
             if osp.samefile(old_path, new_path):
@@ -2327,6 +2516,7 @@ class Maestral:
             self.manager.resume_after_internal_stop(stop_state)
             self._logger.info(f'Dropbox folder moved to "{new_path}"')
 
+    @_with_main_lifecycle
     def create_dropbox_directory(self, path: str) -> None:
         """
         Creates a new Dropbox directory. Only call this during setup.
@@ -2365,6 +2555,7 @@ class Maestral:
                 )
 
             path = osp.normpath(osp.abspath(osp.expanduser(path)))
+            self._check_encrypted_local_root(path, "Cannot create Dropbox folder")
             root_identity = rooted_makedirs(path, exist_ok=True)
             self.manager.reset_sync_state()
             self.virtual_files.reset()
@@ -2405,6 +2596,7 @@ class Maestral:
             assert stop_state is not None
             self.manager.resume_after_internal_stop(stop_state)
 
+    @_with_main_lifecycle
     def confirm_dropbox_directory(self) -> None:
         """Confirms the configured Dropbox folder as the intended sync root.
 
@@ -2580,21 +2772,44 @@ class Maestral:
             release_notes=update_release_notes,
         )
 
+    @_with_main_lifecycle
     def shutdown_daemon(self) -> None:
         """
         Stop syncing and notify anyone monitoring ``shutdown_future`` that we are done.
         """
-        self.virtual_files.close()
-        self.manager.shutdown()
+        self._close_resources()
 
         with self._sync_event_condition:
             self._sync_event_stream_closed = True
             self._sync_event_condition.notify_all()
 
-        if self.shutdown_future and self._loop and self._loop.is_running():
+        if (
+            self.shutdown_future
+            and not self.shutdown_future.done()
+            and self._loop
+            and self._loop.is_running()
+        ):
             self._loop.call_soon_threadsafe(self.shutdown_future.set_result, True)
 
         self._logger.info("Shutting down")
+
+    def _close_resources(self) -> None:
+        """Stop both engines, then close the shared client and sync database once."""
+        resources = (
+            ("virtual files", self.virtual_files.close),
+            ("sync manager", self.manager.shutdown),
+            ("provider client", self.client.close),
+            ("sync database", self.sync._connection.close),
+        )
+        for name, close in resources:
+            if name in self._closed_resources:
+                continue
+            try:
+                close()
+            except Exception:
+                self._logger.error("Could not close the %s", name, exc_info=True)
+                raise
+            self._closed_resources.add(name)
 
     # ==== Verifiers ===================================================================
 
@@ -2617,6 +2832,13 @@ class Maestral:
             raise MaestralApiError(
                 "Virtual root is not enabled",
                 "Select the virtual sync mode before you use virtual files.",
+            )
+
+    def _check_mirror_mode(self, operation: str) -> None:
+        if self.sync_mode == VIRTUAL_MODE:
+            raise MaestralApiError(
+                operation,
+                "This operation is only available for a mirror root.",
             )
 
     def _check_dropbox_dir(self) -> None:

@@ -6,12 +6,14 @@ import pytest
 import maestral.config.main as config_module
 import maestral.main as main_module
 from maestral.client import DropboxClient
-from maestral.config import MaestralConfig
-from maestral.exceptions import MaestralApiError, NotLinkedError
+from maestral.config import MaestralConfig, MaestralState
+from maestral.exceptions import KeyringAccessError, MaestralApiError, NotLinkedError
 from maestral.main import Maestral
 from maestral.providers.encrypted import EncryptedRemoteProvider
 from maestral.providers.google_drive import GoogleDriveProvider
 from maestral.rpc import JsonRpcDispatcher
+
+from .virtual_files_fakes import FakeVirtualFileBackend
 
 
 @pytest.fixture
@@ -47,6 +49,23 @@ class FakeCryptomatorClient:
 
     def terminate(self) -> None:
         self.terminated = True
+
+
+def configure_fake_encryption(
+    maestral: Maestral,
+    cache_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    vault_secrets: Mock | None = None,
+) -> Mock:
+    monkeypatch.setattr(main_module, "CryptomatorClient", FakeCryptomatorClient)
+    monkeypatch.setattr(
+        main_module, "resolve_sidecar_path", lambda: Path("/fake/cryptomator")
+    )
+    secrets = vault_secrets or Mock()
+    monkeypatch.setattr(main_module, "VaultSecretStorage", Mock(return_value=secrets))
+    maestral.configure_encryption("/Maestral Vault", str(cache_path))
+    maestral.set_provider("dropbox")
+    return secrets
 
 
 def test_provider_must_be_selected_before_authentication(
@@ -128,6 +147,11 @@ def test_unlink_reset_keeps_provider_for_the_next_selection(
     unselected_maestral: Maestral,
 ) -> None:
     unselected_maestral.set_provider("google_drive")
+    unselected_maestral._conf.set("encryption", "enabled", True)
+    unselected_maestral._conf.set("encryption", "vault_ready", True)
+    unselected_maestral._conf.set("encryption", "remote_path", "/Vault")
+    unselected_maestral._conf.set("encryption", "cache_path", "/private/cache")
+    unselected_maestral._conf.set("sync", "mode", "virtual")
     unselected_maestral._state.set(
         "recovery",
         "sync_reset",
@@ -138,6 +162,8 @@ def test_unlink_reset_keeps_provider_for_the_next_selection(
             "account_id": "linked-account",
             "keyring": "automatic",
             "credentials_deleted": True,
+            "vault_password_deleted": True,
+            "virtual_files_reset": False,
             "root_path": "",
             "root_marker_id": "",
         },
@@ -148,6 +174,11 @@ def test_unlink_reset_keeps_provider_for_the_next_selection(
     config = MaestralConfig(unselected_maestral.config_name)
     assert config.get("auth", "provider") == "google_drive"
     assert config.get("auth", "provider_selected") is False
+    assert config.get("encryption", "enabled") is True
+    assert config.get("encryption", "vault_ready") is False
+    assert config.get("encryption", "remote_path") == "/Vault"
+    assert config.get("encryption", "cache_path") == "/private/cache"
+    assert config.get("sync", "mode") == "virtual"
 
 
 def test_rpc_exposes_provider_selection_and_snapshot(
@@ -175,6 +206,10 @@ def test_encryption_configuration_rebuilds_provider_stack(
     monkeypatch.setattr(main_module, "CryptomatorClient", FakeCryptomatorClient)
     monkeypatch.setattr(
         main_module, "resolve_sidecar_path", lambda: Path("/fake/cryptomator")
+    )
+    vault_secrets = Mock()
+    monkeypatch.setattr(
+        main_module, "VaultSecretStorage", Mock(return_value=vault_secrets)
     )
 
     unselected_maestral.configure_encryption("/Maestral Vault", str(cache_path))
@@ -213,6 +248,70 @@ def test_encryption_configuration_rebuilds_provider_stack(
     assert unselected_maestral.encryption_vault_ready is False
     assert unselected_maestral.encryption_vault_path == ""
     assert unselected_maestral.encryption_cache_path == ""
+    vault_secrets.delete_password.assert_called_once_with()
+
+
+def test_interrupted_unlink_preserves_protection_and_virtual_mode(
+    config_name: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cache_path = tmp_path / "ciphertext"
+    config = MaestralConfig(config_name)
+    state = MaestralState(config_name)
+    config.set("auth", "provider_selected", True)
+    config.set("auth", "account_id", "old-account")
+    config.set("encryption", "enabled", True)
+    config.set("encryption", "vault_ready", True)
+    config.set("encryption", "remote_path", "/Maestral Vault")
+    config.set("encryption", "cache_path", str(cache_path))
+    config.set("sync", "mode", "virtual")
+    config.set("sync", "path", str(tmp_path / "old-root"))
+    state.set("virtual_files", "cursor", "old-cursor")
+    state.set(
+        "recovery",
+        "sync_reset",
+        {
+            "kind": "unlink",
+            "phase": "pending",
+            "provider": "dropbox",
+            "account_id": "old-account",
+            "keyring": "automatic",
+            "credentials_deleted": True,
+            "vault_password_deleted": True,
+            "virtual_files_reset": False,
+            "root_path": str(tmp_path / "old-root"),
+            "root_marker_id": "a" * 32,
+        },
+    )
+    monkeypatch.setattr(main_module, "CryptomatorClient", FakeCryptomatorClient)
+    monkeypatch.setattr(
+        main_module, "resolve_sidecar_path", lambda: Path("/fake/cryptomator")
+    )
+
+    maestral = Maestral(
+        config_name,
+        virtual_file_backend=FakeVirtualFileBackend(),
+        virtual_file_remote_polling=False,
+    )
+    try:
+        assert isinstance(maestral.client, EncryptedRemoteProvider)
+        assert maestral.sync.client is maestral.client
+        assert maestral.virtual_files.provider is maestral.client
+        assert maestral.sync_mode == "virtual"
+        assert maestral.virtual_file_backend == "fake_native"
+        assert maestral.encryption_enabled is True
+        assert maestral.encryption_vault_ready is False
+        assert maestral.encryption_vault_path == "/Maestral Vault"
+        assert maestral.encryption_cache_path == str(cache_path)
+        assert maestral.virtual_files.cursor == ""
+        assert maestral.dropbox_path == ""
+        assert state.get("recovery", "sync_reset") == {}
+    finally:
+        maestral.virtual_files.close()
+        maestral.manager.shutdown()
+        maestral.sync._connection.close()
+        maestral.client.close()
 
 
 def test_encryption_configuration_is_exposed_over_rpc(
@@ -262,6 +361,264 @@ def test_encryption_configuration_rejects_unsafe_transitions(
 
     with pytest.raises(ValueError, match="remote encryption API"):
         unselected_maestral.set_conf("encryption", "enabled", True)
+
+
+@pytest.mark.parametrize("root_inside_cache", [False, True])
+def test_encryption_rejects_overlapping_plaintext_and_ciphertext_roots(
+    unselected_maestral: Maestral,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    root_inside_cache: bool,
+) -> None:
+    monkeypatch.setattr(main_module, "CryptomatorClient", FakeCryptomatorClient)
+    monkeypatch.setattr(
+        main_module, "resolve_sidecar_path", lambda: Path("/fake/cryptomator")
+    )
+    if root_inside_cache:
+        cache_path = tmp_path / "ciphertext"
+        root_path = cache_path / "plaintext"
+    else:
+        root_path = tmp_path / "plaintext"
+        cache_path = root_path / "ciphertext"
+
+    unselected_maestral.configure_encryption("/Vault", str(cache_path))
+    unselected_maestral.set_provider("dropbox")
+    monkeypatch.setattr(unselected_maestral, "_check_linked", Mock())
+
+    with pytest.raises(MaestralApiError, match="cannot contain each other"):
+        unselected_maestral.create_dropbox_directory(str(root_path))
+
+    assert not root_path.exists()
+
+
+def test_encryption_rechecks_root_separation_before_sync(
+    unselected_maestral: Maestral,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root_path = tmp_path / "plaintext"
+    cache_path = root_path / "ciphertext"
+    monkeypatch.setattr(main_module, "CryptomatorClient", FakeCryptomatorClient)
+    monkeypatch.setattr(
+        main_module, "resolve_sidecar_path", lambda: Path("/fake/cryptomator")
+    )
+    unselected_maestral.configure_encryption("/Vault", str(cache_path))
+    unselected_maestral.sync._dropbox_path = str(root_path)
+    monkeypatch.setattr(unselected_maestral, "_check_linked", Mock())
+    monkeypatch.setattr(unselected_maestral, "_check_dropbox_dir", Mock())
+    mirror_start = Mock()
+    monkeypatch.setattr(unselected_maestral.manager, "start", mirror_start)
+
+    with pytest.raises(MaestralApiError, match="cannot contain each other"):
+        unselected_maestral.start_sync()
+
+    mirror_start.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "protected_name",
+    ["transfers", "owner", "manifest", "transaction"],
+)
+def test_encryption_rejects_every_private_cache_path(
+    unselected_maestral: Maestral,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    protected_name: str,
+) -> None:
+    cache_path = tmp_path / "ciphertext"
+    configure_fake_encryption(unselected_maestral, cache_path, monkeypatch)
+    monkeypatch.setattr(unselected_maestral, "_check_linked", Mock())
+    protected_paths = {
+        "transfers": tmp_path / ".plaintext-transfers",
+        "owner": tmp_path / ".ciphertext.maestral-cryptomator-cache",
+        "manifest": tmp_path / ".ciphertext.maestral-cryptomator-manifest.json",
+        "transaction": tmp_path / ".ciphertext.maestral-cryptomator-transaction.json",
+    }
+    root_path = protected_paths[protected_name]
+
+    with pytest.raises(MaestralApiError, match="cannot contain each other"):
+        unselected_maestral.create_dropbox_directory(str(root_path))
+
+    assert not root_path.exists()
+
+
+def test_encryption_rejects_a_linked_cache_alias(
+    unselected_maestral: Maestral,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cache_path = tmp_path / "ciphertext"
+    cache_path.mkdir()
+    alias_path = tmp_path / "cache-alias"
+    alias_path.symlink_to(cache_path, target_is_directory=True)
+    configure_fake_encryption(unselected_maestral, cache_path, monkeypatch)
+    monkeypatch.setattr(unselected_maestral, "_check_linked", Mock())
+
+    with pytest.raises(MaestralApiError, match="unsafe"):
+        unselected_maestral.create_dropbox_directory(str(alias_path))
+
+
+def test_disable_encryption_rolls_back_before_config_commit(
+    unselected_maestral: Maestral,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    configure_fake_encryption(unselected_maestral, tmp_path / "ciphertext", monkeypatch)
+    old_client = unselected_maestral.client
+    old_close = Mock()
+    monkeypatch.setattr(old_client, "close", old_close)
+    new_client = Mock(linked=False)
+    monkeypatch.setattr(
+        unselected_maestral, "_create_client", Mock(return_value=new_client)
+    )
+    monkeypatch.setattr(
+        unselected_maestral,
+        "_save_encryption_settings",
+        Mock(side_effect=OSError("save failed")),
+    )
+
+    with pytest.raises(OSError, match="save failed"):
+        unselected_maestral.disable_encryption()
+
+    assert unselected_maestral.client is old_client
+    assert unselected_maestral.sync.client is old_client
+    assert unselected_maestral.virtual_files.provider is old_client
+    assert unselected_maestral.encryption_enabled is True
+    assert unselected_maestral._state.get("recovery", "vault_secret_cleanup") == {}
+    new_client.close.assert_called_once_with()
+    old_close.assert_not_called()
+
+
+def test_configure_encryption_finishes_after_config_commit_error(
+    unselected_maestral: Maestral,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cache_path = tmp_path / "ciphertext"
+    old_client = unselected_maestral.client
+    old_close = Mock()
+    monkeypatch.setattr(old_client, "close", old_close)
+    new_client = Mock(linked=False)
+    create_client = Mock(return_value=new_client)
+    monkeypatch.setattr(unselected_maestral, "_create_client", create_client)
+    save_settings = unselected_maestral._save_encryption_settings
+
+    def commit_then_fail(*args: object) -> None:
+        save_settings(*args)  # type: ignore[arg-type]
+        raise OSError("after commit")
+
+    monkeypatch.setattr(
+        unselected_maestral, "_save_encryption_settings", commit_then_fail
+    )
+
+    with pytest.raises(MaestralApiError, match="encrypted provider was saved"):
+        unselected_maestral.configure_encryption("/Vault", str(cache_path))
+
+    assert unselected_maestral.client is new_client
+    assert unselected_maestral.sync.client is new_client
+    assert unselected_maestral.virtual_files.provider is new_client
+    assert unselected_maestral.encryption_enabled is True
+    assert unselected_maestral.encryption_vault_path == "/Vault"
+    assert unselected_maestral.encryption_cache_path == str(cache_path)
+    old_close.assert_called_once_with()
+    new_client.close.assert_not_called()
+
+    unselected_maestral.configure_encryption("/Vault", str(cache_path))
+
+    create_client.assert_called_once()
+
+
+def test_disable_encryption_finishes_after_config_commit_error(
+    unselected_maestral: Maestral,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    vault_secrets = configure_fake_encryption(
+        unselected_maestral, tmp_path / "ciphertext", monkeypatch
+    )
+    old_client = unselected_maestral.client
+    old_close = Mock()
+    monkeypatch.setattr(old_client, "close", old_close)
+    new_client = Mock(linked=False)
+    monkeypatch.setattr(
+        unselected_maestral, "_create_client", Mock(return_value=new_client)
+    )
+    save_settings = unselected_maestral._save_encryption_settings
+
+    def commit_then_fail(*args: object) -> None:
+        save_settings(*args)  # type: ignore[arg-type]
+        raise OSError("after commit")
+
+    monkeypatch.setattr(
+        unselected_maestral, "_save_encryption_settings", commit_then_fail
+    )
+
+    with pytest.raises(MaestralApiError, match="plain provider was saved"):
+        unselected_maestral.disable_encryption()
+
+    assert unselected_maestral.client is new_client
+    assert unselected_maestral.sync.client is new_client
+    assert unselected_maestral.virtual_files.provider is new_client
+    assert unselected_maestral.encryption_enabled is False
+    assert unselected_maestral._state.get("recovery", "vault_secret_cleanup") == {}
+    old_close.assert_called_once_with()
+    new_client.close.assert_not_called()
+    vault_secrets.delete_password.assert_called_once_with()
+
+
+def test_disable_encryption_retries_keyring_cleanup(
+    unselected_maestral: Maestral,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    vault_secrets = Mock()
+    vault_secrets.delete_password.side_effect = KeyringAccessError(
+        "Keyring unavailable", "Try again"
+    )
+    configure_fake_encryption(
+        unselected_maestral,
+        tmp_path / "ciphertext",
+        monkeypatch,
+        vault_secrets,
+    )
+
+    unselected_maestral.disable_encryption()
+
+    assert unselected_maestral.encryption_enabled is False
+    assert unselected_maestral._state.get("recovery", "vault_secret_cleanup") == {
+        "kind": "disable_encryption"
+    }
+
+    vault_secrets.delete_password.side_effect = None
+    unselected_maestral.disable_encryption()
+
+    assert unselected_maestral._state.get("recovery", "vault_secret_cleanup") == {}
+    assert vault_secrets.delete_password.call_count == 2
+
+
+def test_constructor_retries_vault_secret_cleanup(
+    config_name: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = MaestralConfig(config_name)
+    state = MaestralState(config_name)
+    config.set("encryption", "enabled", False)
+    state.set(
+        "recovery",
+        "vault_secret_cleanup",
+        {"kind": "disable_encryption"},
+    )
+    vault_secrets = Mock()
+    monkeypatch.setattr(
+        main_module, "VaultSecretStorage", Mock(return_value=vault_secrets)
+    )
+
+    maestral = Maestral(config_name)
+    try:
+        vault_secrets.delete_password.assert_called_once_with()
+        assert state.get("recovery", "vault_secret_cleanup") == {}
+    finally:
+        maestral._close_resources()
 
 
 @pytest.mark.parametrize("provider", ["onedrive", "", "dropbox_v2"])

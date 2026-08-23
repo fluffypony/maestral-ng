@@ -608,8 +608,10 @@ def start_maestral_daemon(
             asyncio.set_event_loop(None)
 
         if maestral_daemon is not None:
-            maestral_daemon.manager.shutdown()
-            maestral_daemon.sync._connection.close()
+            try:
+                maestral_daemon._close_resources()
+            except Exception:
+                dlogger.error("Could not close daemon resources", exc_info=True)
 
         lock.release()
 
@@ -795,8 +797,7 @@ class MaestralClient(ContextManager["MaestralClient"]):
         if isinstance(self._m, JsonRpcConnection):
             self._m.close()
         else:
-            self._m.manager.shutdown()
-            self._m.sync._connection.close()
+            self._m._close_resources()
 
     def __enter__(self) -> MaestralClient:
         return self

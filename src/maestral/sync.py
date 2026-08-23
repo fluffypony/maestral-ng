@@ -2625,6 +2625,15 @@ class SyncEngine:
         if kind == "unlink" and set(journal) == legacy_unlink_keys:
             journal["provider"] = "dropbox"
             self._state.set("recovery", "sync_reset", journal)
+        if kind == "unlink" and "vault_password_deleted" not in journal:
+            journal["vault_password_deleted"] = False
+            self._state.set("recovery", "sync_reset", journal)
+        if kind == "unlink" and "virtual_files_reset" not in journal:
+            journal["virtual_files_reset"] = False
+            if phase == "queue":
+                journal["phase"] = "virtual"
+                phase = "virtual"
+            self._state.set("recovery", "sync_reset", journal)
         if kind == "sync":
             if set(journal) != {"kind", "phase"} or phase not in {
                 "pending",
@@ -2641,14 +2650,18 @@ class SyncEngine:
                     "account_id",
                     "keyring",
                     "credentials_deleted",
+                    "vault_password_deleted",
+                    "virtual_files_reset",
                     "root_path",
                     "root_marker_id",
                 }
-                or phase not in {"pending", "config", "queue"}
+                or phase not in {"pending", "config", "virtual", "queue"}
                 or journal.get("provider") not in {"dropbox", "google_drive"}
                 or not isinstance(journal.get("account_id"), str)
                 or not isinstance(journal.get("keyring"), str)
                 or not isinstance(journal.get("credentials_deleted"), bool)
+                or not isinstance(journal.get("vault_password_deleted"), bool)
+                or not isinstance(journal.get("virtual_files_reset"), bool)
                 or not isinstance(journal.get("root_path"), str)
                 or not isinstance(journal.get("root_marker_id"), str)
             ):
@@ -2712,6 +2725,10 @@ class SyncEngine:
                         account_id=account_id,
                         keyring=keyring,
                         credentials_deleted=False,
+                        vault_password_deleted=not bool(
+                            self._conf.get("encryption", "enabled")
+                        ),
+                        virtual_files_reset=False,
                         root_path=root_path,
                         root_marker_id=root_marker_id,
                     )
@@ -2790,19 +2807,54 @@ class SyncEngine:
                 snapshot = self._conf._configuration_snapshot()
                 save_generation = self._conf.save_generation
                 try:
+                    encryption_enabled = self._conf.get("encryption", "enabled")
+                    encryption_remote_path = self._conf.get("encryption", "remote_path")
+                    encryption_cache_path = self._conf.get("encryption", "cache_path")
+                    sync_mode = self._conf.get("sync", "mode")
                     self._conf.reset_to_defaults(save=False)
                     self._conf.set("auth", "provider", journal["provider"], save=False)
                     self._conf.set("auth", "provider_selected", False, save=False)
+                    self._conf.set(
+                        "encryption", "enabled", encryption_enabled, save=False
+                    )
+                    self._conf.set("encryption", "vault_ready", False, save=False)
+                    self._conf.set(
+                        "encryption",
+                        "remote_path",
+                        encryption_remote_path,
+                        save=False,
+                    )
+                    self._conf.set(
+                        "encryption",
+                        "cache_path",
+                        encryption_cache_path,
+                        save=False,
+                    )
+                    self._conf.set("sync", "mode", sync_mode, save=False)
                     self._conf.save()
                 except BaseException:
                     if not self._conf.save_committed_since(save_generation):
                         self._conf._restore_configuration_snapshot(snapshot)
                     raise
 
-            journal["phase"] = "queue"
+            journal["phase"] = "virtual"
             self._state.set("recovery", "sync_reset", journal)
 
         self.reload_cached_config()
+
+    def _complete_pending_virtual_reset(self) -> None:
+        """Publish completion of the unlink virtual-state reset."""
+        with self._state._lock:
+            journal = self._validated_sync_reset()
+            if not journal or journal["kind"] != "unlink":
+                return
+            if journal["phase"] == "queue" and journal["virtual_files_reset"]:
+                return
+            if journal["phase"] != "virtual":
+                raise RuntimeError("The unlink virtual reset is not ready")
+            journal["virtual_files_reset"] = True
+            journal["phase"] = "queue"
+            self._state.set("recovery", "sync_reset", journal)
 
     def _finish_sync_reset_queue(self) -> None:
         """Clear a reset marker after the live queue matches persistent state."""
@@ -2810,7 +2862,11 @@ class SyncEngine:
         if not journal or journal["phase"] != "queue":
             return
         if journal["kind"] == "unlink":
-            if not journal["credentials_deleted"]:
+            if not (
+                journal["credentials_deleted"]
+                and journal["vault_password_deleted"]
+                and journal["virtual_files_reset"]
+            ):
                 return
             if self._root_bound_recovery_names():
                 return

@@ -92,9 +92,11 @@ DEFAULTS_STATE: _DefaultsType = {
     },
     "virtual_files": {
         "cursor": "",  # provider cursor for the separate virtual root
+        "needs_full_snapshot": False,  # missing-index recovery is incomplete
     },
     "recovery": {
         "sync_reset": {},  # durable sync-state or unlink reset journal
+        "vault_secret_cleanup": {},  # obsolete encrypted-vault password cleanup
         "local_evacuations": {},  # local items held during remote changes
         "case_changes": {},  # local case-only renames awaiting index updates
         "local_paths": {},  # recovered local items awaiting upload

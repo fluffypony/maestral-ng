@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import BinaryIO
 
@@ -13,6 +14,7 @@ from maestral.exceptions import (
 )
 from maestral.virtual_files import (
     HydrationRequest,
+    NativeFileIdentity,
     NativeFileRecord,
     NativeFileState,
     VirtualFileDescriptor,
@@ -39,7 +41,7 @@ def make_file(
         shared=False,
         modified_by=None,
         is_downloadable=True,
-        content_hash=f"hash-{revision}",
+        content_hash=hashlib.sha256(content).hexdigest(),
     )
 
 
@@ -63,6 +65,7 @@ class FakeVirtualProvider:
         self.download_started = threading.Event()
         self.release_download = threading.Event()
         self.release_download.set()
+        self.change_poll_started = threading.Event()
         self.pages: list[ListFolderResult] = []
 
     def add_file(
@@ -113,6 +116,7 @@ class FakeVirtualProvider:
         indexed_paths: dict[str, str] | None = None,
     ) -> object:
         del last_cursor, indexed_paths
+        self.change_poll_started.set()
         yield from self.pages
 
     def wait_for_remote_changes(self, last_cursor: str, timeout: int = 40) -> bool:
@@ -140,6 +144,7 @@ class FakeVirtualFileBackend:
         self.request_hydration: HydrationRequest | None = None
         self.started = False
         self.require_empty_directories = False
+        self.cascade_directory_removals = False
 
     def start(self, root_path: str, request_hydration: HydrationRequest) -> None:
         self.calls.append(("start", root_path))
@@ -151,30 +156,73 @@ class FakeVirtualFileBackend:
         self.started = False
         self.request_hydration = None
 
-    def upsert(self, item: VirtualFileDescriptor) -> None:
-        self.calls.append(("upsert", item.provider_id, item.revision))
+    def upsert(
+        self,
+        item: VirtualFileDescriptor,
+        *,
+        expected: NativeFileIdentity | None,
+    ) -> None:
+        self.calls.append(("upsert", item.provider_id, item.revision, expected))
         old = self.items.get(item.provider_id)
         if old is None:
+            if expected is not None:
+                raise VirtualFileRevisionError(
+                    "Fake placeholder revision changed", item.provider_id
+                )
             self.items[item.provider_id] = FakeNativeItem(
                 descriptor=item, pinned=item.pinned
             )
             return
-        if old.dirty and old.descriptor.revision != item.revision:
-            raise VirtualFileBusyError(
-                "Cannot update the fake placeholder", "The file is dirty."
+        if old.descriptor == item and old.pinned == item.pinned:
+            return
+        current_identity = NativeFileIdentity(
+            provider_id=old.descriptor.provider_id,
+            path=old.descriptor.path,
+            is_directory=old.descriptor.is_directory,
+            revision=old.descriptor.revision,
+        )
+        if current_identity != expected:
+            raise VirtualFileRevisionError(
+                "Fake placeholder revision changed", item.provider_id
             )
+        if old.dirty or old.open_count:
+            raise VirtualFileBusyError(
+                "Cannot update the fake placeholder",
+                "The file has local changes or is open.",
+            )
+        old_path = old.descriptor.path
+        if old.descriptor.is_directory and old_path != item.path:
+            old_prefix = old_path.rstrip("/") + "/"
+            for child in self.items.values():
+                if child is old or not child.descriptor.path.startswith(old_prefix):
+                    continue
+                suffix = child.descriptor.path[len(old_path) :]
+                child.descriptor = replace(child.descriptor, path=item.path + suffix)
         if old.descriptor.revision != item.revision:
             old.content = None
             old.hydrated_revision = None
         old.descriptor = item
         old.pinned = item.pinned
 
-    def remove(self, provider_id: str) -> None:
-        self.calls.append(("remove", provider_id))
+    def remove(self, provider_id: str, *, expected: NativeFileIdentity) -> None:
+        self.calls.append(("remove", provider_id, expected))
         item = self.items.get(provider_id)
-        if item is not None and item.dirty:
+        if item is None:
+            return
+        current_identity = NativeFileIdentity(
+            provider_id=item.descriptor.provider_id,
+            path=item.descriptor.path,
+            is_directory=item.descriptor.is_directory,
+            revision=item.descriptor.revision,
+        )
+        if current_identity != expected:
+            raise VirtualFileRevisionError(
+                "Fake placeholder revision changed", provider_id
+            )
+        if item.dirty or item.open_count:
             raise VirtualFileBusyError(
-                "Cannot remove the fake placeholder", "The file is dirty."
+                "Cannot remove the fake placeholder",
+                "The file has local changes or is open.",
             )
         if item is not None and self.require_empty_directories:
             prefix = item.descriptor.path.rstrip("/") + "/"
@@ -185,6 +233,15 @@ class FakeVirtualFileBackend:
                 raise VirtualFileBusyError(
                     "Cannot remove the fake placeholder", "The directory is not empty."
                 )
+        if item is not None and self.cascade_directory_removals:
+            prefix = item.descriptor.path.rstrip("/") + "/"
+            child_ids = [
+                child_id
+                for child_id, child in self.items.items()
+                if child_id != provider_id and child.descriptor.path.startswith(prefix)
+            ]
+            for child_id in child_ids:
+                self.items.pop(child_id)
         self.items.pop(provider_id, None)
 
     def set_pinned(self, provider_id: str, pinned: bool) -> None:
@@ -243,6 +300,12 @@ class FakeVirtualFileBackend:
         if native is None:
             return None
         return NativeFileState(
+            identity=NativeFileIdentity(
+                provider_id=native.descriptor.provider_id,
+                path=native.descriptor.path,
+                is_directory=native.descriptor.is_directory,
+                revision=native.descriptor.revision,
+            ),
             hydrated_revision=native.hydrated_revision,
             pinned=native.pinned,
             dirty=native.dirty,
@@ -255,6 +318,7 @@ class FakeVirtualFileBackend:
             NativeFileRecord(
                 provider_id=provider_id,
                 path=item.descriptor.path,
+                is_directory=item.descriptor.is_directory,
                 revision=item.descriptor.revision,
                 hydrated_revision=item.hydrated_revision,
                 pinned=item.pinned,
