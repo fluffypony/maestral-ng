@@ -839,7 +839,10 @@ class NativeProcessVirtualFileBackend:
                 "The configured path does not match the saved visible root.",
             )
         self._verify_binding_caches(binding)
-        self._verify_visible_root(binding)
+        if self._platform_name != "Darwin":
+            # File Provider can remove the visible root before a lost detach
+            # response is replayed. The adapter verifies a live domain itself.
+            self._verify_visible_root(binding)
 
         with self._lifecycle_lock:
             with self._state_lock:

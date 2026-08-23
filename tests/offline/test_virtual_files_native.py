@@ -223,7 +223,9 @@ def handle(request):
             })
             return
         start_result = {
-            "adapter": "macos-file-provider" if mode == "macos" else "linux-fuse",
+            "adapter": (
+                "macos-file-provider" if mode.startswith("macos") else "linux-fuse"
+            ),
             "capabilities": [
                 "placeholders", "hydration", "dehydration", "pinning", "recovery"
             ],
@@ -231,7 +233,7 @@ def handle(request):
             "cachePath": params["cachePath"],
             "rootIdentity": params["rootIdentity"],
         }
-        if mode == "macos":
+        if mode.startswith("macos"):
             source_root = pathlib.Path(params["rootPath"])
             actual_root = source_root.parent / "macos-visible-root"
             actual_cache = source_root.parent / "macos-app-group-cache"
@@ -286,13 +288,21 @@ def handle(request):
 
     if method == "detach":
         append_log({"detach": params})
-        if mode == "macos" and source_root_path is None:
+        if mode.startswith("macos") and source_root_path is None:
             source_root_path = (
                 pathlib.Path(params["cachePath"]) / "source-root"
             ).read_text()
         detach_result = {
-            "rootPath": source_root_path if mode == "macos" else params["rootPath"]
+            "rootPath": (
+                source_root_path if mode.startswith("macos") else params["rootPath"]
+            )
         }
+        if mode == "macos-detach-lost-response":
+            completed = pathlib.Path(params["cachePath"]) / "detach-complete"
+            if not completed.exists():
+                pathlib.Path(params["rootPath"]).rmdir()
+                completed.write_text("complete")
+                os._exit(0)
         if mode == "bad-detach":
             detach_result["legacy"] = True
         elif mode == "bad-detach-path":
@@ -965,6 +975,45 @@ def test_detach_is_idempotent_across_process_restarts(
             "rootIdentity": start_params["rootIdentity"],
         }
     ]
+
+
+def test_macos_detach_replays_after_domain_removal_and_lost_response(
+    fake_adapter: Path, tmp_path: Path
+) -> None:
+    log_path = tmp_path / "macos-detach-replay.jsonl"
+    backend = make_backend(
+        fake_adapter,
+        tmp_path,
+        mode="macos-detach-lost-response",
+        platform_name="Darwin",
+        log_path=log_path,
+    )
+    root = tmp_path / "root"
+    root.mkdir()
+    marker = root / ".maestral-root"
+    marker.write_text(f"maestral-root-v1:{ROOT_MARKER_ID}\n")
+    marker.chmod(0o600)
+    binding = backend.start(str(root), lambda _provider_id, _revision: {})
+    backend.accept_binding(ROOT_MARKER_ID)
+
+    with pytest.raises(NativeVirtualFileTimeoutError):
+        backend.detach(binding.root_path, ROOT_MARKER_ID)
+    assert not Path(binding.root_path).exists()
+
+    restarted = make_backend(
+        fake_adapter,
+        tmp_path,
+        mode="macos-detach-lost-response",
+        platform_name="Darwin",
+        log_path=log_path,
+    )
+    assert restarted.detach(binding.root_path, ROOT_MARKER_ID) == str(root)
+    assert not restarted.binding_accepted(ROOT_MARKER_ID)
+    assert restarted.detach(str(root), ROOT_MARKER_ID) == str(root)
+    detach_requests = [
+        entry["detach"] for entry in wait_for_log(log_path, 3) if "detach" in entry
+    ]
+    assert len(detach_requests) == 2
 
 
 def test_detach_requires_an_exact_result(fake_adapter: Path, tmp_path: Path) -> None:
