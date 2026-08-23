@@ -793,7 +793,11 @@ class PhysicalVaultMirror:
                     "Encrypted transaction move target exists",
                     "Keep the ciphertext cache and resolve the remote conflict.",
                 )
-            moved = self.provider.move(self._remote_path(operation.source), target_path)
+            moved = self.provider.move(
+                self._remote_path(operation.source),
+                target_path,
+                expected_provider_id=operation.expected_id,
+            )
             self._require_expected_remote(moved, operation)
             return moved
 
@@ -852,7 +856,11 @@ class PhysicalVaultMirror:
             if recovering and target is None:
                 return None
             self._require_expected_remote(target, operation)
-            return self.provider.remove(target_path, parent_rev=operation.expected_rev)
+            return self.provider.remove(
+                target_path,
+                parent_rev=operation.expected_rev,
+                expected_provider_id=operation.expected_id,
+            )
 
         raise self._invalid_journal()
 
