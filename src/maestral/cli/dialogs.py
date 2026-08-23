@@ -63,6 +63,18 @@ def prompt(
 
 
 @exit_on_keyboard_interrupt
+def prompt_password(message: str, confirmation: bool = False) -> str:
+    """Prompt for a password without terminal echo or environment lookup."""
+    return click.prompt(
+        message,
+        type=str,
+        hide_input=True,
+        confirmation_prompt=confirmation,
+        show_default=False,
+    )
+
+
+@exit_on_keyboard_interrupt
 def confirm(message: str, default: bool | None = True) -> bool:
     return click.confirm(message, default=default)
 

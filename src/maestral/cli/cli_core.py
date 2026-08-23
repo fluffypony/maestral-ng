@@ -11,6 +11,10 @@ from rich.console import Console, ConsoleRenderable
 from ..constants import ROOT_MARKER_FILE
 from ..core import FolderMetadata, SharedLinkMetadata
 from ..utils.path import delete
+from .cli_encryption import (
+    configure_encryption_dialog,
+    setup_encrypted_vault_dialog,
+)
 from .common import (
     check_for_fatal_errors,
     config_option,
@@ -229,7 +233,18 @@ def start(foreground: bool, verbose: bool, config_name: str) -> None:
 
         if m.pending_link:
             m.set_provider(m.provider)
+            configure_encryption_dialog(m)
             link_dialog(m)
+
+        if m.encryption_enabled and not m.encryption_vault_ready:
+            setup_encrypted_vault_dialog(m)
+
+        if (
+            m.encryption_enabled
+            and m.encryption_vault_ready
+            and not m.encryption_vault_open
+        ):
+            m.unlock_encrypted_vault()
 
         if m.pending_dropbox_folder:
             path = select_dbx_path_dialog(config_name, allow_merge=True)
