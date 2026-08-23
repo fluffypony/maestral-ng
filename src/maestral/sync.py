@@ -5801,6 +5801,10 @@ class SyncEngine:
                 dbx_path_from_lower,
             )
         }
+        source_entry = source_index_entries.get(dbx_path_from_lower)
+        if source_entry is None:
+            self.rescan(event.local_path)
+            return SyncStatus.Skipped
 
         # If a file at the destination should be replaced, remove it first, but only if
         # its rev matches the rev of the local overwritten file.
@@ -5814,7 +5818,9 @@ class SyncEngine:
         ):
             try:
                 self.client.remove(
-                    local_entry.dbx_path_lower, parent_rev=local_entry.rev
+                    local_entry.dbx_path_lower,
+                    parent_rev=local_entry.rev,
+                    expected_provider_id=local_entry.provider_id,
                 )
             except (NotFoundError, FileConflictError):
                 pass
@@ -5825,7 +5831,12 @@ class SyncEngine:
 
         # Perform the move.
         try:
-            md_to_new = self.client.move(dbx_path_from, event.dbx_path, autorename=True)
+            md_to_new = self.client.move(
+                dbx_path_from,
+                event.dbx_path,
+                autorename=True,
+                expected_provider_id=source_entry.provider_id,
+            )
         except NotFoundError:
             # If not on Dropbox, e.g., because its old name was invalid,
             # create it instead of moving it.
@@ -6370,7 +6381,11 @@ class SyncEngine:
         try:
             # The metadata and indexed identity match, so bind the deletion to the
             # exact remote file revision.
-            self.client.remove(event.dbx_path, parent_rev=md.rev)
+            self.client.remove(
+                event.dbx_path,
+                parent_rev=md.rev,
+                expected_provider_id=md.id,
+            )
             status = SyncStatus.Done
         except NotFoundError:
             self._logger.debug(

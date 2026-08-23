@@ -210,12 +210,17 @@ class FakeRemoteProvider:
         return metadata
 
     def move(
-        self, remote_path: str, new_path: str, autorename: bool = False
+        self,
+        remote_path: str,
+        new_path: str,
+        autorename: bool = False,
+        *,
+        expected_provider_id: str,
     ) -> FileMetadata | FolderMetadata:
         del autorename
         source = self._local(remote_path)
         target = self._local(new_path)
-        if not source.exists():
+        if not source.exists() or self._ids[remote_path] != expected_provider_id:
             raise NotFoundError("Not found", dbx_path=remote_path)
         if target.exists():
             raise FileConflictError("Already exists", dbx_path=new_path)
@@ -235,9 +240,15 @@ class FakeRemoteProvider:
         return self._metadata(new_path)
 
     def remove(
-        self, remote_path: str, parent_rev: str | None = None
+        self,
+        remote_path: str,
+        parent_rev: str | None = None,
+        *,
+        expected_provider_id: str,
     ) -> FileMetadata | FolderMetadata:
         metadata = self._metadata(remote_path)
+        if metadata.id != expected_provider_id:
+            raise NotFoundError("ID changed", dbx_path=remote_path)
         if (
             parent_rev is not None
             and isinstance(metadata, FileMetadata)
@@ -632,7 +643,19 @@ def test_encrypted_provider_round_trip_and_stable_identity(tmp_path: Path) -> No
     )
     assert b"cleartext must stay local" not in remote_bytes
 
-    moved = provider.move("/Documents/report.txt", "/Documents/final report.txt")
+    with pytest.raises(NotFoundError):
+        provider.move(
+            "/Documents/report.txt",
+            "/Documents/wrong.txt",
+            expected_provider_id="logical:replacement",
+        )
+    assert provider.get_metadata("/Documents/report.txt") == uploaded
+
+    moved = provider.move(
+        "/Documents/report.txt",
+        "/Documents/final report.txt",
+        expected_provider_id=uploaded.id,
+    )
     assert moved.id == stable_id
     assert provider.get_metadata("/Documents/report.txt") is None
 
@@ -662,6 +685,13 @@ def test_encrypted_provider_round_trip_and_stable_identity(tmp_path: Path) -> No
     assert updated.id == stable_id
     assert updated.rev != moved.rev
 
+    with pytest.raises(NotFoundError):
+        provider.remove(
+            "/Documents/final report.txt",
+            expected_provider_id="logical:replacement",
+        )
+    assert provider.get_metadata("/Documents/final report.txt") == updated
+
     provider.lock_vault()
     assert not provider.vault_open
     assert provider.get_metadata("/Documents/final report.txt") == updated
@@ -683,7 +713,7 @@ def test_encrypted_provider_lists_deletions_after_remote_refresh(
     provider.initialise_vault("password")
     first = provider.upload(io.BytesIO(b"one"), "/one.txt")
     cursor = provider.list_folder("/", recursive=True).cursor
-    provider.remove("/one.txt")
+    provider.remove("/one.txt", expected_provider_id=first.id)
 
     page = next(provider.list_remote_changes_iterator(cursor, {first.id: "/one.txt"}))
     assert page.cursor != cursor

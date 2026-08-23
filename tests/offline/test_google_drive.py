@@ -19,7 +19,7 @@ import requests
 
 from maestral.config import MaestralConfig, remove_configuration
 from maestral.core import DeletedMetadata, FileMetadata, FolderMetadata, WriteMode
-from maestral.exceptions import UnsupportedProviderOperationError
+from maestral.exceptions import NotFoundError, UnsupportedProviderOperationError
 from maestral.providers.google_drive import (
     GOOGLE_DRIVE_SCOPE,
     DriveChange,
@@ -739,10 +739,14 @@ def test_provider_upload_download_move_delete_and_failure_rollback(
     assert provider.download("/New.txt", downloaded).id == uploaded.id
     assert downloaded.getvalue() == b"hello"
 
-    moved = provider.move("/New.txt", "/Moved.txt")
+    moved = provider.move("/New.txt", "/Moved.txt", expected_provider_id=uploaded.id)
     assert moved.id == uploaded.id
     assert moved.path_display == "/Moved.txt"
-    removed = provider.remove("/Moved.txt", parent_rev=moved.rev)
+    removed = provider.remove(
+        "/Moved.txt",
+        parent_rev=moved.rev,
+        expected_provider_id=moved.id,
+    )
     assert removed.id == uploaded.id
     assert provider.get_metadata("/Moved.txt") is None
 
@@ -751,6 +755,47 @@ def test_provider_upload_download_move_delete_and_failure_rollback(
     with pytest.raises(GoogleDriveError, match="Fake upload failed"):
         provider.upload(io.BytesIO(b"failed"), "/Failed.txt", WriteMode.Add)
     assert provider._ensure_projection().projected_items() == before
+
+
+@pytest.mark.parametrize("operation", ["move", "remove"])
+def test_provider_rejects_path_replacement_for_identity_bound_mutation(
+    config_name: str,
+    operation: str,
+) -> None:
+    original = drive_item("original", "Target.txt", md5Checksum="a" * 32)
+    replacement = drive_item("replacement", "Target.txt", md5Checksum="b" * 32)
+    api = FakeDriveAPI([original], {"original": b"first"})
+    provider = provider_with_fake_api(config_name, api)
+    provider.list_folder("/", recursive=True)
+
+    api.items.pop(original.id)
+    api.blobs.pop(original.id)
+    api.items[replacement.id] = replacement
+    api.blobs[replacement.id] = b"second"
+    provider._ensure_projection().apply_changes(
+        (
+            DriveChange(original.id, True, None, None),
+            DriveChange(replacement.id, False, replacement, None),
+        )
+    )
+
+    with pytest.raises(NotFoundError):
+        if operation == "move":
+            provider.move(
+                "/Target.txt",
+                "/Moved.txt",
+                expected_provider_id=original.id,
+            )
+        else:
+            provider.remove(
+                "/Target.txt",
+                expected_provider_id=original.id,
+            )
+
+    assert api.items[replacement.id] == replacement
+    remaining = provider.get_metadata("/Target.txt")
+    assert isinstance(remaining, FileMetadata)
+    assert remaining.id == replacement.id
 
 
 def test_provider_resumes_opaque_cursor_and_emits_identity_move(

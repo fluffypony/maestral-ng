@@ -2184,13 +2184,23 @@ class GoogleDriveProvider:
         return metadata
 
     def move(
-        self, remote_path: str, new_path: str, autorename: bool = False
+        self,
+        remote_path: str,
+        new_path: str,
+        autorename: bool = False,
+        *,
+        expected_provider_id: str,
     ) -> FileMetadata | FolderMetadata:
         remote_path = self._normalise_remote_path(remote_path)
         new_path = self._normalise_remote_path(new_path)
         projection = self._ensure_projection()
-        item = projection.item_for_path(remote_path)
-        if item is None:
+        item = projection.item_for_id(expected_provider_id)
+        source_path = projection.path_for_id(expected_provider_id)
+        if (
+            item is None
+            or source_path is None
+            or _path_collision_key(source_path) != _path_collision_key(remote_path)
+        ):
             raise NotFoundError("Item not found", dbx_path=remote_path)
         destination = projection.item_for_path(new_path)
         if destination is not None and destination.id != item.id and not autorename:
@@ -2221,12 +2231,21 @@ class GoogleDriveProvider:
         return metadata
 
     def remove(
-        self, remote_path: str, parent_rev: str | None = None
+        self,
+        remote_path: str,
+        parent_rev: str | None = None,
+        *,
+        expected_provider_id: str,
     ) -> FileMetadata | FolderMetadata:
         remote_path = self._normalise_remote_path(remote_path)
         projection = self._ensure_projection()
-        item = projection.item_for_path(remote_path)
-        if item is None:
+        item = projection.item_for_id(expected_provider_id)
+        source_path = projection.path_for_id(expected_provider_id)
+        if (
+            item is None
+            or source_path is None
+            or _path_collision_key(source_path) != _path_collision_key(remote_path)
+        ):
             raise NotFoundError("Item not found", dbx_path=remote_path)
         if parent_rev is not None and item.version != parent_rev:
             raise FileConflictError(

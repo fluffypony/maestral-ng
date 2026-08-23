@@ -24,7 +24,7 @@ def clean_dropbox_dir(c: DropboxClient, lock_path: str):
             continue
 
         try:
-            c.remove(entry.path_lower)
+            c.remove(entry.path_lower, expected_provider_id=entry.id)
         except NotFoundError:
             pass
 

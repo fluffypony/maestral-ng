@@ -1412,7 +1412,13 @@ class PhysicalVaultMirror:
             )
         ]
         for path in sorted(conflicts, key=_path_depth, reverse=True):
-            self.provider.remove(self._remote_path(path))
+            metadata = remote[path]
+            parent_rev = metadata.rev if isinstance(metadata, FileMetadata) else None
+            self.provider.remove(
+                self._remote_path(path),
+                parent_rev=parent_rev,
+                expected_provider_id=metadata.id,
+            )
             self._drop_remote_prefix(remote, path)
 
     @staticmethod
@@ -1507,7 +1513,9 @@ class PhysicalVaultMirror:
             if parent and parent not in remote and parent not in targets:
                 self._create_parent_chain(parent, after, remote)
             moved = self.provider.move(
-                self._remote_path(source), self._remote_path(target)
+                self._remote_path(source),
+                self._remote_path(target),
+                expected_provider_id=expected.id,
             )
             if not isinstance(moved, FolderMetadata):
                 raise EncryptedVaultError(
@@ -1536,7 +1544,9 @@ class PhysicalVaultMirror:
                 )
             self._require_current_remote(source, expected)
             moved = self.provider.move(
-                self._remote_path(source), self._remote_path(target)
+                self._remote_path(source),
+                self._remote_path(target),
+                expected_provider_id=expected.id,
             )
             if not isinstance(moved, FileMetadata):
                 raise EncryptedVaultError(
@@ -1583,7 +1593,11 @@ class PhysicalVaultMirror:
             return
         if type(current_target) is not type(moved) or current_target.id != moved.id:
             return
-        restored = self.provider.move(target_path, source_path)
+        restored = self.provider.move(
+            target_path,
+            source_path,
+            expected_provider_id=moved.id,
+        )
         if type(restored) is not type(moved) or restored.id != moved.id:
             raise EncryptedVaultError(
                 "Encrypted vault recovery failed",
@@ -1680,10 +1694,17 @@ class PhysicalVaultMirror:
         ]
         for path in sorted(stale_files, key=_path_depth, reverse=True):
             metadata = cast(FileMetadata, remote[path])
-            self.provider.remove(self._remote_path(path), parent_rev=metadata.rev)
+            self.provider.remove(
+                self._remote_path(path),
+                parent_rev=metadata.rev,
+                expected_provider_id=metadata.id,
+            )
             remote.pop(path)
         for path in sorted(directory_roots, key=_path_depth, reverse=True):
-            self.provider.remove(self._remote_path(path))
+            folder_metadata = remote[path]
+            self.provider.remove(
+                self._remote_path(path), expected_provider_id=folder_metadata.id
+            )
             self._drop_remote_prefix(remote, path)
 
     @staticmethod
@@ -2160,14 +2181,19 @@ class EncryptedRemoteProvider:
             return metadata
 
     def move(
-        self, remote_path: str, new_path: str, autorename: bool = False
+        self,
+        remote_path: str,
+        new_path: str,
+        autorename: bool = False,
+        *,
+        expected_provider_id: str,
     ) -> FileMetadata | FolderMetadata:
         with self._lock:
             self._ensure_loaded()
             source = self._normalise_logical_path(remote_path)
             target = self._normalise_logical_path(new_path)
             metadata = self._metadata_by_path.get(normalize(source))
-            if metadata is None:
+            if metadata is None or metadata.id != expected_provider_id:
                 raise NotFoundError("Encrypted item not found", dbx_path=source)
             if source == target:
                 return metadata
@@ -2195,13 +2221,17 @@ class EncryptedRemoteProvider:
             return moved
 
     def remove(
-        self, remote_path: str, parent_rev: str | None = None
+        self,
+        remote_path: str,
+        parent_rev: str | None = None,
+        *,
+        expected_provider_id: str,
     ) -> FileMetadata | FolderMetadata:
         with self._lock:
             self._ensure_loaded()
             path = self._normalise_logical_path(remote_path)
             metadata = self._metadata_by_path.get(normalize(path))
-            if metadata is None:
+            if metadata is None or metadata.id != expected_provider_id:
                 raise NotFoundError("Encrypted item not found", dbx_path=path)
             if (
                 parent_rev is not None

@@ -33,6 +33,7 @@ class DropboxTestLock:
         self.lock_path = lock_path
         self.expires_after = expires_after
         self._rev = None
+        self._id = None
 
     def acquire(self, blocking: bool = True, timeout: float = -1) -> bool:
         """
@@ -67,6 +68,7 @@ class DropboxTestLock:
                         client_modified=expiry_time,
                     )
                     self._rev = md.rev
+                    self._id = md.id
             except FileConflictError:
                 # Check if lockfile has expired. If yes, delete it retry to acquire.
                 if not self.locked():
@@ -90,6 +92,7 @@ class DropboxTestLock:
             client_modified=expiry_time,
         )
         self._rev = md.rev
+        self._id = md.id
 
     def locked(self):
         """
@@ -105,7 +108,11 @@ class DropboxTestLock:
         if md.client_modified < datetime.now(timezone.utc):
             # lock has expired, remove
             try:
-                self.client.remove(self.lock_path, parent_rev=md.rev)
+                self.client.remove(
+                    self.lock_path,
+                    parent_rev=md.rev,
+                    expected_provider_id=md.id,
+                )
             except NotFoundError:
                 # protect against race
                 pass
@@ -121,12 +128,17 @@ class DropboxTestLock:
         :raises: RuntimeError we did not acquire the lock.
         """
 
-        if not self._rev:
+        if not self._rev or not self._id:
             raise RuntimeError("release unlocked lock")
 
         try:
-            self.client.remove(self.lock_path, parent_rev=self._rev)
+            self.client.remove(
+                self.lock_path,
+                parent_rev=self._rev,
+                expected_provider_id=self._id,
+            )
         except NotFoundError:
             pass
 
         self._rev = None
+        self._id = None

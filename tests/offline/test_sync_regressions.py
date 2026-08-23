@@ -330,7 +330,10 @@ def test_case_only_move_does_not_remove_remote_destination(
     assert sync_engine._on_local_moved(event) is SyncStatus.Done
     sync_engine.client.remove.assert_not_called()
     sync_engine.client.move.assert_called_once_with(
-        "/readme.txt", "/README.txt", autorename=True
+        "/readme.txt",
+        "/README.txt",
+        autorename=True,
+        expected_provider_id="id:source",
     )
 
 
@@ -366,7 +369,9 @@ def test_move_to_different_path_still_removes_remote_destination(
 
     assert sync_engine._on_local_moved(event) is SyncStatus.Done
     sync_engine.client.remove.assert_called_once_with(
-        "/destination.txt", parent_rev="old-rev"
+        "/destination.txt",
+        parent_rev="old-rev",
+        expected_provider_id="id:destination",
     )
 
 

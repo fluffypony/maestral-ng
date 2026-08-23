@@ -364,6 +364,40 @@ def test_create_shared_link_converts_aware_expiry_to_utc(client, monkeypatch):
     assert settings.expires == datetime(2026, 1, 2, 10, tzinfo=timezone.utc)
 
 
+@pytest.mark.parametrize("operation", ["move", "remove"])
+def test_mutation_uses_expected_id_instead_of_replaceable_path(
+    client: DropboxClient,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+) -> None:
+    client._dbx = Mock()
+    monkeypatch.setattr(client_module, "convert_metadata", lambda value: value)
+    expected_id = "id:original"
+
+    if operation == "move":
+        client._dbx.files_move_v2.return_value = SimpleNamespace(metadata="moved")
+        result = client.move(
+            "/replaceable.txt",
+            "/moved.txt",
+            expected_provider_id=expected_id,
+        )
+        assert result == "moved"
+        assert client._dbx.files_move_v2.call_args.args[:2] == (
+            expected_id,
+            "/moved.txt",
+        )
+    else:
+        client._dbx.files_delete_v2.return_value = SimpleNamespace(metadata="removed")
+        result = client.remove(
+            "/replaceable.txt",
+            expected_provider_id=expected_id,
+        )
+        assert result == "removed"
+        client._dbx.files_delete_v2.assert_called_once_with(
+            expected_id, parent_rev=None
+        )
+
+
 def test_list_shared_links_forwards_direct_only_on_every_page(client):
     first_page = SimpleNamespace(links=[], has_more=True, cursor="first")
     second_page = SimpleNamespace(links=[], has_more=False, cursor="second")

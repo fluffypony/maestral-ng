@@ -152,11 +152,20 @@ class RemoteProvider(Protocol):
     ) -> FolderMetadata: ...
 
     def move(
-        self, remote_path: str, new_path: str, autorename: bool = False
+        self,
+        remote_path: str,
+        new_path: str,
+        autorename: bool = False,
+        *,
+        expected_provider_id: str,
     ) -> FileMetadata | FolderMetadata: ...
 
     def remove(
-        self, remote_path: str, parent_rev: str | None = None
+        self,
+        remote_path: str,
+        parent_rev: str | None = None,
+        *,
+        expected_provider_id: str,
     ) -> FileMetadata | FolderMetadata: ...
 
     def share_dir(

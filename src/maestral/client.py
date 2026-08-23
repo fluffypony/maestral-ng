@@ -1205,7 +1205,11 @@ class DropboxClient:
         return md
 
     def remove(
-        self, dbx_path: str, parent_rev: str | None = None
+        self,
+        dbx_path: str,
+        parent_rev: str | None = None,
+        *,
+        expected_provider_id: str,
     ) -> FileMetadata | FolderMetadata:
         """
         Removes a file / folder from Dropbox.
@@ -1213,10 +1217,11 @@ class DropboxClient:
         :param dbx_path: Path to file on Dropbox.
         :param parent_rev: Perform delete if given "rev" matches the existing file's
             latest "rev". This field does not support deleting a folder.
+        :param expected_provider_id: Stable ID of the item which may be deleted.
         :returns: Metadata of deleted item.
         """
         with convert_api_errors(dbx_path=dbx_path):
-            res = self.dbx.files_delete_v2(dbx_path, parent_rev=parent_rev)
+            res = self.dbx.files_delete_v2(expected_provider_id, parent_rev=parent_rev)
         return convert_metadata(res.metadata)
 
     def remove_batch(
@@ -1328,7 +1333,12 @@ class DropboxClient:
         return result_list
 
     def move(
-        self, dbx_path: str, new_path: str, autorename: bool = False
+        self,
+        dbx_path: str,
+        new_path: str,
+        autorename: bool = False,
+        *,
+        expected_provider_id: str,
     ) -> FileMetadata | FolderMetadata:
         """
         Moves / renames files or folders on Dropbox.
@@ -1337,11 +1347,12 @@ class DropboxClient:
         :param new_path: New path on Dropbox to move to.
         :param autorename: Have the Dropbox server try to rename the item in case of a
             conflict.
+        :param expected_provider_id: Stable ID of the item which may be moved.
         :returns: Metadata of moved item.
         """
         with convert_api_errors(dbx_path=new_path):
             res = self.dbx.files_move_v2(
-                dbx_path,
+                expected_provider_id,
                 new_path,
                 allow_shared_folder=True,
                 allow_ownership_transfer=True,

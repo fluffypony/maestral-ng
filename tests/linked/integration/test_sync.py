@@ -72,6 +72,12 @@ def wait_for_idle(m: Maestral, cycles: int = 6) -> None:
             count += 1
 
 
+def remove_remote_item(m: Maestral, path: str) -> None:
+    metadata = m.client.get_metadata(path)
+    assert metadata is not None
+    m.client.remove(path, expected_provider_id=metadata.id)
+
+
 # ==== test basic sync =================================================================
 
 
@@ -121,7 +127,7 @@ def test_file_lifecycle(m: Maestral, name: str) -> None:
     assert_synced(m, tree)
 
     # Test remote file deletion.
-    m.client.remove(f"/{name}")
+    remove_remote_item(m, f"/{name}")
 
     wait_for_idle(m)
 
@@ -201,7 +207,7 @@ def test_folder_tree_remote(m: Maestral) -> None:
 
     # Test remote tree deletion.
 
-    m.client.remove("/test_folder")
+    remove_remote_item(m, "/test_folder")
     wait_for_idle(m, 15)
 
     assert_no_errors(m)
@@ -341,7 +347,14 @@ def test_case_change_remote(m: Maestral) -> None:
     assert_synced(m)
 
     # Rename the remote folder.
-    m.client.move("/folder", "/FOLDER", autorename=True)
+    source_md = m.client.get_metadata("/folder")
+    assert isinstance(source_md, FolderMetadata)
+    m.client.move(
+        "/folder",
+        "/FOLDER",
+        autorename=True,
+        expected_provider_id=source_md.id,
+    )
 
     wait_for_idle(m)
 
@@ -453,7 +466,7 @@ def test_excluded_folder_cleared_on_deletion(m: Maestral) -> None:
     assert not osp.exists(local_path)
 
     # Check that an excluded folder is removed from excluded_list on deletion.
-    m.client.remove(dbx_path)
+    remove_remote_item(m, dbx_path)
     wait_for_idle(m)
 
     assert normalize(dbx_path) not in m.selective_sync_paths
@@ -571,7 +584,7 @@ def test_remote_file_replaced_by_folder(m: Maestral) -> None:
 
     with m.sync.sync_lock:
         # Replace the remote file with folder.
-        m.client.remove("/file.txt")
+        remove_remote_item(m, "/file.txt")
         m.client.make_dir("/file.txt")
 
     wait_for_idle(m, 10)
@@ -591,7 +604,7 @@ def test_remote_file_replaced_by_folder_and_unsynced_local_changes(m: Maestral) 
 
     with m.sync.sync_lock:
         # replace remote file with folder
-        m.client.remove("/file.txt")
+        remove_remote_item(m, "/file.txt")
         m.client.make_dir("/file.txt")
 
         # create local changes
@@ -631,7 +644,7 @@ def test_remote_folder_replaced_by_file(m: Maestral) -> None:
 
     with m.sync.sync_lock:
         # Replace remote folder with a file.
-        m.client.remove("/folder")
+        remove_remote_item(m, "/folder")
         create_remote_tree(m, {"folder": "content"})
 
     wait_for_idle(m)
@@ -655,7 +668,7 @@ def test_remote_folder_replaced_by_file_and_unsynced_local_changes(m: Maestral) 
         # Remote state:
         # - '/Sync Tests/folder'
 
-        m.client.remove("/folder")
+        remove_remote_item(m, "/folder")
         create_remote_tree(m, {"folder": "content"})
 
         # Make some local changes to the folder.
@@ -956,7 +969,7 @@ def test_parallel_deletion_when_paused(m: Maestral) -> None:
     delete(m.dropbox_path + "/file.txt")
 
     # delete remote file
-    m.client.remove("/file.txt")
+    remove_remote_item(m, "/file.txt")
 
     m.start_sync()
     wait_for_idle(m)
