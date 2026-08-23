@@ -21,6 +21,12 @@ OLD_REV_FILE = ".maestral"
 MIGNORE_FILE = ".mignore"
 FILE_CACHE = ".maestral.cache"
 ROOT_MARKER_FILE = ".maestral-root"
+ROOT_MARKER_TEMP_PREFIX = ".~maestral-root-"
+CASE_CHANGE_TEMP_PREFIX = ".~maestral-case-"
+MOVE_TEMP_PREFIX = ".~maestral-move-"
+REMOVE_TEMP_PREFIX = ".~maestral-remove-"
+PATH_ROOT_MIGRATION_PREFIX = ".maestral-migration-"
+PATH_ROOT_RECOVERY_PREFIX = ".maestral-recovered-"
 
 EXCLUDED_FILE_NAMES = frozenset(
     [
