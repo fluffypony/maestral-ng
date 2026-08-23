@@ -21,6 +21,7 @@ def m():
     m.log_level = logging.DEBUG
     yield m
     m.manager.shutdown()
+    m.sync._connection.close()
     remove_configuration(m.config_name)
 
 
@@ -43,6 +44,7 @@ def sync():
     observer.stop()
     observer.join()
 
+    sync._connection.close()
     remove_configuration("test-config")
     delete(sync.dropbox_path)
 

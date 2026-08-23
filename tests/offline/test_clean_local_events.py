@@ -27,6 +27,7 @@ def sync():
 
     yield sync
 
+    sync._connection.close()
     remove_configuration("test-config")
 
 
