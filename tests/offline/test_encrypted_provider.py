@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import os
 import posixpath
 import shutil
+import time
+import uuid
 from collections.abc import Iterator
 from datetime import datetime, timezone
 from pathlib import Path
@@ -19,7 +22,13 @@ from maestral.core import (
     WriteMode,
 )
 from maestral.exceptions import FileConflictError, NotFoundError
-from maestral.providers.encrypted import EncryptedVaultError, PhysicalVaultMirror
+from maestral.providers.encrypted import (
+    EncryptedRemoteProvider,
+    EncryptedVaultError,
+    PhysicalVaultMirror,
+    VaultEntry,
+    VaultStorageEntry,
+)
 from maestral.utils.hashing import sha256_content_hasher
 from maestral.utils.path import normalize
 
@@ -33,12 +42,16 @@ class FakeRemoteProvider:
 
     def __init__(self, root: Path) -> None:
         self.config_name = "encrypted-test"
+        self.linked = True
         self.root = root
         self.root.mkdir()
         self._ids = {"/": "id:root"}
         self._revisions: dict[str, str] = {}
         self._next_id = 0
         self._cursor = 1
+
+    def close(self) -> None:
+        pass
 
     def _local(self, remote_path: str) -> Path:
         if not remote_path.startswith("/") or ".." in remote_path.split("/"):
@@ -109,6 +122,24 @@ class FakeRemoteProvider:
             relative = path.relative_to(self.root).as_posix()
             entries.append(self._metadata("/" + relative))
         yield ListFolderResult(entries, False, f"cursor:{self._cursor}")
+
+    def list_remote_changes_iterator(
+        self,
+        last_cursor: str,
+        indexed_paths: object = None,
+    ) -> Iterator[ListFolderResult]:
+        del indexed_paths
+        current = f"cursor:{self._cursor}"
+        entries: list[Metadata] = []
+        if last_cursor != current:
+            entries = [
+                self._metadata(path) for path in sorted(self._ids) if path != "/"
+            ]
+        yield ListFolderResult(entries, False, current)
+
+    def wait_for_remote_changes(self, last_cursor: str, timeout: int = 40) -> bool:
+        del timeout
+        return last_cursor != f"cursor:{self._cursor}"
 
     def make_dir(self, remote_path: str, autorename: bool = False) -> FolderMetadata:
         del autorename
@@ -234,6 +265,214 @@ def write_vault(root: Path) -> None:
     (root / "d" / "aa" / "long.c9s" / "name.c9s").write_bytes(b"old name")
 
 
+class FakeSecretStore:
+    def __init__(self) -> None:
+        self.secret: str | None = None
+
+    def load(self) -> str | None:
+        return self.secret
+
+    def save(self, secret: str) -> None:
+        self.secret = secret
+
+    def delete(self) -> None:
+        self.secret = None
+
+
+class FakeCryptomatorSession:
+    def __init__(self, password: str) -> None:
+        self.password = password
+        self.vault_path: Path | None = None
+        self.opened = False
+        self.entries: dict[str, VaultEntry] = {}
+        self.storage: dict[str, VaultStorageEntry] = {}
+        self.contents: dict[str, bytes] = {}
+
+    def _vault(self) -> Path:
+        assert self.vault_path is not None
+        return self.vault_path
+
+    @staticmethod
+    def _password(secret: bytes | bytearray) -> str:
+        return bytes(secret).decode("utf-8")
+
+    @staticmethod
+    def _cipher_name(name: str) -> str:
+        return hashlib.sha256(name.encode()).hexdigest()[:24] + ".c9r"
+
+    def _parent_storage(self, logical_path: str) -> str:
+        parent = posixpath.dirname(logical_path) or "/"
+        if parent == "/":
+            return "d/root"
+        return self.storage[parent]["storage_path"]
+
+    def _entry_path(self, logical_path: str) -> str:
+        return (
+            self._parent_storage(logical_path)
+            + "/"
+            + self._cipher_name(posixpath.basename(logical_path))
+        )
+
+    def _physical(self, storage_path: str) -> Path:
+        return self._vault().joinpath(*storage_path.split("/"))
+
+    def initialize(
+        self, vault_path: str | os.PathLike[str], secret: bytes | bytearray
+    ) -> dict[str, object]:
+        assert self._password(secret) == self.password
+        self.vault_path = Path(vault_path)
+        (self._vault() / "d" / "root").mkdir(parents=True)
+        (self._vault() / "vault.cryptomator").write_bytes(b"signed vault config")
+        (self._vault() / "masterkey.cryptomator").write_bytes(b"protected key")
+        self.opened = True
+        return {"vault_format": 8, "key_id": "masterkeyfile:masterkey.cryptomator"}
+
+    def open(
+        self, vault_path: str | os.PathLike[str], secret: bytes | bytearray
+    ) -> dict[str, object]:
+        assert self._password(secret) == self.password
+        self.vault_path = Path(vault_path)
+        assert (self._vault() / "vault.cryptomator").is_file()
+        self.opened = True
+        return {"vault_format": 8, "key_id": "masterkeyfile:masterkey.cryptomator"}
+
+    def close_vault(self) -> None:
+        self.opened = False
+
+    def shutdown(self) -> None:
+        self.opened = False
+
+    def snapshot(self, *, include_hash: bool = False) -> list[VaultEntry]:
+        assert self.opened
+        assert include_hash
+        return [self.entries[path].copy() for path in sorted(self.entries)]  # type: ignore[misc]
+
+    def storage_map(self) -> list[VaultStorageEntry]:
+        assert self.opened
+        return [self.storage[path].copy() for path in sorted(self.storage)]  # type: ignore[misc]
+
+    def put_file(
+        self,
+        logical_path: str,
+        source: str | os.PathLike[str] | BinaryIO,
+        *,
+        modified_ms: int | None = None,
+        replace: bool = False,
+    ) -> None:
+        assert self.opened
+        assert replace == (logical_path in self.entries)
+        if isinstance(source, (str, bytes, os.PathLike)):
+            content = Path(source).read_bytes()
+        else:
+            source.seek(0)
+            content = source.read()
+            source.seek(0)
+        storage_path = self.storage.get(logical_path, {}).get(
+            "storage_path", self._entry_path(logical_path)
+        )
+        assert isinstance(storage_path, str)
+        physical = self._physical(storage_path)
+        physical.parent.mkdir(parents=True, exist_ok=True)
+        physical.write_bytes(bytes(byte ^ 0xA5 for byte in content))
+        self.contents[logical_path] = content
+        self.entries[logical_path] = {
+            "path": logical_path,
+            "type": "file",
+            "size": len(content),
+            "modified_ms": modified_ms or int(time.time() * 1000),
+            "sha256": hashlib.sha256(content).hexdigest(),
+            "link_target": "",
+        }
+        self.storage[logical_path] = {
+            "path": logical_path,
+            "type": "file",
+            "storage_path": storage_path,
+        }
+
+    def get_file(
+        self,
+        logical_path: str,
+        destination: str | os.PathLike[str] | BinaryIO,
+        *,
+        replace: bool = False,
+    ) -> None:
+        del replace
+        content = self.contents[logical_path]
+        if isinstance(destination, (str, bytes, os.PathLike)):
+            Path(destination).write_bytes(content)
+        else:
+            destination.write(content)
+
+    def mkdir(self, logical_path: str, *, parents: bool = False) -> None:
+        del parents
+        token = uuid.uuid4().hex[:24]
+        storage_path = "d/" + token
+        self._physical(storage_path).mkdir()
+        marker = self._physical(self._entry_path(logical_path))
+        marker.mkdir()
+        (marker / "dir.c9r").write_bytes(token.encode())
+        self.entries[logical_path] = {
+            "path": logical_path,
+            "type": "directory",
+            "size": 0,
+            "modified_ms": int(time.time() * 1000),
+            "sha256": "",
+            "link_target": "",
+        }
+        self.storage[logical_path] = {
+            "path": logical_path,
+            "type": "directory",
+            "storage_path": storage_path,
+        }
+
+    def move(self, source: str, target: str, *, replace: bool = False) -> None:
+        assert not replace
+        moving = [
+            path
+            for path in self.entries
+            if path == source or path.startswith(source + "/")
+        ]
+        source_marker = self._physical(self._entry_path(source))
+        target_marker = self._physical(self._entry_path(target))
+        source_marker.rename(target_marker)
+        for old_path in sorted(moving, key=len):
+            new_path = target + old_path[len(source) :]
+            entry = self.entries.pop(old_path)
+            storage = self.storage.pop(old_path)
+            entry["path"] = new_path
+            storage["path"] = new_path
+            if entry["type"] == "file" and old_path == source:
+                storage["storage_path"] = target_marker.relative_to(
+                    self._vault()
+                ).as_posix()
+            self.entries[new_path] = entry
+            self.storage[new_path] = storage
+            if old_path in self.contents:
+                self.contents[new_path] = self.contents.pop(old_path)
+
+    def delete(self, logical_path: str, *, recursive: bool = False) -> None:
+        selected = [
+            path
+            for path in self.entries
+            if path == logical_path
+            or (recursive and path.startswith(logical_path + "/"))
+        ]
+        marker = self._physical(self._entry_path(logical_path))
+        if marker.is_dir():
+            shutil.rmtree(marker)
+        else:
+            marker.unlink()
+        for path in sorted(selected, key=len, reverse=True):
+            if self.entries[path]["type"] == "directory":
+                shutil.rmtree(
+                    self._physical(self.storage[path]["storage_path"]),
+                    ignore_errors=True,
+                )
+            self.entries.pop(path)
+            self.storage.pop(path)
+            self.contents.pop(path, None)
+
+
 def test_ciphertext_commit_preserves_ids_for_moves_and_updates(tmp_path: Path) -> None:
     local = tmp_path / "local-vault"
     local.mkdir()
@@ -301,3 +540,112 @@ def test_remote_vault_root_must_be_dedicated() -> None:
 
     with pytest.raises(ValueError, match="invalid"):
         PhysicalVaultMirror._normalise_remote_root("/Encrypted/../escape")
+
+
+def test_encrypted_provider_round_trip_and_stable_identity(tmp_path: Path) -> None:
+    remote = FakeRemoteProvider(tmp_path / "remote-provider")
+    secrets = FakeSecretStore()
+    sidecar = FakeCryptomatorSession("vault password")
+    provider = EncryptedRemoteProvider(
+        remote,
+        secrets,
+        "/Encrypted",
+        tmp_path / "ciphertext-cache",
+        sidecar=sidecar,
+    )
+
+    provider.initialise_vault("vault password")
+    assert secrets.secret == "vault password"
+    assert provider.vault_open
+    assert provider.list_folder("/").entries == []
+
+    folder = provider.make_dir("/Documents")
+    assert folder.path_display == "/Documents"
+    source = io.BytesIO(b"cleartext must stay local")
+    uploaded = provider.upload(source, "/Documents/report.txt")
+    assert uploaded.content_hash == hashlib.sha256(source.getvalue()).hexdigest()
+    stable_id = uploaded.id
+
+    remote_bytes = b"".join(
+        path.read_bytes() for path in remote.root.rglob("*") if path.is_file()
+    )
+    assert b"cleartext must stay local" not in remote_bytes
+
+    moved = provider.move("/Documents/report.txt", "/Documents/final report.txt")
+    assert moved.id == stable_id
+    assert provider.get_metadata("/Documents/report.txt") is None
+
+    downloaded = io.BytesIO()
+    provider.download(
+        "/Documents/final report.txt",
+        downloaded,
+        rev=moved.rev,
+        provider_id=moved.id,
+    )
+    assert downloaded.getvalue() == b"cleartext must stay local"
+
+    with pytest.raises(FileConflictError, match="changed"):
+        provider.upload(
+            io.BytesIO(b"new content"),
+            "/Documents/final report.txt",
+            write_mode=WriteMode.Update,
+            update_rev="stale revision",
+        )
+
+    updated = provider.upload(
+        io.BytesIO(b"new content"),
+        "/Documents/final report.txt",
+        write_mode=WriteMode.Update,
+        update_rev=moved.rev,
+    )
+    assert updated.id == stable_id
+    assert updated.rev != moved.rev
+
+    provider.lock_vault()
+    assert not provider.vault_open
+    assert provider.get_metadata("/Documents/final report.txt") == updated
+    assert provider.vault_open
+    provider.close()
+
+
+def test_encrypted_provider_lists_deletions_after_remote_refresh(
+    tmp_path: Path,
+) -> None:
+    remote = FakeRemoteProvider(tmp_path / "remote-provider")
+    provider = EncryptedRemoteProvider(
+        remote,
+        FakeSecretStore(),
+        "/Encrypted",
+        tmp_path / "ciphertext-cache",
+        sidecar=FakeCryptomatorSession("password"),
+    )
+    provider.initialise_vault("password")
+    first = provider.upload(io.BytesIO(b"one"), "/one.txt")
+    cursor = provider.list_folder("/", recursive=True).cursor
+    provider.remove("/one.txt")
+
+    page = next(provider.list_remote_changes_iterator(cursor, {first.id: "/one.txt"}))
+    assert page.cursor != cursor
+    assert len(page.entries) == 1
+    assert page.entries[0].path_display == "/one.txt"
+    assert not isinstance(page.entries[0], FileMetadata)
+    provider.close()
+
+
+def test_encrypted_provider_rejects_storage_map_mismatch(tmp_path: Path) -> None:
+    remote = FakeRemoteProvider(tmp_path / "remote-provider")
+    sidecar = FakeCryptomatorSession("password")
+    provider = EncryptedRemoteProvider(
+        remote,
+        FakeSecretStore(),
+        "/Encrypted",
+        tmp_path / "ciphertext-cache",
+        sidecar=sidecar,
+    )
+    provider.initialise_vault("password")
+    provider.upload(io.BytesIO(b"content"), "/file.txt")
+    sidecar.storage.clear()
+
+    with pytest.raises(EncryptedVaultError, match="different sizes"):
+        provider._rebuild_logical_metadata()
+    provider.close()

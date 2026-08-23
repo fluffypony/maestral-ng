@@ -5,25 +5,132 @@ from __future__ import annotations
 import hashlib
 import os
 import posixpath
+import re
 import shutil
 import stat
 import tempfile
+import threading
+import time
 import uuid
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
-from typing import TYPE_CHECKING, Literal, cast
+from typing import (
+    TYPE_CHECKING,
+    BinaryIO,
+    Literal,
+    Protocol,
+    TypedDict,
+    cast,
+    overload,
+)
 
-from maestral.core import FileMetadata, FolderMetadata, Metadata, WriteMode
-from maestral.exceptions import MaestralApiError
+from maestral.core import (
+    Account,
+    DeletedMetadata,
+    FileMetadata,
+    FolderMetadata,
+    FullAccount,
+    LinkAccessLevel,
+    LinkAudience,
+    ListFolderResult,
+    Metadata,
+    PersonalSpaceUsage,
+    RootInfo,
+    SharedLinkMetadata,
+    WriteMode,
+)
+from maestral.exceptions import (
+    DataChangedError,
+    DataCorruptionError,
+    FileConflictError,
+    FolderConflictError,
+    IsAFolderError,
+    MaestralApiError,
+    NotAFolderError,
+    NotFoundError,
+    UnsupportedProviderOperationError,
+)
 from maestral.providers.base import RemoteProvider
+from maestral.utils.hashing import ContentHasherFactory, sha256_content_hasher
 from maestral.utils.path import normalize
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from maestral.models import SyncEvent
 
 
 class EncryptedVaultError(MaestralApiError):
     """A local Cryptomator vault or mirror operation failed."""
+
+
+class VaultEntry(TypedDict):
+    path: str
+    type: str
+    size: int
+    modified_ms: int
+    sha256: str
+    link_target: str
+
+
+class VaultStorageEntry(TypedDict):
+    path: str
+    type: str
+    storage_path: str
+
+
+class CryptomatorSession(Protocol):
+    """The sidecar methods used by the encrypted provider."""
+
+    def initialize(
+        self, vault_path: str | os.PathLike[str], secret: bytes | bytearray
+    ) -> Mapping[str, object]: ...
+
+    def open(
+        self, vault_path: str | os.PathLike[str], secret: bytes | bytearray
+    ) -> Mapping[str, object]: ...
+
+    def close_vault(self) -> None: ...
+
+    def shutdown(self) -> None: ...
+
+    def snapshot(self, *, include_hash: bool = False) -> list[VaultEntry]: ...
+
+    def storage_map(self) -> list[VaultStorageEntry]: ...
+
+    def put_file(
+        self,
+        logical_path: str,
+        source: str | os.PathLike[str] | BinaryIO,
+        *,
+        modified_ms: int | None = None,
+        replace: bool = False,
+    ) -> None: ...
+
+    def get_file(
+        self,
+        logical_path: str,
+        destination: str | os.PathLike[str] | BinaryIO,
+        *,
+        replace: bool = False,
+    ) -> None: ...
+
+    def mkdir(self, logical_path: str, *, parents: bool = False) -> None: ...
+
+    def move(self, source: str, target: str, *, replace: bool = False) -> None: ...
+
+    def delete(self, logical_path: str, *, recursive: bool = False) -> None: ...
+
+
+class VaultSecretStore(Protocol):
+    """Secure storage used for one vault password."""
+
+    def load(self) -> str | None: ...
+
+    def save(self, secret: str) -> None: ...
+
+    def delete(self) -> None: ...
 
 
 _PhysicalKind = Literal["file", "directory"]
@@ -638,3 +745,912 @@ class PhysicalVaultMirror:
             while chunk := file.read(1024 * 1024):
                 digest.update(chunk)
         return digest.hexdigest()
+
+
+class EncryptedRemoteProvider:
+    """Expose an official Cryptomator vault as a logical remote provider."""
+
+    content_hasher_factory: ContentHasherFactory = sha256_content_hasher
+
+    def __init__(
+        self,
+        provider: RemoteProvider,
+        secret_store: VaultSecretStore,
+        remote_root: str,
+        local_root: str | os.PathLike[str],
+        *,
+        sidecar: CryptomatorSession,
+    ) -> None:
+        self._provider = provider
+        self._secret_store = secret_store
+        self._sidecar = sidecar
+        self._mirror = PhysicalVaultMirror(provider, remote_root, local_root)
+        self._lock = threading.RLock()
+        self._secret: bytearray | None = None
+        self._vault_info: Mapping[str, object] | None = None
+        self._metadata_by_path: dict[str, FileMetadata | FolderMetadata] = {}
+        self._metadata_by_id: dict[str, FileMetadata | FolderMetadata] = {}
+        self._cursor = ""
+        self._loaded = False
+        self._closed = False
+
+        self.config_name = provider.config_name
+        self.provider_id = provider.provider_id
+        self.api_url = provider.api_url
+        self.bandwidth_limit_up = provider.bandwidth_limit_up
+        self.bandwidth_limit_down = provider.bandwidth_limit_down
+
+    @property
+    def linked(self) -> bool:
+        return self._provider.linked
+
+    @property
+    def account_info(self) -> FullAccount:
+        return self._provider.account_info
+
+    @property
+    def namespace_id(self) -> str:
+        return self._provider.namespace_id
+
+    @property
+    def is_team_space(self) -> bool:
+        return self._provider.is_team_space
+
+    @property
+    def vault_open(self) -> bool:
+        return self._loaded
+
+    @property
+    def vault_path(self) -> str:
+        return self._mirror.remote_root
+
+    def get_auth_url(self) -> str:
+        return self._provider.get_auth_url()
+
+    def link(
+        self,
+        code: str | None = None,
+        refresh_token: str | None = None,
+        access_token: str | None = None,
+        allow_plaintext_keyring: bool = False,
+    ) -> int:
+        return self._provider.link(
+            code,
+            refresh_token,
+            access_token,
+            allow_plaintext_keyring,
+        )
+
+    def unlink(self) -> None:
+        self.lock_vault()
+        self._provider.unlink()
+
+    @overload
+    def get_account_info(self, dbid: None = None) -> FullAccount: ...
+
+    @overload
+    def get_account_info(self, dbid: str) -> Account: ...
+
+    def get_account_info(self, dbid: str | None = None) -> Account:
+        return self._provider.get_account_info(dbid)
+
+    def get_space_usage(self) -> PersonalSpaceUsage:
+        return self._provider.get_space_usage()
+
+    def update_path_root(self, root_info: RootInfo) -> None:
+        with self._lock:
+            if self._loaded:
+                raise EncryptedVaultError(
+                    "Cannot change the remote account root",
+                    "Lock the encrypted vault before this account change.",
+                )
+            self._provider.update_path_root(root_info)
+
+    def initialise_vault(self, secret: str) -> None:
+        """Create a new format-eight vault in an empty remote folder."""
+        secret_bytes = self._encode_secret(secret)
+        with self._lock:
+            self._require_open_provider()
+            if self._loaded:
+                self._wipe(secret_bytes)
+                raise EncryptedVaultError(
+                    "Encrypted vault is already open",
+                    "Lock the current vault before creating another vault.",
+                )
+            try:
+                self._prepare_local_root_for_initialisation()
+                self._vault_info = self._sidecar.initialize(
+                    self._mirror.local_root, secret_bytes
+                )
+                before: Mapping[str, _LocalPhysicalEntry] = {}
+                self._sidecar.close_vault()
+                self._mirror.ensure_remote_root(create=True)
+                remote = self._mirror._list_remote()[0]
+                if remote:
+                    raise EncryptedVaultError(
+                        "Encrypted vault is not empty",
+                        "Choose an empty remote folder for a new vault.",
+                    )
+                self._mirror._remote = {}
+                self._mirror.commit(before)
+                self._vault_info = self._sidecar.open(
+                    self._mirror.local_root, secret_bytes
+                )
+                self._secret_store.save(secret)
+                self._secret = secret_bytes
+                self._loaded = True
+                self._rebuild_logical_metadata()
+            except BaseException:
+                if self._secret is not secret_bytes:
+                    self._wipe(secret_bytes)
+                self._loaded = False
+                raise
+
+    def attach_vault(self, secret: str) -> None:
+        """Verify and save the password for an existing remote vault."""
+        secret_bytes = self._encode_secret(secret)
+        with self._lock:
+            self._require_open_provider()
+            if self._loaded:
+                self._wipe(secret_bytes)
+                raise EncryptedVaultError(
+                    "Encrypted vault is already open",
+                    "Lock the current vault before attaching another vault.",
+                )
+            try:
+                self._cursor = self._mirror.refresh()
+                self._vault_info = self._sidecar.open(
+                    self._mirror.local_root, secret_bytes
+                )
+                self._rebuild_logical_metadata()
+                self._secret_store.save(secret)
+                self._secret = secret_bytes
+                self._loaded = True
+            except BaseException:
+                self._wipe(secret_bytes)
+                try:
+                    self._sidecar.close_vault()
+                except Exception:
+                    pass
+                self._loaded = False
+                raise
+
+    def unlock_vault(self) -> None:
+        """Load the saved password and open the configured remote vault."""
+        with self._lock:
+            if self._loaded:
+                return
+            self._require_open_provider()
+            secret = self._secret_store.load()
+            if secret is None:
+                raise EncryptedVaultError(
+                    "Encrypted vault is locked",
+                    "Save the vault password in the system keyring and try again.",
+                )
+            secret_bytes = self._encode_secret(secret)
+            try:
+                self._cursor = self._mirror.refresh()
+                self._vault_info = self._sidecar.open(
+                    self._mirror.local_root, secret_bytes
+                )
+                self._secret = secret_bytes
+                self._loaded = True
+                self._rebuild_logical_metadata()
+            except BaseException:
+                self._wipe(secret_bytes)
+                self._loaded = False
+                raise
+
+    def lock_vault(self) -> None:
+        with self._lock:
+            if self._loaded:
+                try:
+                    self._sidecar.close_vault()
+                finally:
+                    self._loaded = False
+                    self._metadata_by_path.clear()
+                    self._metadata_by_id.clear()
+                    self._vault_info = None
+            if self._secret is not None:
+                self._wipe(self._secret)
+                self._secret = None
+
+    def close(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            try:
+                self.lock_vault()
+                self._sidecar.shutdown()
+            finally:
+                self._closed = True
+                self._provider.close()
+
+    def __enter__(self) -> EncryptedRemoteProvider:
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        self.close()
+
+    def get_metadata(
+        self, remote_path: str, include_deleted: bool = False
+    ) -> Metadata | None:
+        del include_deleted
+        with self._lock:
+            self._ensure_loaded()
+            path = self._normalise_logical_path(remote_path)
+            if path == "/":
+                return self._root_metadata()
+            return self._metadata_by_path.get(normalize(path))
+
+    def list_folder(
+        self,
+        remote_path: str,
+        recursive: bool = False,
+        include_deleted: bool = False,
+        include_mounted_folders: bool = True,
+        include_non_downloadable_files: bool = False,
+    ) -> ListFolderResult:
+        return next(
+            self.list_folder_iterator(
+                remote_path,
+                recursive,
+                include_deleted,
+                include_mounted_folders,
+                include_non_downloadable_files=include_non_downloadable_files,
+            )
+        )
+
+    def list_folder_iterator(
+        self,
+        remote_path: str,
+        recursive: bool = False,
+        include_deleted: bool = False,
+        include_mounted_folders: bool = True,
+        limit: int | None = None,
+        include_non_downloadable_files: bool = False,
+    ) -> Iterator[ListFolderResult]:
+        del include_deleted, include_mounted_folders, limit
+        del include_non_downloadable_files
+        with self._lock:
+            self._ensure_loaded()
+            self._refresh_locked()
+            path = self._normalise_logical_path(remote_path)
+            entries = self._listed_metadata(path, recursive)
+            result = ListFolderResult(entries, False, self._cursor)
+        yield result
+
+    def list_remote_changes_iterator(
+        self,
+        last_cursor: str,
+        indexed_paths: Mapping[str, str] | None = None,
+    ) -> Iterator[ListFolderResult]:
+        with self._lock:
+            self._ensure_loaded()
+            final_cursor = last_cursor
+            saw_entries = False
+            physical_paths = {
+                metadata.id: self._mirror._remote_path(relative)
+                for relative, metadata in self._mirror.remote_entries.items()
+            }
+            for page in self._provider.list_remote_changes_iterator(
+                last_cursor, indexed_paths=physical_paths
+            ):
+                final_cursor = page.cursor
+                saw_entries = saw_entries or bool(page.entries)
+
+            if final_cursor == last_cursor and not saw_entries:
+                result = ListFolderResult([], False, last_cursor)
+            else:
+                self._refresh_locked()
+                known = dict(indexed_paths or {})
+                current_by_id = self._metadata_by_id
+                entries: list[Metadata] = []
+                for provider_id, old_path in sorted(known.items()):
+                    current = current_by_id.get(provider_id)
+                    if current is None or current.path_lower != normalize(old_path):
+                        entries.append(
+                            DeletedMetadata(
+                                posixpath.basename(old_path),
+                                normalize(old_path),
+                                old_path,
+                            )
+                        )
+                entries.extend(
+                    sorted(
+                        self._metadata_by_path.values(),
+                        key=lambda metadata: metadata.path_lower,
+                    )
+                )
+                result = ListFolderResult(entries, False, self._cursor)
+        yield result
+
+    def wait_for_remote_changes(self, last_cursor: str, timeout: int = 40) -> bool:
+        return self._provider.wait_for_remote_changes(last_cursor, timeout)
+
+    def download(
+        self,
+        remote_path: str,
+        local_path: str | BinaryIO,
+        sync_event: SyncEvent | None = None,
+        *,
+        rev: str | None = None,
+        provider_id: str | None = None,
+    ) -> FileMetadata:
+        with self._lock:
+            self._ensure_loaded()
+            metadata = self._file_for_request(remote_path, provider_id)
+            if rev is not None and rev != metadata.rev:
+                raise DataChangedError(
+                    "Encrypted file changed",
+                    "Retry the encrypted download.",
+                    dbx_path=remote_path,
+                )
+            file: BinaryIO
+            should_close = False
+            if isinstance(local_path, str):
+                self._sidecar.get_file(metadata.path_display, local_path, replace=True)
+                file = open(local_path, "rb")
+                should_close = True
+            else:
+                local_path.seek(0)
+                local_path.truncate()
+                self._sidecar.get_file(metadata.path_display, local_path, replace=True)
+                local_path.seek(0)
+                file = local_path
+
+            try:
+                digest = hashlib.sha256()
+                completed = 0
+                while chunk := file.read(1024 * 1024):
+                    digest.update(chunk)
+                    completed += len(chunk)
+                    if sync_event is not None:
+                        sync_event.completed = completed
+                if digest.hexdigest() != metadata.content_hash:
+                    raise DataCorruptionError(
+                        "Encrypted download is corrupt",
+                        "Retry the encrypted download.",
+                        dbx_path=metadata.path_display,
+                    )
+            finally:
+                if should_close:
+                    file.close()
+            if isinstance(local_path, str):
+                modified = metadata.client_modified.timestamp()
+                os.utime(local_path, (time.time(), modified))
+            return metadata
+
+    def upload(
+        self,
+        local_file: str | os.PathLike[str] | BinaryIO,
+        remote_path: str,
+        write_mode: WriteMode = WriteMode.Add,
+        update_rev: str | None = None,
+        autorename: bool = False,
+        sync_event: SyncEvent | None = None,
+        *,
+        local_path: str | None = None,
+    ) -> FileMetadata:
+        del local_path
+        with self._lock:
+            self._ensure_loaded()
+            target = self._normalise_logical_path(remote_path)
+            existing = self._metadata_by_path.get(normalize(target))
+            if write_mode is WriteMode.Add and existing is not None:
+                if not autorename:
+                    raise FileConflictError("File already exists", dbx_path=target)
+                target = self._autorename_path(target)
+                existing = None
+            if write_mode is WriteMode.Update:
+                if not isinstance(existing, FileMetadata) or existing.rev != update_rev:
+                    raise FileConflictError("Encrypted file changed", dbx_path=target)
+            if (
+                isinstance(existing, FolderMetadata)
+                and write_mode is not WriteMode.Overwrite
+            ):
+                raise IsAFolderError("Cannot upload over folder", dbx_path=target)
+
+            digest, modified_ms, size = self._hash_upload_source(local_file)
+
+            def operation() -> None:
+                if isinstance(existing, FolderMetadata):
+                    self._sidecar.delete(target, recursive=True)
+                self._sidecar.put_file(
+                    target,
+                    local_file,
+                    modified_ms=modified_ms,
+                    replace=isinstance(existing, FileMetadata),
+                )
+
+            self._mutate_locked(operation)
+            metadata = self._metadata_by_path.get(normalize(target))
+            if not isinstance(metadata, FileMetadata):
+                raise EncryptedVaultError(
+                    "Encrypted upload failed",
+                    "The uploaded logical file is missing from the vault.",
+                )
+            if metadata.content_hash != digest or metadata.size != size:
+                raise DataChangedError(
+                    "File changed during encrypted upload",
+                    local_path=(
+                        os.fspath(local_file)
+                        if isinstance(local_file, (str, os.PathLike))
+                        else None
+                    ),
+                )
+            if sync_event is not None:
+                sync_event.completed = size
+            return metadata
+
+    def make_dir(self, remote_path: str, autorename: bool = False) -> FolderMetadata:
+        with self._lock:
+            self._ensure_loaded()
+            target = self._normalise_logical_path(remote_path)
+            existing = self._metadata_by_path.get(normalize(target))
+            if existing is not None:
+                if not autorename:
+                    raise FolderConflictError("Folder already exists", dbx_path=target)
+                target = self._autorename_path(target)
+            self._require_parent_directory(target)
+            self._mutate_locked(lambda: self._sidecar.mkdir(target))
+            metadata = self._metadata_by_path.get(normalize(target))
+            if not isinstance(metadata, FolderMetadata):
+                raise EncryptedVaultError(
+                    "Encrypted folder creation failed",
+                    "The new logical folder is missing from the vault.",
+                )
+            return metadata
+
+    def move(
+        self, remote_path: str, new_path: str, autorename: bool = False
+    ) -> FileMetadata | FolderMetadata:
+        with self._lock:
+            self._ensure_loaded()
+            source = self._normalise_logical_path(remote_path)
+            target = self._normalise_logical_path(new_path)
+            metadata = self._metadata_by_path.get(normalize(source))
+            if metadata is None:
+                raise NotFoundError("Encrypted item not found", dbx_path=source)
+            destination = self._metadata_by_path.get(normalize(target))
+            if destination is not None:
+                if not autorename:
+                    raise (
+                        FolderConflictError("Folder already exists", dbx_path=target)
+                        if isinstance(destination, FolderMetadata)
+                        else FileConflictError("File already exists", dbx_path=target)
+                    )
+                target = self._autorename_path(target)
+            self._require_parent_directory(target)
+            self._mutate_locked(lambda: self._sidecar.move(source, target))
+            moved = self._metadata_by_path.get(normalize(target))
+            if not isinstance(moved, (FileMetadata, FolderMetadata)):
+                raise EncryptedVaultError(
+                    "Encrypted move failed",
+                    "The moved logical item is missing from the vault.",
+                )
+            return moved
+
+    def remove(
+        self, remote_path: str, parent_rev: str | None = None
+    ) -> FileMetadata | FolderMetadata:
+        with self._lock:
+            self._ensure_loaded()
+            path = self._normalise_logical_path(remote_path)
+            metadata = self._metadata_by_path.get(normalize(path))
+            if metadata is None:
+                raise NotFoundError("Encrypted item not found", dbx_path=path)
+            if (
+                parent_rev is not None
+                and isinstance(metadata, FileMetadata)
+                and metadata.rev != parent_rev
+            ):
+                raise FileConflictError("Encrypted item changed", dbx_path=path)
+            self._mutate_locked(lambda: self._sidecar.delete(path, recursive=True))
+            return metadata
+
+    def share_dir(
+        self, remote_path: str, force_async: bool = False
+    ) -> FolderMetadata | None:
+        del remote_path, force_async
+        raise self._unsupported("shared folders")
+
+    def list_revisions(
+        self, remote_path: str, mode: str = "path", limit: int = 10
+    ) -> list[FileMetadata]:
+        del remote_path, mode, limit
+        raise self._unsupported("revision history")
+
+    def restore(self, remote_path: str, rev: str) -> FileMetadata:
+        del remote_path, rev
+        raise self._unsupported("revision restore")
+
+    def create_shared_link(
+        self,
+        remote_path: str,
+        visibility: LinkAudience = LinkAudience.Public,
+        access_level: LinkAccessLevel = LinkAccessLevel.Viewer,
+        allow_download: bool | None = None,
+        password: str | None = None,
+        expires: datetime | None = None,
+    ) -> SharedLinkMetadata:
+        del remote_path, visibility, access_level, allow_download, password, expires
+        raise self._unsupported("shared links")
+
+    def revoke_shared_link(self, url: str) -> None:
+        del url
+        raise self._unsupported("shared links")
+
+    def list_shared_links(
+        self, remote_path: str | None = None, *, direct_only: bool = False
+    ) -> list[SharedLinkMetadata]:
+        del remote_path, direct_only
+        raise self._unsupported("shared links")
+
+    def _ensure_loaded(self) -> None:
+        if not self._loaded:
+            self.unlock_vault()
+
+    def _require_open_provider(self) -> None:
+        if self._closed:
+            raise EncryptedVaultError(
+                "Encrypted provider is closed", "Start a new provider session."
+            )
+        if not self._provider.linked:
+            raise EncryptedVaultError(
+                "Remote account is not linked", "Link the remote account first."
+            )
+
+    def _refresh_locked(self) -> None:
+        self._sidecar.close_vault()
+        try:
+            self._cursor = self._mirror.refresh()
+            self._vault_info = self._sidecar.open(
+                self._mirror.local_root, self._require_secret()
+            )
+            self._rebuild_logical_metadata()
+        except BaseException:
+            self._loaded = False
+            raise
+
+    def _mutate_locked(self, operation: Callable[[], None]) -> None:
+        before = self._mirror.snapshot_local()
+        try:
+            operation()
+        except BaseException:
+            self._recover_from_remote_locked()
+            raise
+        self._sidecar.close_vault()
+        try:
+            self._mirror.commit(before)
+            self._vault_info = self._sidecar.open(
+                self._mirror.local_root, self._require_secret()
+            )
+            self._rebuild_logical_metadata()
+        except BaseException:
+            self._recover_from_remote_locked()
+            raise
+
+    def _recover_from_remote_locked(self) -> None:
+        try:
+            self._sidecar.close_vault()
+        except Exception:
+            pass
+        self._cursor = self._mirror.refresh()
+        self._vault_info = self._sidecar.open(
+            self._mirror.local_root, self._require_secret()
+        )
+        self._loaded = True
+        self._rebuild_logical_metadata()
+
+    def _rebuild_logical_metadata(self) -> None:
+        snapshot = self._sidecar.snapshot(include_hash=True)
+        storage_entries = self._sidecar.storage_map()
+        if len(snapshot) != len(storage_entries):
+            raise EncryptedVaultError(
+                "Encrypted vault is inconsistent",
+                "The logical and physical vault maps have different sizes.",
+            )
+        storage_by_path = {
+            self._normalise_logical_path(entry["path"]): entry
+            for entry in storage_entries
+        }
+        if len(storage_by_path) != len(storage_entries):
+            raise EncryptedVaultError(
+                "Encrypted vault is inconsistent",
+                "The vault has duplicate logical storage mappings.",
+            )
+
+        by_path: dict[str, FileMetadata | FolderMetadata] = {}
+        by_id: dict[str, FileMetadata | FolderMetadata] = {}
+        for entry in snapshot:
+            path = self._normalise_logical_path(entry["path"])
+            storage = storage_by_path.get(path)
+            if storage is None or storage["type"] != entry["type"]:
+                raise EncryptedVaultError(
+                    "Encrypted vault is inconsistent",
+                    "A logical item has no matching ciphertext object.",
+                )
+            storage_path = self._normalise_storage_path(storage["storage_path"])
+            backing = self._mirror.remote_entry(storage_path)
+            metadata = self._logical_metadata(entry, backing)
+            if metadata.path_lower in by_path or metadata.id in by_id:
+                raise EncryptedVaultError(
+                    "Encrypted vault has colliding identities",
+                    "A logical item path or stable provider ID is duplicated.",
+                )
+            by_path[metadata.path_lower] = metadata
+            by_id[metadata.id] = metadata
+
+        self._metadata_by_path = by_path
+        self._metadata_by_id = by_id
+
+    def _logical_metadata(
+        self,
+        entry: VaultEntry,
+        backing: FileMetadata | FolderMetadata,
+    ) -> FileMetadata | FolderMetadata:
+        path = self._normalise_logical_path(entry["path"])
+        entry_type = entry["type"]
+        name = posixpath.basename(path)
+        path_lower = normalize(path)
+        modified_value = entry.get("modified_ms")
+        if (
+            not isinstance(modified_value, int)
+            or isinstance(modified_value, bool)
+            or modified_value < 0
+        ):
+            raise EncryptedVaultError(
+                "Encrypted vault contains invalid metadata",
+                "A logical modified time is invalid.",
+            )
+        modified = datetime.fromtimestamp(modified_value / 1000, timezone.utc)
+
+        if entry_type == "directory":
+            if not isinstance(backing, FolderMetadata):
+                raise EncryptedVaultError(
+                    "Encrypted vault is inconsistent",
+                    "A logical folder has no ciphertext directory.",
+                )
+            return FolderMetadata(name, path_lower, path, backing.id, False)
+
+        if not isinstance(backing, FileMetadata):
+            raise EncryptedVaultError(
+                "Encrypted vault is inconsistent",
+                "A logical file has no ciphertext file.",
+            )
+        size_value = entry.get("size")
+        if (
+            not isinstance(size_value, int)
+            or isinstance(size_value, bool)
+            or size_value < 0
+        ):
+            raise EncryptedVaultError(
+                "Encrypted vault contains invalid metadata",
+                "A logical file size is invalid.",
+            )
+        if entry_type == "file":
+            digest = entry.get("sha256")
+            symlink_target = None
+        elif entry_type == "symlink":
+            symlink_target = entry.get("link_target")
+            if not isinstance(symlink_target, str) or "\x00" in symlink_target:
+                raise EncryptedVaultError(
+                    "Encrypted vault contains invalid metadata",
+                    "A logical symbolic link target is invalid.",
+                )
+            digest = hashlib.sha256(symlink_target.encode("utf-8")).hexdigest()
+        else:
+            raise EncryptedVaultError(
+                "Encrypted vault contains invalid metadata",
+                "A logical item has an unsupported type.",
+            )
+        if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+            raise EncryptedVaultError(
+                "Encrypted vault contains invalid metadata",
+                "A logical file checksum is invalid.",
+            )
+        return FileMetadata(
+            name=name,
+            path_lower=path_lower,
+            path_display=path,
+            id=backing.id,
+            client_modified=modified,
+            server_modified=modified,
+            rev=f"cryptomator-v8:{digest}",
+            size=size_value,
+            symlink_target=symlink_target,
+            shared=False,
+            modified_by=None,
+            is_downloadable=True,
+            content_hash=digest,
+        )
+
+    def _root_metadata(self) -> FolderMetadata:
+        root = self._mirror.ensure_remote_root(create=False)
+        return FolderMetadata("", "/", "/", f"cryptomator-v8:{root.id}", False)
+
+    def _listed_metadata(self, path: str, recursive: bool) -> list[Metadata]:
+        if path != "/" and not isinstance(
+            self._metadata_by_path.get(normalize(path)), FolderMetadata
+        ):
+            metadata = self._metadata_by_path.get(normalize(path))
+            if metadata is None:
+                raise NotFoundError("Encrypted folder not found", dbx_path=path)
+            raise NotAFolderError("Encrypted path is not a folder", dbx_path=path)
+        prefix = path.rstrip("/") + "/"
+        entries: list[Metadata] = []
+        for metadata in self._metadata_by_path.values():
+            if path == "/":
+                relative = metadata.path_display[1:]
+            elif metadata.path_display.startswith(prefix):
+                relative = metadata.path_display[len(prefix) :]
+            else:
+                continue
+            if not recursive and "/" in relative:
+                continue
+            entries.append(metadata)
+        return sorted(entries, key=lambda metadata: metadata.path_lower)
+
+    def _file_for_request(
+        self, remote_path: str, provider_id: str | None
+    ) -> FileMetadata:
+        path = self._normalise_logical_path(remote_path)
+        metadata = (
+            self._metadata_by_id.get(provider_id)
+            if provider_id is not None
+            else self._metadata_by_path.get(normalize(path))
+        )
+        if metadata is None:
+            raise NotFoundError("Encrypted file not found", dbx_path=path)
+        if isinstance(metadata, FolderMetadata):
+            raise IsAFolderError("Cannot download folder", dbx_path=path)
+        if metadata.path_lower != normalize(path):
+            raise DataChangedError(
+                "Encrypted file moved", "Retry the encrypted download.", dbx_path=path
+            )
+        if metadata.symlink_target is not None:
+            raise IsAFolderError("Cannot download symbolic link content", dbx_path=path)
+        return metadata
+
+    def _require_parent_directory(self, path: str) -> None:
+        parent = posixpath.dirname(path) or "/"
+        if parent == "/":
+            return
+        metadata = self._metadata_by_path.get(normalize(parent))
+        if metadata is None:
+            raise NotFoundError("Encrypted parent folder not found", dbx_path=parent)
+        if not isinstance(metadata, FolderMetadata):
+            raise NotAFolderError("Encrypted parent is not a folder", dbx_path=parent)
+
+    def _autorename_path(self, path: str) -> str:
+        parent, name = posixpath.split(path)
+        stem, extension = posixpath.splitext(name)
+        for index in range(1, 10_000):
+            candidate = posixpath.join(parent, f"{stem} ({index}){extension}")
+            if normalize(candidate) not in self._metadata_by_path:
+                return candidate
+        raise EncryptedVaultError(
+            "Cannot choose an encrypted conflict name",
+            "Move an existing conflict copy and try again.",
+        )
+
+    @staticmethod
+    def _normalise_logical_path(path: str) -> str:
+        if (
+            not isinstance(path, str)
+            or not path.startswith("/")
+            or "\x00" in path
+            or "\\" in path
+            or "//" in path
+        ):
+            raise ValueError("The logical vault path is invalid")
+        if path == "/":
+            return path
+        components = path[1:].split("/")
+        if any(component in {"", ".", ".."} for component in components):
+            raise ValueError("The logical vault path is invalid")
+        return path
+
+    @staticmethod
+    def _normalise_storage_path(path: str) -> str:
+        if (
+            not isinstance(path, str)
+            or path.startswith("/")
+            or "\\" in path
+            or "\x00" in path
+        ):
+            raise EncryptedVaultError(
+                "Encrypted vault contains invalid metadata",
+                "A ciphertext storage path is invalid.",
+            )
+        components = path.split("/")
+        if (
+            not components
+            or components[0] != "d"
+            or any(component in {"", ".", ".."} for component in components)
+        ):
+            raise EncryptedVaultError(
+                "Encrypted vault contains invalid metadata",
+                "A ciphertext storage path is invalid.",
+            )
+        return path
+
+    @staticmethod
+    def _hash_upload_source(
+        source: str | os.PathLike[str] | BinaryIO,
+    ) -> tuple[str, int | None, int]:
+        context: AbstractContextManager[BinaryIO]
+        if isinstance(source, (str, bytes, os.PathLike)):
+            context = open(source, "rb")
+        else:
+            context = nullcontext(source)
+        with context as file:
+            file.seek(0)
+            before: os.stat_result | None
+            try:
+                before = os.fstat(file.fileno())
+                modified_ms = before.st_mtime_ns // 1_000_000
+            except (AttributeError, OSError):
+                before = None
+                modified_ms = None
+            digest = hashlib.sha256()
+            size = 0
+            while chunk := file.read(1024 * 1024):
+                digest.update(chunk)
+                size += len(chunk)
+            if before is not None and os.fstat(file.fileno()) != before:
+                raise DataChangedError("File changed during encrypted hashing")
+            file.seek(0)
+        return digest.hexdigest(), modified_ms, size
+
+    def _require_secret(self) -> bytearray:
+        if self._secret is None:
+            raise EncryptedVaultError(
+                "Encrypted vault secret is unavailable",
+                "Unlock the encrypted vault and try again.",
+            )
+        return self._secret
+
+    def _prepare_local_root_for_initialisation(self) -> None:
+        root = self._mirror.local_root
+        root.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if root.is_symlink():
+            raise EncryptedVaultError(
+                "Encrypted vault mirror is unsafe",
+                "The ciphertext cache root cannot be a symbolic link.",
+            )
+        if root.exists():
+            if not root.is_dir() or any(root.iterdir()):
+                raise EncryptedVaultError(
+                    "Encrypted vault cache is not empty",
+                    "Remove the old ciphertext cache or attach its vault.",
+                )
+        else:
+            root.mkdir(mode=0o700)
+
+    @staticmethod
+    def _encode_secret(secret: str) -> bytearray:
+        if not isinstance(secret, str) or not secret or "\x00" in secret:
+            raise ValueError("The encrypted vault password is invalid")
+        encoded = bytearray(secret, "utf-8")
+        if len(encoded) > 4096:
+            EncryptedRemoteProvider._wipe(encoded)
+            raise ValueError("The encrypted vault password is too long")
+        return encoded
+
+    @staticmethod
+    def _wipe(secret: bytearray) -> None:
+        secret[:] = b"\x00" * len(secret)
+
+    @staticmethod
+    def _unsupported(operation: str) -> UnsupportedProviderOperationError:
+        return UnsupportedProviderOperationError(
+            f"Encrypted storage does not support {operation}",
+            "The remote provider cannot expose this logical encrypted item.",
+        )
+
+
+def _remote_provider_contract(provider: EncryptedRemoteProvider) -> RemoteProvider:
+    """Keep the wrapper checked against the sync engine's provider protocol."""
+    return provider
