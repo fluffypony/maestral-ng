@@ -273,6 +273,7 @@ def test_sync_event_longpoll(m):
 
 
 def test_app_snapshot_uses_cached_usage_and_deduplicates_history(m, monkeypatch):
+    m.set_state("account", "type", "business")
     m.set_state("account", "usage_used", 123)
     m.set_state("account", "usage_allocated", 456)
     active = make_sync_event("/active.txt")
@@ -284,6 +285,7 @@ def test_app_snapshot_uses_cached_usage_and_deduplicates_history(m, monkeypatch)
 
     snapshot = m.get_app_snapshot()
 
+    assert snapshot["account"]["type"] == "business"
     assert snapshot["space_usage"] == {"used": 123, "allocated": 456}
     assert [event.id for event in snapshot["activity"]] == [7, 8]
 
