@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import io
+import json
 import os
 import posixpath
 import shutil
@@ -275,6 +277,12 @@ def write_vault(root: Path) -> None:
     (root / "d" / "aa" / "file.c9r").write_bytes(b"ciphertext one")
     (root / "d" / "aa" / "long.c9s" / "contents.c9r").write_bytes(b"long ciphertext")
     (root / "d" / "aa" / "long.c9s" / "name.c9s").write_bytes(b"old name")
+
+
+def backing_revision(logical_revision: str) -> str:
+    encoded = logical_revision.rsplit(":", 1)[1].encode("ascii")
+    encoded += b"=" * (-len(encoded) % 4)
+    return base64.urlsafe_b64decode(encoded).decode("utf-8")
 
 
 class FakeSecretStore:
@@ -639,6 +647,7 @@ def test_encrypted_provider_round_trip_and_stable_identity(tmp_path: Path) -> No
     uploaded = provider.upload(source, "/Documents/report.txt")
     assert uploaded.content_hash == hashlib.sha256(source.getvalue()).hexdigest()
     stable_id = uploaded.id
+    assert str(uuid.UUID(stable_id)) == stable_id
 
     remote_bytes = b"".join(
         path.read_bytes() for path in remote.root.rglob("*") if path.is_file()
@@ -699,6 +708,359 @@ def test_encrypted_provider_round_trip_and_stable_identity(tmp_path: Path) -> No
     assert provider.get_metadata("/Documents/final report.txt") == updated
     assert provider.vault_open
     provider.close()
+
+
+def test_identity_survives_backing_replacement_at_same_path(tmp_path: Path) -> None:
+    remote = FakeRemoteProvider(tmp_path / "remote-provider")
+    sidecar = FakeCryptomatorSession("password")
+    provider = EncryptedRemoteProvider(
+        remote,
+        FakeSecretStore(),
+        "/Encrypted",
+        tmp_path / "ciphertext-cache",
+        sidecar=sidecar,
+    )
+    provider.initialise_vault("password")
+    uploaded = provider.upload(io.BytesIO(b"same cleartext"), "/file.txt")
+    storage_path = sidecar.storage["/file.txt"].storage_path
+    remote_path = "/Encrypted/" + storage_path
+
+    provider.lock_vault()
+    remote._ids[remote_path] = remote._new_id()
+    remote._revisions[remote_path] = "rev:external-replacement"
+    remote._touch_cursor()
+
+    refreshed = provider.get_metadata("/file.txt")
+    assert isinstance(refreshed, FileMetadata)
+    assert refreshed.id == uploaded.id
+    assert refreshed.rev != uploaded.rev
+    assert backing_revision(refreshed.rev) == "rev:external-replacement"
+    provider.close()
+
+
+def test_external_move_uses_one_unique_content_match(tmp_path: Path) -> None:
+    remote = FakeRemoteProvider(tmp_path / "remote-provider")
+    sidecar = FakeCryptomatorSession("password")
+    provider = EncryptedRemoteProvider(
+        remote,
+        FakeSecretStore(),
+        "/Encrypted",
+        tmp_path / "ciphertext-cache",
+        sidecar=sidecar,
+    )
+    provider.initialise_vault("password")
+    uploaded = provider.upload(io.BytesIO(b"unique content"), "/before.txt")
+    old_storage = sidecar.storage["/before.txt"].storage_path
+
+    provider.lock_vault()
+    sidecar.opened = True
+    sidecar.move("/before.txt", "/after.txt")
+    sidecar.opened = False
+    new_storage = sidecar.storage["/after.txt"].storage_path
+    old_remote_path = "/Encrypted/" + old_storage
+    new_remote_path = "/Encrypted/" + new_storage
+    backing = remote.get_metadata(old_remote_path)
+    assert isinstance(backing, FileMetadata)
+    remote.move(
+        old_remote_path,
+        new_remote_path,
+        expected_provider_id=backing.id,
+    )
+    remote._ids[new_remote_path] = remote._new_id()
+    remote._touch_cursor()
+
+    moved = provider.get_metadata("/after.txt")
+    assert isinstance(moved, FileMetadata)
+    assert moved.id == uploaded.id
+    assert provider.get_metadata("/before.txt") is None
+    provider.close()
+
+
+def test_external_directory_move_uses_stable_storage(tmp_path: Path) -> None:
+    remote = FakeRemoteProvider(tmp_path / "remote-provider")
+    sidecar = FakeCryptomatorSession("password")
+    provider = EncryptedRemoteProvider(
+        remote,
+        FakeSecretStore(),
+        "/Encrypted",
+        tmp_path / "ciphertext-cache",
+        sidecar=sidecar,
+    )
+    provider.initialise_vault("password")
+    folder = provider.make_dir("/Before")
+    stable_storage = sidecar.storage["/Before"].storage_path
+    old_marker = sidecar._entry_path("/Before")
+
+    provider.lock_vault()
+    sidecar.opened = True
+    sidecar.move("/Before", "/After")
+    sidecar.opened = False
+    new_marker = sidecar._entry_path("/After")
+    marker_metadata = remote.get_metadata("/Encrypted/" + old_marker)
+    assert isinstance(marker_metadata, FolderMetadata)
+    remote.move(
+        "/Encrypted/" + old_marker,
+        "/Encrypted/" + new_marker,
+        expected_provider_id=marker_metadata.id,
+    )
+    remote._ids["/Encrypted/" + stable_storage] = remote._new_id()
+    remote._touch_cursor()
+
+    moved = provider.get_metadata("/After")
+    assert isinstance(moved, FolderMetadata)
+    assert moved.id == folder.id
+    provider.close()
+
+
+def test_ambiguous_external_content_moves_get_new_identities(tmp_path: Path) -> None:
+    remote = FakeRemoteProvider(tmp_path / "remote-provider")
+    sidecar = FakeCryptomatorSession("password")
+    provider = EncryptedRemoteProvider(
+        remote,
+        FakeSecretStore(),
+        "/Encrypted",
+        tmp_path / "ciphertext-cache",
+        sidecar=sidecar,
+    )
+    provider.initialise_vault("password")
+    first = provider.upload(io.BytesIO(b"duplicate"), "/first.txt")
+    second = provider.upload(io.BytesIO(b"duplicate"), "/second.txt")
+    old_ids = {first.id, second.id}
+    old_storage = {
+        path: sidecar.storage[path].storage_path
+        for path in ("/first.txt", "/second.txt")
+    }
+
+    provider.lock_vault()
+    for source, target in (
+        ("/first.txt", "/moved-one.txt"),
+        ("/second.txt", "/moved-two.txt"),
+    ):
+        sidecar.opened = True
+        sidecar.move(source, target)
+        sidecar.opened = False
+        old_remote_path = "/Encrypted/" + old_storage[source]
+        new_remote_path = "/Encrypted/" + sidecar.storage[target].storage_path
+        backing = remote.get_metadata(old_remote_path)
+        assert isinstance(backing, FileMetadata)
+        remote.move(
+            old_remote_path,
+            new_remote_path,
+            expected_provider_id=backing.id,
+        )
+        remote._ids[new_remote_path] = remote._new_id()
+    remote._touch_cursor()
+
+    moved = provider.list_folder("/", recursive=True).entries
+    new_ids = {entry.id for entry in moved}
+    assert len(new_ids) == 2
+    assert old_ids.isdisjoint(new_ids)
+    provider.close()
+
+
+def test_old_vault_bootstraps_manifest_through_journal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    local = tmp_path / "ciphertext-cache"
+    local.mkdir()
+    sidecar = FakeCryptomatorSession("password")
+    sidecar.initialize(local, bytearray(b"password"))
+    sidecar.put_file("/legacy.txt", io.BytesIO(b"legacy"))
+    sidecar.close_vault()
+    remote = FakeRemoteProvider(tmp_path / "remote-provider")
+    PhysicalVaultMirror(remote, "/Encrypted", local).initialise_remote()
+
+    provider = EncryptedRemoteProvider(
+        remote,
+        FakeSecretStore(),
+        "/Encrypted",
+        local,
+        sidecar=sidecar,
+    )
+    journal_seen = False
+    execute_journal = provider._mirror._execute_journal
+
+    def record_journal(journal: dict[str, object]) -> None:
+        nonlocal journal_seen
+        journal_seen = journal_seen or provider._mirror.journal_path.is_file()
+        execute_journal(journal)
+
+    monkeypatch.setattr(provider._mirror, "_execute_journal", record_journal)
+    provider.attach_vault("password")
+
+    metadata = provider.get_metadata("/legacy.txt")
+    assert isinstance(metadata, FileMetadata)
+    assert str(uuid.UUID(metadata.id)) == metadata.id
+    assert journal_seen
+    assert not provider._mirror.journal_path.exists()
+    assert EncryptedRemoteProvider._IDENTITY_MANIFEST in sidecar.entries
+    provider.close()
+
+
+def test_manifest_bootstrap_keeps_local_state_after_remote_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    local = tmp_path / "ciphertext-cache"
+    local.mkdir()
+    sidecar = FakeCryptomatorSession("password")
+    sidecar.initialize(local, bytearray(b"password"))
+    sidecar.put_file("/legacy.txt", io.BytesIO(b"legacy"))
+    sidecar.close_vault()
+    remote = FakeRemoteProvider(tmp_path / "remote-provider")
+    PhysicalVaultMirror(remote, "/Encrypted", local).initialise_remote()
+    provider = EncryptedRemoteProvider(
+        remote,
+        FakeSecretStore(),
+        "/Encrypted",
+        local,
+        sidecar=sidecar,
+    )
+    original_upload = remote.upload
+
+    def fail_upload(*_args: object, **_kwargs: object) -> FileMetadata:
+        raise ConnectionError("bootstrap upload unavailable")
+
+    monkeypatch.setattr(remote, "upload", fail_upload)
+    with pytest.raises(ConnectionError, match="bootstrap upload unavailable"):
+        provider.attach_vault("password")
+
+    manifest_path = EncryptedRemoteProvider._IDENTITY_MANIFEST
+    manifest_storage = sidecar.storage[manifest_path].storage_path
+    assert provider._mirror.journal_path.is_file()
+    assert sidecar.contents[manifest_path]
+    assert sidecar._physical(manifest_storage).is_file()
+
+    monkeypatch.setattr(remote, "upload", original_upload)
+    restarted = EncryptedRemoteProvider(
+        remote,
+        FakeSecretStore(),
+        "/Encrypted",
+        local,
+        sidecar=sidecar,
+    )
+    restarted.attach_vault("password")
+    metadata = restarted.get_metadata("/legacy.txt")
+    assert isinstance(metadata, FileMetadata)
+    assert not restarted._mirror.journal_path.exists()
+    restarted.close()
+
+
+def test_identity_manifest_is_encrypted_hidden_and_reserved(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    remote = FakeRemoteProvider(tmp_path / "remote-provider")
+    sidecar = FakeCryptomatorSession("password")
+    provider = EncryptedRemoteProvider(
+        remote,
+        FakeSecretStore(),
+        "/Encrypted",
+        tmp_path / "ciphertext-cache",
+        sidecar=sidecar,
+    )
+    upload_saw_manifest: list[bool] = []
+    original_upload = remote.upload
+
+    def track_initial_upload(*args: object, **kwargs: object) -> FileMetadata:
+        upload_saw_manifest.append(
+            EncryptedRemoteProvider._IDENTITY_MANIFEST in sidecar.entries
+        )
+        return original_upload(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(remote, "upload", track_initial_upload)
+    provider.initialise_vault("password")
+
+    assert upload_saw_manifest and all(upload_saw_manifest)
+    assert provider.list_folder("/", recursive=True).entries == []
+    assert provider.get_metadata(EncryptedRemoteProvider._IDENTITY_DIRECTORY) is None
+    with pytest.raises(EncryptedVaultError, match="reserved"):
+        provider.upload(
+            io.BytesIO(b"blocked"),
+            EncryptedRemoteProvider._IDENTITY_DIRECTORY + "/user.txt",
+        )
+    manifest = sidecar.contents[EncryptedRemoteProvider._IDENTITY_MANIFEST]
+    vault_identity = provider._require_vault_identity().encode("ascii")
+    remote_bytes = b"".join(
+        path.read_bytes() for path in remote.root.rglob("*") if path.is_file()
+    )
+    assert manifest not in remote_bytes
+    assert vault_identity not in remote_bytes
+    provider.close()
+
+
+def test_cursor_rejects_another_manifest_vault_identity(tmp_path: Path) -> None:
+    provider = EncryptedRemoteProvider(
+        FakeRemoteProvider(tmp_path / "remote-provider"),
+        FakeSecretStore(),
+        "/Encrypted",
+        tmp_path / "ciphertext-cache",
+        sidecar=FakeCryptomatorSession("password"),
+    )
+    provider.initialise_vault("password")
+    uploaded = provider.upload(io.BytesIO(b"content"), "/file.txt")
+    cursor = provider.list_folder("/", recursive=True).cursor
+    encoded = cursor.split(":", 1)[1].encode("ascii")
+    encoded += b"=" * (-len(encoded) % 4)
+    payload = json.loads(base64.urlsafe_b64decode(encoded).decode("utf-8"))
+    payload["vault_id"] = str(uuid.uuid4())
+    mismatched = EncryptedRemoteProvider._CURSOR_PREFIX + base64.urlsafe_b64encode(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).rstrip(b"=").decode("ascii")
+
+    assert provider._decode_cursor(mismatched) is None
+    page = next(
+        provider.list_remote_changes_iterator(
+            mismatched, {uploaded.id: uploaded.path_display}
+        )
+    )
+    assert any(
+        entry.id == uploaded.id for entry in page.entries if hasattr(entry, "id")
+    )
+    provider.close()
+
+
+def test_corrupt_identity_manifest_fails_closed(tmp_path: Path) -> None:
+    sidecar = FakeCryptomatorSession("password")
+    provider = EncryptedRemoteProvider(
+        FakeRemoteProvider(tmp_path / "remote-provider"),
+        FakeSecretStore(),
+        "/Encrypted",
+        tmp_path / "ciphertext-cache",
+        sidecar=sidecar,
+    )
+    provider.initialise_vault("password")
+    provider.lock_vault()
+    sidecar.contents[EncryptedRemoteProvider._IDENTITY_MANIFEST] = b'{"schema":'
+
+    with pytest.raises(EncryptedVaultError, match="identity manifest"):
+        provider.unlock_vault()
+    assert provider._state == "failed"
+    assert provider._secret is None
+
+
+def test_duplicate_identity_manifest_fails_closed(tmp_path: Path) -> None:
+    sidecar = FakeCryptomatorSession("password")
+    provider = EncryptedRemoteProvider(
+        FakeRemoteProvider(tmp_path / "remote-provider"),
+        FakeSecretStore(),
+        "/Encrypted",
+        tmp_path / "ciphertext-cache",
+        sidecar=sidecar,
+    )
+    provider.initialise_vault("password")
+    provider.lock_vault()
+    duplicate = "/.MAESTRAL/identity-manifest.json"
+    original = EncryptedRemoteProvider._IDENTITY_MANIFEST
+    sidecar.entries[duplicate] = dataclass_replace(
+        sidecar.entries[original], path=duplicate
+    )
+    sidecar.storage[duplicate] = dataclass_replace(
+        sidecar.storage[original], path=duplicate
+    )
+    sidecar.contents[duplicate] = sidecar.contents[original]
+
+    with pytest.raises(EncryptedVaultError, match="duplicate identity manifest"):
+        provider.unlock_vault()
+    assert provider._state == "failed"
 
 
 def test_encrypted_provider_lists_deletions_after_remote_refresh(

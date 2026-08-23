@@ -123,6 +123,7 @@ class VaultSecretStore(Protocol):
 
 _PhysicalKind = Literal["file", "directory"]
 _PhysicalOperationKind = Literal["move", "mkdir", "upload", "remove"]
+_LogicalKind = Literal["file", "directory", "symlink"]
 _VaultState = Literal["locked", "opening", "open", "closing", "failed", "closed"]
 _WINDOWS_RESERVED_NAMES = {
     "CON",
@@ -161,6 +162,22 @@ class _PhysicalOperation:
     sha256: str | None = None
 
 
+@dataclass(frozen=True)
+class _LogicalIdentityEntry:
+    logical_id: str
+    kind: _LogicalKind
+    storage_path: str
+    backing_id: str | None
+    content_hash: str | None
+
+
+@dataclass(frozen=True)
+class _CurrentLogicalEntry:
+    entry: VaultEntry
+    storage_path: str
+    backing: FileMetadata | FolderMetadata | None
+
+
 def _path_depth(path: str) -> int:
     return path.count("/") + 1
 
@@ -195,6 +212,7 @@ class PhysicalVaultMirror:
         self._remote: dict[str, FileMetadata | FolderMetadata] = {}
         self._remote_root_id: str | None = None
         self._manifest_local: dict[str, _LocalPhysicalEntry] = {}
+        self._cursor = ""
 
     @staticmethod
     def _normalise_remote_root(path: str) -> str:
@@ -228,6 +246,15 @@ class PhysicalVaultMirror:
                 "Open or initialise the remote vault first.",
             )
         return self._remote_root_id
+
+    @property
+    def cursor(self) -> str:
+        if not self._cursor:
+            raise EncryptedVaultError(
+                "Encrypted vault cursor is unavailable",
+                "Open or initialise the remote vault first.",
+            )
+        return self._cursor
 
     @property
     def owner_marker(self) -> Path:
@@ -321,6 +348,7 @@ class PhysicalVaultMirror:
         remote, cursor = self._list_remote()
         self._materialise(remote)
         self._remote = remote
+        self._cursor = cursor
         local = self.snapshot_local(reuse_manifest=False)
         self._save_manifest(local, remote)
         return cursor
@@ -330,7 +358,8 @@ class PhysicalVaultMirror:
         self.claim_local_root(allow_nonempty=True)
         self.ensure_remote_root(create=True)
         self.resume_pending_transaction()
-        remote, _ = self._list_remote()
+        remote, cursor = self._list_remote()
+        self._cursor = cursor
         if remote:
             raise EncryptedVaultError(
                 "Encrypted vault is not empty",
@@ -752,7 +781,7 @@ class PhysicalVaultMirror:
         if not isinstance(desired_value, dict):
             raise self._invalid_journal()
         desired = self._decode_local_entries(desired_value)
-        remote, _ = self._list_remote()
+        remote, cursor = self._list_remote()
         if set(remote) != set(desired) or any(
             self._remote_state(remote[path]).kind != desired[path].kind
             for path in desired
@@ -768,6 +797,7 @@ class PhysicalVaultMirror:
                 "Restore the private ciphertext cache before another remote update.",
             )
         self._remote = remote
+        self._cursor = cursor
         self._save_manifest(local, remote)
         self._unlink_durable(self.journal_path)
 
@@ -1767,6 +1797,10 @@ class EncryptedRemoteProvider:
 
     content_hasher_factory: ContentHasherFactory = sha256_content_hasher
     _CURSOR_PREFIX = "cryptomator-v1:"
+    _IDENTITY_SCHEMA = 1
+    _IDENTITY_DIRECTORY = "/.maestral"
+    _IDENTITY_MANIFEST = "/.maestral/identity-manifest.json"
+    _MAX_IDENTITY_MANIFEST_BYTES = 32 * 1024 * 1024
 
     def __init__(
         self,
@@ -1786,6 +1820,10 @@ class EncryptedRemoteProvider:
         self._vault_info: VaultInfo | None = None
         self._metadata_by_path: dict[str, FileMetadata | FolderMetadata] = {}
         self._metadata_by_id: dict[str, FileMetadata | FolderMetadata] = {}
+        self._vault_identity: str | None = None
+        self._identity_entries: dict[str, _LogicalIdentityEntry] = {}
+        self._identity_manifest_present = False
+        self._identity_manifest_dirty = False
         self._cursor = ""
         self._state: _VaultState = "locked"
         self._closed = False
@@ -1893,12 +1931,18 @@ class EncryptedRemoteProvider:
                 self._vault_info = self._sidecar.initialize(
                     self._mirror.local_root, secret_bytes
                 )
+                self._vault_identity = str(uuid.uuid4())
+                self._identity_entries = {}
+                self._identity_manifest_present = False
+                self._identity_manifest_dirty = True
+                self._write_identity_manifest_to_sidecar()
                 self._state = "closing"
                 self._sidecar.close_vault()
                 self._state = "locked"
                 self._vault_info = None
                 self._secret_store.save_password(secret)
                 self._mirror.initialise_remote()
+                self._cursor = self._mirror.cursor
                 self._open_with_secret(secret_bytes)
                 adopted = True
             except BaseException:
@@ -2014,6 +2058,8 @@ class EncryptedRemoteProvider:
             path = self._normalise_logical_path(remote_path)
             if path == "/":
                 return self._root_metadata()
+            if self._is_reserved_logical_path(path):
+                return None
             return self._metadata_by_path.get(normalize(path))
 
     def list_folder(
@@ -2049,6 +2095,7 @@ class EncryptedRemoteProvider:
             self._ensure_loaded()
             self._refresh_locked()
             path = self._normalise_logical_path(remote_path)
+            self._require_public_logical_path(path)
             entries = self._listed_metadata(path, recursive)
             result = ListFolderResult(entries, False, self._encode_cursor(self._cursor))
         yield result
@@ -2153,6 +2200,7 @@ class EncryptedRemoteProvider:
         with self._lock:
             self._ensure_loaded()
             target = self._normalise_logical_path(remote_path)
+            self._require_public_logical_path(target)
             existing = self._metadata_by_path.get(normalize(target))
             if write_mode is WriteMode.Add and existing is not None:
                 if not autorename:
@@ -2200,6 +2248,7 @@ class EncryptedRemoteProvider:
         with self._lock:
             self._ensure_loaded()
             target = self._normalise_logical_path(remote_path)
+            self._require_public_logical_path(target)
             existing = self._metadata_by_path.get(normalize(target))
             if existing is not None:
                 if not autorename:
@@ -2227,6 +2276,8 @@ class EncryptedRemoteProvider:
             self._ensure_loaded()
             source = self._normalise_logical_path(remote_path)
             target = self._normalise_logical_path(new_path)
+            self._require_public_logical_path(source)
+            self._require_public_logical_path(target)
             metadata = self._metadata_by_path.get(normalize(source))
             if metadata is None or metadata.id != expected_provider_id:
                 raise NotFoundError("Encrypted item not found", dbx_path=source)
@@ -2246,7 +2297,10 @@ class EncryptedRemoteProvider:
                     )
                 target = self._autorename_path(target)
             self._require_parent_directory(target)
-            self._mutate_locked(lambda: self._sidecar.move(source, target))
+            self._mutate_locked(
+                lambda: self._sidecar.move(source, target),
+                identity_move=(source, target),
+            )
             moved = self._metadata_by_path.get(normalize(target))
             if not isinstance(moved, (FileMetadata, FolderMetadata)):
                 raise EncryptedVaultError(
@@ -2265,6 +2319,7 @@ class EncryptedRemoteProvider:
         with self._lock:
             self._ensure_loaded()
             path = self._normalise_logical_path(remote_path)
+            self._require_public_logical_path(path)
             metadata = self._metadata_by_path.get(normalize(path))
             if metadata is None or metadata.id != expected_provider_id:
                 raise NotFoundError("Encrypted item not found", dbx_path=path)
@@ -2346,13 +2401,17 @@ class EncryptedRemoteProvider:
                 "Start a new provider session before another vault operation.",
             )
 
-    def _open_with_secret(self, secret: bytearray) -> None:
+    def _open_with_secret(
+        self, secret: bytearray, *, persist_identity: bool = True
+    ) -> None:
         self._require_locked_state()
         self._state = "opening"
         self._vault_info = self._sidecar.open(self._mirror.local_root, secret)
-        self._rebuild_logical_metadata()
         self._secret = secret
         self._state = "open"
+        self._rebuild_logical_metadata()
+        if persist_identity and self._identity_manifest_dirty:
+            self._persist_identity_manifest_locked()
 
     def _close_for_transition(self) -> bytearray:
         secret = self._require_secret()
@@ -2370,12 +2429,20 @@ class EncryptedRemoteProvider:
         self._vault_info = None
         self._metadata_by_path.clear()
         self._metadata_by_id.clear()
+        self._vault_identity = None
+        self._identity_entries.clear()
+        self._identity_manifest_present = False
+        self._identity_manifest_dirty = False
         return secret
 
     def _clear_runtime_state(self) -> None:
         self._metadata_by_path.clear()
         self._metadata_by_id.clear()
         self._vault_info = None
+        self._vault_identity = None
+        self._identity_entries.clear()
+        self._identity_manifest_present = False
+        self._identity_manifest_dirty = False
         if self._secret is not None:
             self._wipe(self._secret)
             self._secret = None
@@ -2404,11 +2471,17 @@ class EncryptedRemoteProvider:
             self._abort_sidecar(secret)
             raise
 
-    def _mutate_locked(self, operation: Callable[[], None]) -> None:
+    def _mutate_locked(
+        self,
+        operation: Callable[[], None],
+        *,
+        identity_move: tuple[str, str] | None = None,
+    ) -> None:
         if self._mirror.journal_path.exists():
             secret = self._close_for_transition()
             try:
                 self._mirror.resume_pending_transaction()
+                self._cursor = self._mirror.cursor
                 self._open_with_secret(secret)
             except BaseException:
                 self._abort_sidecar(secret)
@@ -2416,6 +2489,10 @@ class EncryptedRemoteProvider:
         before = self._mirror.snapshot_local()
         try:
             operation()
+            if identity_move is not None:
+                self._move_identity_prefix(*identity_move)
+            self._reconcile_identity_manifest(require_backing=False)
+            self._write_identity_manifest_to_sidecar()
         except BaseException as operation_error:
             try:
                 secret = self._close_for_transition()
@@ -2428,6 +2505,7 @@ class EncryptedRemoteProvider:
         secret = self._close_for_transition()
         try:
             self._mirror.commit(before)
+            self._cursor = self._mirror.cursor
         except BaseException as commit_error:
             try:
                 self._open_with_secret(secret)
@@ -2471,6 +2549,7 @@ class EncryptedRemoteProvider:
             "namespace": self._provider.namespace_id,
             "vault_root": self._mirror.remote_root,
             "vault_root_id": self._mirror.remote_root_id,
+            "vault_id": self._require_vault_identity(),
             "cursor": provider_cursor,
         }
         encoded = base64.urlsafe_b64encode(
@@ -2496,6 +2575,7 @@ class EncryptedRemoteProvider:
             "namespace",
             "vault_root",
             "vault_root_id",
+            "vault_id",
             "cursor",
         }:
             return None
@@ -2505,6 +2585,7 @@ class EncryptedRemoteProvider:
             or payload["namespace"] != self._provider.namespace_id
             or payload["vault_root"] != self._mirror.remote_root
             or payload["vault_root_id"] != self._mirror.remote_root_id
+            or payload["vault_id"] != self._require_vault_identity()
             or not isinstance(payload["cursor"], str)
             or not payload["cursor"]
         ):
@@ -2512,35 +2593,22 @@ class EncryptedRemoteProvider:
         return payload["cursor"]
 
     def _rebuild_logical_metadata(self) -> None:
-        snapshot = self._sidecar.snapshot(include_hash=True)
-        storage_entries = self._sidecar.storage_map()
-        if len(snapshot) != len(storage_entries):
-            raise EncryptedVaultError(
-                "Encrypted vault is inconsistent",
-                "The logical and physical vault maps have different sizes.",
-            )
-        storage_by_path = {
-            self._normalise_logical_path(entry.path): entry for entry in storage_entries
-        }
-        if len(storage_by_path) != len(storage_entries):
-            raise EncryptedVaultError(
-                "Encrypted vault is inconsistent",
-                "The vault has duplicate logical storage mappings.",
-            )
-
+        current, manifest_present = self._collect_current_logical_entries(
+            require_backing=True
+        )
+        self._load_identity_manifest(manifest_present)
+        current = self._reconcile_identity_entries(current)
         by_path: dict[str, FileMetadata | FolderMetadata] = {}
         by_id: dict[str, FileMetadata | FolderMetadata] = {}
-        for entry in snapshot:
-            path = self._normalise_logical_path(entry.path)
-            storage = storage_by_path.get(path)
-            if storage is None or storage.type != entry.type:
+        for path, current_entry in sorted(current.items()):
+            identity = self._identity_entries[path]
+            backing = current_entry.backing
+            if not isinstance(backing, (FileMetadata, FolderMetadata)):
                 raise EncryptedVaultError(
                     "Encrypted vault is inconsistent",
-                    "A logical item has no matching ciphertext object.",
+                    "A logical item has no remote ciphertext object.",
                 )
-            storage_path = self._normalise_storage_path(storage.storage_path)
-            backing = self._mirror.remote_entry(storage_path)
-            metadata = self._logical_metadata(entry, backing)
+            metadata = self._logical_metadata(current_entry.entry, backing, identity)
             if metadata.path_lower in by_path or metadata.id in by_id:
                 raise EncryptedVaultError(
                     "Encrypted vault has colliding identities",
@@ -2552,13 +2620,578 @@ class EncryptedRemoteProvider:
         self._metadata_by_path = by_path
         self._metadata_by_id = by_id
 
+    def _collect_current_logical_entries(
+        self, *, require_backing: bool
+    ) -> tuple[dict[str, _CurrentLogicalEntry], bool]:
+        snapshot = self._sidecar.snapshot(include_hash=True)
+        storage_entries = self._sidecar.storage_map()
+        if len(snapshot) != len(storage_entries):
+            raise EncryptedVaultError(
+                "Encrypted vault is inconsistent",
+                "The logical and physical vault maps have different sizes.",
+            )
+
+        snapshot_by_path: dict[str, VaultEntry] = {}
+        snapshot_by_normalised_path: dict[str, str] = {}
+        for vault_entry in snapshot:
+            path = self._normalise_logical_path(vault_entry.path)
+            normalised = normalize(path)
+            if path in snapshot_by_path or normalised in snapshot_by_normalised_path:
+                if self._is_reserved_logical_path(path):
+                    raise self._invalid_identity_manifest(
+                        "The vault has duplicate identity manifest objects."
+                    )
+                raise EncryptedVaultError(
+                    "Encrypted vault has colliding paths",
+                    "Two logical items use the same provider path.",
+                )
+            snapshot_by_path[path] = vault_entry
+            snapshot_by_normalised_path[normalised] = path
+
+        storage_by_path: dict[str, StorageMapEntry] = {}
+        storage_by_normalised_path: dict[str, str] = {}
+        for storage_entry in storage_entries:
+            path = self._normalise_logical_path(storage_entry.path)
+            normalised = normalize(path)
+            if path in storage_by_path or normalised in storage_by_normalised_path:
+                if self._is_reserved_logical_path(path):
+                    raise self._invalid_identity_manifest(
+                        "The vault has duplicate identity manifest mappings."
+                    )
+                raise EncryptedVaultError(
+                    "Encrypted vault is inconsistent",
+                    "The vault has duplicate logical storage mappings.",
+                )
+            storage_by_path[path] = storage_entry
+            storage_by_normalised_path[normalised] = path
+
+        if set(snapshot_by_path) != set(storage_by_path):
+            raise EncryptedVaultError(
+                "Encrypted vault is inconsistent",
+                "The logical and physical vault maps contain different paths.",
+            )
+
+        reserved_paths = {
+            path for path in snapshot_by_path if self._is_reserved_logical_path(path)
+        }
+        if reserved_paths:
+            if reserved_paths != {
+                self._IDENTITY_DIRECTORY,
+                self._IDENTITY_MANIFEST,
+            }:
+                raise self._invalid_identity_manifest(
+                    "The reserved identity namespace is duplicated or contains data."
+                )
+            directory_entry = snapshot_by_path[self._IDENTITY_DIRECTORY]
+            manifest_entry = snapshot_by_path[self._IDENTITY_MANIFEST]
+            directory_storage = storage_by_path[self._IDENTITY_DIRECTORY]
+            manifest_storage = storage_by_path[self._IDENTITY_MANIFEST]
+            if (
+                directory_entry.type != "directory"
+                or directory_storage.type != "directory"
+                or manifest_entry.type != "file"
+                or manifest_storage.type != "file"
+            ):
+                raise self._invalid_identity_manifest(
+                    "The reserved identity objects have invalid types."
+                )
+            manifest_present = True
+        else:
+            manifest_present = False
+
+        current: dict[str, _CurrentLogicalEntry] = {}
+        storage_paths: set[str] = set()
+        backing_ids: set[str] = set()
+        for path, entry in snapshot_by_path.items():
+            if self._is_reserved_logical_path(path):
+                continue
+            if entry.type not in {"file", "directory", "symlink"}:
+                raise EncryptedVaultError(
+                    "Encrypted vault contains invalid metadata",
+                    "A logical item has an unsupported type.",
+                )
+            storage = storage_by_path[path]
+            if storage.type != entry.type:
+                raise EncryptedVaultError(
+                    "Encrypted vault is inconsistent",
+                    "A logical item has no matching ciphertext object.",
+                )
+            storage_path = self._normalise_storage_path(storage.storage_path)
+            if storage_path in storage_paths:
+                raise EncryptedVaultError(
+                    "Encrypted vault has colliding storage mappings",
+                    "Two logical items use the same ciphertext object.",
+                )
+            storage_paths.add(storage_path)
+            try:
+                backing = self._mirror.remote_entry(storage_path)
+            except EncryptedVaultError:
+                if require_backing:
+                    raise
+                backing = None
+            if backing is not None:
+                if (entry.type == "directory") != isinstance(backing, FolderMetadata):
+                    raise EncryptedVaultError(
+                        "Encrypted vault is inconsistent",
+                        "A logical item has the wrong ciphertext object type.",
+                    )
+                if backing.id in backing_ids:
+                    raise EncryptedVaultError(
+                        "Encrypted vault has colliding storage identities",
+                        "Two logical items use the same remote ciphertext identity.",
+                    )
+                backing_ids.add(backing.id)
+            self._logical_content_hash(entry)
+            current[path] = _CurrentLogicalEntry(entry, storage_path, backing)
+
+        return current, manifest_present
+
+    def _load_identity_manifest(self, manifest_present: bool) -> None:
+        if not manifest_present:
+            self._vault_identity = str(uuid.uuid4())
+            self._identity_entries = {}
+            self._identity_manifest_present = False
+            self._identity_manifest_dirty = True
+            return
+
+        with self._temporary_plaintext_file("identity-read") as staged_path:
+            self._sidecar.get_file(self._IDENTITY_MANIFEST, staged_path, replace=True)
+            manifest_size = staged_path.stat().st_size
+            if not 0 < manifest_size <= self._MAX_IDENTITY_MANIFEST_BYTES:
+                raise self._invalid_identity_manifest(
+                    "The identity manifest has an invalid size."
+                )
+            manifest_bytes = staged_path.read_bytes()
+
+        def unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+            result: dict[str, object] = {}
+            for key, value in pairs:
+                if key in result:
+                    raise ValueError("duplicate JSON key")
+                result[key] = value
+            return result
+
+        try:
+            raw = json.loads(
+                manifest_bytes.decode("utf-8"), object_pairs_hook=unique_object
+            )
+        except (UnicodeError, json.JSONDecodeError, ValueError) as exc:
+            raise self._invalid_identity_manifest(
+                "The identity manifest is not valid JSON."
+            ) from exc
+        if not isinstance(raw, dict) or set(raw) != {
+            "schema",
+            "vault_id",
+            "entries",
+        }:
+            raise self._invalid_identity_manifest(
+                "The identity manifest has invalid top-level fields."
+            )
+        schema = raw["schema"]
+        if (
+            not isinstance(schema, int)
+            or isinstance(schema, bool)
+            or schema != self._IDENTITY_SCHEMA
+        ):
+            raise self._invalid_identity_manifest(
+                "The identity manifest version is not supported."
+            )
+        vault_identity = self._canonical_uuid(raw["vault_id"])
+        raw_entries = raw["entries"]
+        if not isinstance(raw_entries, list):
+            raise self._invalid_identity_manifest(
+                "The identity manifest entries are invalid."
+            )
+
+        entries: dict[str, _LogicalIdentityEntry] = {}
+        normalised_paths: set[str] = set()
+        logical_ids = {vault_identity}
+        backing_ids: set[str] = set()
+        storage_paths: set[str] = set()
+        for raw_entry in raw_entries:
+            if not isinstance(raw_entry, dict) or set(raw_entry) != {
+                "path",
+                "id",
+                "type",
+                "storage_path",
+                "backing_id",
+                "content_hash",
+            }:
+                raise self._invalid_identity_manifest(
+                    "An identity manifest entry has invalid fields."
+                )
+            path_value = raw_entry["path"]
+            if not isinstance(path_value, str):
+                raise self._invalid_identity_manifest(
+                    "An identity manifest path is invalid."
+                )
+            try:
+                path = self._normalise_logical_path(path_value)
+            except ValueError as exc:
+                raise self._invalid_identity_manifest(
+                    "An identity manifest path is invalid."
+                ) from exc
+            if self._is_reserved_logical_path(path):
+                raise self._invalid_identity_manifest(
+                    "The identity manifest contains its reserved path."
+                )
+            normalised_path = normalize(path)
+            logical_id = self._canonical_uuid(raw_entry["id"])
+            kind = raw_entry["type"]
+            storage_value = raw_entry["storage_path"]
+            backing_id = raw_entry["backing_id"]
+            content_hash = raw_entry["content_hash"]
+            if kind not in {"file", "directory", "symlink"}:
+                raise self._invalid_identity_manifest(
+                    "An identity manifest item type is invalid."
+                )
+            if not isinstance(storage_value, str):
+                raise self._invalid_identity_manifest(
+                    "An identity manifest storage path is invalid."
+                )
+            try:
+                storage_path = self._normalise_storage_path(storage_value)
+            except EncryptedVaultError as exc:
+                raise self._invalid_identity_manifest(
+                    "An identity manifest storage path is invalid."
+                ) from exc
+            if backing_id is not None and (
+                not isinstance(backing_id, str)
+                or not backing_id
+                or len(backing_id) > 4096
+            ):
+                raise self._invalid_identity_manifest(
+                    "An identity manifest backing identity is invalid."
+                )
+            if kind == "directory":
+                if content_hash is not None:
+                    raise self._invalid_identity_manifest(
+                        "A folder identity contains a content hash."
+                    )
+            elif (
+                not isinstance(content_hash, str)
+                or re.fullmatch(r"[0-9a-f]{64}", content_hash) is None
+            ):
+                raise self._invalid_identity_manifest(
+                    "A file identity contains an invalid content hash."
+                )
+            if (
+                normalised_path in normalised_paths
+                or logical_id in logical_ids
+                or storage_path in storage_paths
+                or (backing_id is not None and backing_id in backing_ids)
+            ):
+                raise self._invalid_identity_manifest(
+                    "The identity manifest contains duplicate identities."
+                )
+            normalised_paths.add(normalised_path)
+            logical_ids.add(logical_id)
+            storage_paths.add(storage_path)
+            if backing_id is not None:
+                backing_ids.add(backing_id)
+            entries[path] = _LogicalIdentityEntry(
+                logical_id,
+                cast(_LogicalKind, kind),
+                storage_path,
+                backing_id,
+                cast(str | None, content_hash),
+            )
+
+        self._vault_identity = vault_identity
+        self._identity_entries = entries
+        self._identity_manifest_present = True
+        self._identity_manifest_dirty = False
+
+    def _reconcile_identity_manifest(
+        self, *, require_backing: bool
+    ) -> dict[str, _CurrentLogicalEntry]:
+        current, manifest_present = self._collect_current_logical_entries(
+            require_backing=require_backing
+        )
+        if not manifest_present or not self._identity_manifest_present:
+            raise self._invalid_identity_manifest(
+                "The identity manifest disappeared during a vault operation."
+            )
+        return self._reconcile_identity_entries(current)
+
+    def _reconcile_identity_entries(
+        self, current: Mapping[str, _CurrentLogicalEntry]
+    ) -> dict[str, _CurrentLogicalEntry]:
+        vault_identity = self._require_vault_identity()
+        old = self._identity_entries
+        assignments: dict[str, _LogicalIdentityEntry] = {}
+        unmatched_old = set(old)
+        unmatched_current = set(current)
+
+        def assign(current_path: str, old_path: str) -> None:
+            assignments[current_path] = old[old_path]
+            unmatched_current.remove(current_path)
+            unmatched_old.remove(old_path)
+
+        old_by_path = {
+            (normalize(path), entry.kind): path for path, entry in old.items()
+        }
+        for current_path in sorted(tuple(unmatched_current)):
+            current_kind = current[current_path].entry.type
+            if current_kind not in {"file", "directory", "symlink"}:
+                continue
+            old_path = old_by_path.get((normalize(current_path), current_kind))
+            if old_path is not None and old_path in unmatched_old:
+                assign(current_path, old_path)
+
+        old_by_backing = {
+            (entry.backing_id, entry.kind): path
+            for path, entry in old.items()
+            if path in unmatched_old and entry.backing_id is not None
+        }
+        for current_path in sorted(tuple(unmatched_current)):
+            current_entry = current[current_path]
+            if current_entry.backing is None or current_entry.entry.type not in {
+                "file",
+                "directory",
+                "symlink",
+            }:
+                continue
+            old_path = old_by_backing.get(
+                (
+                    current_entry.backing.id,
+                    current_entry.entry.type,
+                )
+            )
+            if old_path is not None and old_path in unmatched_old:
+                assign(current_path, old_path)
+
+        old_directories_by_storage = {
+            entry.storage_path: path
+            for path, entry in old.items()
+            if path in unmatched_old and entry.kind == "directory"
+        }
+        for current_path in sorted(tuple(unmatched_current)):
+            current_entry = current[current_path]
+            if current_entry.entry.type != "directory":
+                continue
+            old_path = old_directories_by_storage.get(current_entry.storage_path)
+            if old_path is not None and old_path in unmatched_old:
+                assign(current_path, old_path)
+
+        old_by_content: dict[tuple[_LogicalKind, str], list[str]] = {}
+        for old_path in unmatched_old:
+            old_entry = old[old_path]
+            if old_entry.kind == "directory" or old_entry.content_hash is None:
+                continue
+            old_by_content.setdefault(
+                (old_entry.kind, old_entry.content_hash), []
+            ).append(old_path)
+        current_by_content: dict[tuple[_LogicalKind, str], list[str]] = {}
+        for current_path in unmatched_current:
+            vault_entry = current[current_path].entry
+            if vault_entry.type not in {"file", "symlink"}:
+                continue
+            digest = self._logical_content_hash(vault_entry)
+            if digest is not None:
+                current_by_content.setdefault((vault_entry.type, digest), []).append(
+                    current_path
+                )
+        for key in sorted(set(old_by_content) & set(current_by_content)):
+            old_paths = old_by_content[key]
+            current_paths = current_by_content[key]
+            if len(old_paths) == 1 and len(current_paths) == 1:
+                assign(current_paths[0], old_paths[0])
+
+        used_ids = {entry.logical_id for entry in assignments.values()}
+        desired: dict[str, _LogicalIdentityEntry] = {}
+        for path, current_entry in sorted(current.items()):
+            vault_entry = current_entry.entry
+            if vault_entry.type not in {"file", "directory", "symlink"}:
+                raise EncryptedVaultError(
+                    "Encrypted vault contains invalid metadata",
+                    "A logical item has an unsupported type.",
+                )
+            matched = assignments.get(path)
+            if matched is None:
+                while True:
+                    logical_id = str(uuid.uuid4())
+                    if logical_id != vault_identity and logical_id not in used_ids:
+                        break
+                used_ids.add(logical_id)
+            else:
+                logical_id = matched.logical_id
+            backing_id = (
+                current_entry.backing.id
+                if current_entry.backing is not None
+                else matched.backing_id if matched is not None else None
+            )
+            desired[path] = _LogicalIdentityEntry(
+                logical_id,
+                vault_entry.type,
+                current_entry.storage_path,
+                backing_id,
+                self._logical_content_hash(vault_entry),
+            )
+
+        if desired != old:
+            self._identity_manifest_dirty = True
+        self._identity_entries = desired
+        return dict(current)
+
+    def _move_identity_prefix(self, source: str, target: str) -> None:
+        moved: dict[str, _LogicalIdentityEntry] = {}
+        for path, entry in self._identity_entries.items():
+            destination = _replace_prefix(path, source, target)
+            if destination in moved:
+                raise self._invalid_identity_manifest(
+                    "A logical move produced duplicate identity paths."
+                )
+            moved[destination] = entry
+        self._identity_entries = moved
+        self._identity_manifest_dirty = True
+
+    def _write_identity_manifest_to_sidecar(self) -> None:
+        payload = {
+            "schema": self._IDENTITY_SCHEMA,
+            "vault_id": self._require_vault_identity(),
+            "entries": [
+                {
+                    "path": path,
+                    "id": entry.logical_id,
+                    "type": entry.kind,
+                    "storage_path": entry.storage_path,
+                    "backing_id": entry.backing_id,
+                    "content_hash": entry.content_hash,
+                }
+                for path, entry in sorted(self._identity_entries.items())
+            ],
+        }
+        encoded = json.dumps(
+            payload, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        if len(encoded) > self._MAX_IDENTITY_MANIFEST_BYTES:
+            raise self._invalid_identity_manifest(
+                "The identity manifest exceeds the safe size limit."
+            )
+        with self._temporary_plaintext_file("identity-write") as staged_path:
+            with staged_path.open("wb") as staged_file:
+                staged_file.write(encoded)
+                staged_file.flush()
+                os.fsync(staged_file.fileno())
+            os.chmod(staged_path, 0o600)
+            if not self._identity_manifest_present:
+                self._sidecar.mkdir(self._IDENTITY_DIRECTORY)
+            self._sidecar.put_file(
+                self._IDENTITY_MANIFEST,
+                staged_path,
+                replace=self._identity_manifest_present,
+            )
+        self._identity_manifest_present = True
+        self._identity_manifest_dirty = False
+
+    def _persist_identity_manifest_locked(self) -> None:
+        if not self._identity_manifest_dirty:
+            return
+        before = self._mirror.snapshot_local()
+        try:
+            self._write_identity_manifest_to_sidecar()
+        except BaseException as operation_error:
+            try:
+                secret = self._close_for_transition()
+                self._cursor = self._mirror.refresh()
+                self._open_with_secret(secret, persist_identity=False)
+            except BaseException as recovery_error:
+                self._abort_sidecar(self._secret)
+                raise operation_error from recovery_error
+            raise
+        secret = self._close_for_transition()
+        try:
+            self._mirror.commit(before)
+            self._cursor = self._mirror.cursor
+        except BaseException as commit_error:
+            try:
+                self._open_with_secret(secret, persist_identity=False)
+            except BaseException as reopen_error:
+                self._abort_sidecar(secret)
+                raise commit_error from reopen_error
+            raise
+        self._open_with_secret(secret, persist_identity=False)
+        if self._identity_manifest_dirty:
+            raise self._invalid_identity_manifest(
+                "The saved identity manifest did not converge."
+            )
+
+    @staticmethod
+    def _logical_content_hash(entry: VaultEntry) -> str | None:
+        if entry.type == "directory":
+            return None
+        if entry.type == "file":
+            digest = entry.sha256
+        elif entry.type == "symlink":
+            target = entry.link_target
+            if not isinstance(target, str) or "\x00" in target:
+                raise EncryptedVaultError(
+                    "Encrypted vault contains invalid metadata",
+                    "A logical symbolic link target is invalid.",
+                )
+            digest = hashlib.sha256(target.encode("utf-8")).hexdigest()
+        else:
+            raise EncryptedVaultError(
+                "Encrypted vault contains invalid metadata",
+                "A logical item has an unsupported type.",
+            )
+        if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+            raise EncryptedVaultError(
+                "Encrypted vault contains invalid metadata",
+                "A logical file checksum is invalid.",
+            )
+        return digest
+
+    @staticmethod
+    def _logical_file_revision(content_hash: str, backing_revision: str) -> str:
+        encoded_revision = base64.urlsafe_b64encode(
+            backing_revision.encode("utf-8")
+        ).rstrip(b"=")
+        return f"cryptomator-v8:{content_hash}:{encoded_revision.decode('ascii')}"
+
+    def _require_vault_identity(self) -> str:
+        if self._vault_identity is None:
+            raise self._invalid_identity_manifest("The vault identity is not loaded.")
+        return self._vault_identity
+
+    def _canonical_uuid(self, value: object) -> str:
+        if not isinstance(value, str):
+            raise self._invalid_identity_manifest(
+                "An identity manifest UUID is invalid."
+            )
+        try:
+            parsed = uuid.UUID(value)
+        except (AttributeError, ValueError) as exc:
+            raise self._invalid_identity_manifest(
+                "An identity manifest UUID is invalid."
+            ) from exc
+        if str(parsed) != value:
+            raise self._invalid_identity_manifest(
+                "An identity manifest UUID is not canonical."
+            )
+        return value
+
+    @staticmethod
+    def _invalid_identity_manifest(detail: str) -> EncryptedVaultError:
+        return EncryptedVaultError(
+            "Encrypted identity manifest is invalid",
+            detail,
+        )
+
     def _logical_metadata(
         self,
         entry: VaultEntry,
         backing: FileMetadata | FolderMetadata,
+        identity: _LogicalIdentityEntry,
     ) -> FileMetadata | FolderMetadata:
         path = self._normalise_logical_path(entry.path)
         entry_type = entry.type
+        if identity.kind != entry_type:
+            raise EncryptedVaultError(
+                "Encrypted identity manifest is inconsistent",
+                "A logical item type does not match its saved identity.",
+            )
         name = posixpath.basename(path)
         path_lower = normalize(path)
         modified_value = entry.modified_ms
@@ -2579,12 +3212,17 @@ class EncryptedRemoteProvider:
                     "Encrypted vault is inconsistent",
                     "A logical folder has no ciphertext directory.",
                 )
-            return FolderMetadata(name, path_lower, path, backing.id, False)
+            return FolderMetadata(name, path_lower, path, identity.logical_id, False)
 
         if not isinstance(backing, FileMetadata):
             raise EncryptedVaultError(
                 "Encrypted vault is inconsistent",
                 "A logical file has no ciphertext file.",
+            )
+        if not isinstance(backing.rev, str) or not backing.rev:
+            raise EncryptedVaultError(
+                "Encrypted vault contains invalid metadata",
+                "A ciphertext file revision is invalid.",
             )
         size_value = entry.size
         if (
@@ -2621,10 +3259,10 @@ class EncryptedRemoteProvider:
             name=name,
             path_lower=path_lower,
             path_display=path,
-            id=backing.id,
+            id=identity.logical_id,
             client_modified=modified,
             server_modified=modified,
-            rev=f"cryptomator-v8:{digest}",
+            rev=self._logical_file_revision(digest, backing.rev),
             size=size_value,
             symlink_target=symlink_target,
             shared=False,
@@ -2634,8 +3272,8 @@ class EncryptedRemoteProvider:
         )
 
     def _root_metadata(self) -> FolderMetadata:
-        root = self._mirror.ensure_remote_root(create=False)
-        return FolderMetadata("", "/", "/", f"cryptomator-v8:{root.id}", False)
+        self._mirror.ensure_remote_root(create=False)
+        return FolderMetadata("", "/", "/", self._require_vault_identity(), False)
 
     def _listed_metadata(self, path: str, recursive: bool) -> list[Metadata]:
         if path != "/" and not isinstance(
@@ -2701,6 +3339,20 @@ class EncryptedRemoteProvider:
             "Cannot choose an encrypted conflict name",
             "Move an existing conflict copy and try again.",
         )
+
+    @classmethod
+    def _is_reserved_logical_path(cls, path: str) -> bool:
+        normalised = normalize(path)
+        reserved = normalize(cls._IDENTITY_DIRECTORY)
+        return normalised == reserved or normalised.startswith(reserved + "/")
+
+    @classmethod
+    def _require_public_logical_path(cls, path: str) -> None:
+        if cls._is_reserved_logical_path(path):
+            raise EncryptedVaultError(
+                "Encrypted vault path is reserved",
+                "Choose a path outside the private Maestral identity namespace.",
+            )
 
     @staticmethod
     def _normalise_logical_path(path: str) -> str:
