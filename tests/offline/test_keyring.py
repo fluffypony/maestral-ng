@@ -2,13 +2,14 @@ from unittest import mock
 
 import pytest
 from keyring.backend import KeyringBackend
+from keyring.backends.macOS import Keyring as MacOSKeyring
 from keyring.backends.SecretService import Keyring as SecretServiceKeyring
 from keyring.errors import InitError, KeyringLocked, NoKeyringError, PasswordDeleteError
 from keyrings.alt.file import PlaintextKeyring
 
 from maestral.config import MaestralConfig, remove_configuration
 from maestral.exceptions import KeyringAccessError
-from maestral.keyring import CredentialStorage
+from maestral.keyring import CredentialStorage, VaultSecretStorage
 
 
 @pytest.fixture
@@ -288,3 +289,128 @@ def test_load_migrates_legacy_dropbox_accessor() -> None:
         "Maestral", "config:legacy-config:account"
     )
     remove_configuration("legacy-config")
+
+
+class MemoryKeyring(MacOSKeyring):
+    priority = 1
+
+    def __init__(self) -> None:
+        self.passwords: dict[tuple[str, str], str] = {}
+        self.calls: list[tuple[str, str, str]] = []
+        self.error: Exception | None = None
+
+    def get_password(self, service: str, username: str) -> str | None:
+        if self.error:
+            raise self.error
+        self.calls.append(("get", service, username))
+        return self.passwords.get((service, username))
+
+    def set_password(self, service: str, username: str, password: str) -> None:
+        if self.error:
+            raise self.error
+        self.calls.append(("set", service, username))
+        self.passwords[(service, username)] = password
+
+    def delete_password(self, service: str, username: str) -> None:
+        if self.error:
+            raise self.error
+        self.calls.append(("delete", service, username))
+        try:
+            del self.passwords[(service, username)]
+        except KeyError:
+            raise PasswordDeleteError
+
+
+class InsecureChainerKeyring(MemoryKeyring):
+    __module__ = "keyring.backends.chainer"
+
+
+def test_vault_secret_storage_round_trip_and_config_scope() -> None:
+    ring = MemoryKeyring()
+    first = VaultSecretStorage("vault-first", ring)
+    second = VaultSecretStorage("vault-second", ring)
+
+    try:
+        first.save_password("first secret")
+        second.save_password("second secret")
+        assert first.load_password() == "first secret"
+        assert second.load_password() == "second secret"
+        first.delete_password()
+        assert first.load_password() is None
+
+        first_key = ring.calls[0][1:]
+        second_key = ring.calls[1][1:]
+        assert first_key != second_key
+        assert "vault-first" in first_key[0] and "vault-first" in first_key[1]
+        assert "vault-second" in second_key[0] and "vault-second" in second_key[1]
+    finally:
+        remove_configuration("vault-first")
+        remove_configuration("vault-second")
+
+
+def test_vault_secret_storage_uses_configured_keyring() -> None:
+    config_name = "vault-configured-keyring"
+    ring = MemoryKeyring()
+    MaestralConfig(config_name).set("auth", "keyring", "tests.MemoryKeyring")
+
+    try:
+        with mock.patch("maestral.keyring.load_keyring", return_value=ring) as load:
+            storage = VaultSecretStorage(config_name)
+            storage.save_password("secret")
+        load.assert_called_once_with("tests.MemoryKeyring")
+        assert storage.keyring is ring
+    finally:
+        remove_configuration(config_name)
+
+
+def test_vault_secret_storage_rejects_plaintext() -> None:
+    with pytest.raises(KeyringAccessError, match="Secure"):
+        VaultSecretStorage("vault-plaintext", PlaintextKeyring())
+    remove_configuration("vault-plaintext")
+
+
+def test_vault_secret_storage_rejects_fallback_keyring() -> None:
+    with pytest.raises(KeyringAccessError, match="Secure"):
+        VaultSecretStorage("vault-fallback", InsecureChainerKeyring())
+    remove_configuration("vault-fallback")
+
+
+def test_vault_secret_storage_auto_selects_only_native_keyring() -> None:
+    config_name = "vault-automatic-keyring"
+    native = MemoryKeyring()
+
+    try:
+        with mock.patch(
+            "maestral.keyring.keyring.backend.get_all_keyring",
+            return_value=[PlaintextKeyring(), InsecureChainerKeyring(), native],
+        ):
+            storage = VaultSecretStorage(config_name)
+            storage.save_password("secret")
+        assert storage.keyring is native
+        assert native.passwords
+    finally:
+        remove_configuration(config_name)
+
+
+@pytest.mark.parametrize("error", [KeyringLocked(), InitError(), NoKeyringError()])
+@pytest.mark.parametrize("operation", ["load", "save", "delete"])
+def test_vault_secret_storage_maps_keyring_errors(
+    error: Exception, operation: str
+) -> None:
+    config_name = f"vault-keyring-error-{operation}-{type(error).__name__}"
+    ring = MemoryKeyring()
+    ring.error = error
+    storage = VaultSecretStorage(config_name, ring)
+
+    try:
+        with pytest.raises(KeyringAccessError) as exc_info:
+            if operation == "load":
+                storage.load_password()
+            elif operation == "save":
+                storage.save_password("secret")
+            else:
+                storage.delete_password()
+        assert "secret" not in str(exc_info.value)
+        assert exc_info.value.__cause__ is None
+    finally:
+        remove_configuration(config_name)

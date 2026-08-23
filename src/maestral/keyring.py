@@ -11,6 +11,7 @@ import keyring.backends
 import keyring.backends.kwallet
 import keyring.backends.macOS
 import keyring.backends.SecretService
+import keyring.backends.Windows
 import keyrings.alt.file
 
 # external imports
@@ -32,7 +33,7 @@ from .exceptions import KeyringAccessError
 from .logging import scoped_logger
 from .utils import exc_info_tuple
 
-__all__ = ["CredentialStorage"]
+__all__ = ["CredentialStorage", "VaultSecretStorage"]
 
 
 supported_keyring_backends = (
@@ -41,6 +42,14 @@ supported_keyring_backends = (
     keyring.backends.kwallet.DBusKeyring,
     keyring.backends.kwallet.DBusKeyringKWallet4,
     keyrings.alt.file.PlaintextKeyring,
+)
+
+secure_vault_keyring_backends = (
+    keyring.backends.macOS.Keyring,
+    keyring.backends.SecretService.Keyring,
+    keyring.backends.kwallet.DBusKeyring,
+    keyring.backends.kwallet.DBusKeyringKWallet4,
+    keyring.backends.Windows.WinVaultKeyring,
 )
 
 CONNECTION_ERRORS = (
@@ -406,6 +415,162 @@ class CredentialStorage:
                 self._keyring = None
                 self._token = None
                 self._loaded = False
+
+    def __repr__(self) -> str:
+        return f"<{self.__class__.__name__}(config={self._config_name!r})>"
+
+
+class VaultSecretStorage:
+    """Store one Cryptomator vault password in a secure system keyring.
+
+    This storage never uses Maestral's optional plaintext credential backend. It also
+    does not cache the password after a keyring operation.
+
+    :param config_name: Name of the Maestral configuration which owns the vault.
+    :param keyring_backend: Explicit backend for tests or an already configured
+        application. When omitted, use the backend selected in the auth configuration.
+    """
+
+    _lock = RLock()
+
+    def __init__(
+        self,
+        config_name: str,
+        keyring_backend: KeyringBackend | None = None,
+    ) -> None:
+        self._config_name = config_name
+        self._conf = MaestralConfig(config_name)
+        self._service = f"Maestral Cryptomator:{config_name}"
+        self._account = f"config:{config_name}:cryptomator:vault-password"
+        self._keyring = (
+            keyring_backend
+            if keyring_backend is not None
+            else self._keyring_from_config()
+        )
+        if self._keyring is not None:
+            self._require_secure(self._keyring)
+
+    @property
+    def keyring(self) -> KeyringBackend | None:
+        """The secure keyring backend used for the vault password."""
+        return self._keyring
+
+    def load_password(self) -> str | None:
+        """Load the saved vault password, or return ``None`` when none exists."""
+        with self._lock:
+            ring = self._get_keyring()
+            try:
+                return ring.get_password(self._service, self._account)
+            except (KeyringLocked, InitError, NoKeyringError):
+                raise KeyringAccessError(
+                    "Could not load vault password",
+                    "The system keyring is locked or unavailable. Please try again.",
+                ) from None
+            except Exception:
+                raise KeyringAccessError(
+                    "Could not load vault password",
+                    "The system keyring is unavailable. Please try again.",
+                ) from None
+
+    def save_password(self, password: str) -> None:
+        """Save the vault password in a secure system keyring."""
+        encoded = bytearray(password, "utf-8")
+        try:
+            if not encoded or len(encoded) > 4096:
+                raise ValueError("The vault password length is invalid")
+        finally:
+            encoded[:] = b"\0" * len(encoded)
+
+        with self._lock:
+            ring = self._get_keyring()
+            try:
+                ring.set_password(self._service, self._account, password)
+            except (KeyringLocked, InitError, NoKeyringError):
+                raise KeyringAccessError(
+                    "Could not save vault password",
+                    "The system keyring is locked or unavailable. Please try again.",
+                ) from None
+            except Exception:
+                raise KeyringAccessError(
+                    "Could not save vault password",
+                    "The system keyring is unavailable. Please try again.",
+                ) from None
+
+    def delete_password(self) -> None:
+        """Delete the vault password from the secure system keyring."""
+        with self._lock:
+            ring = self._get_keyring()
+            try:
+                ring.delete_password(self._service, self._account)
+            except PasswordDeleteError:
+                return
+            except (KeyringLocked, InitError, NoKeyringError):
+                raise KeyringAccessError(
+                    "Could not delete vault password",
+                    "The system keyring is locked or unavailable. Please try again.",
+                ) from None
+            except Exception:
+                raise KeyringAccessError(
+                    "Could not delete vault password",
+                    "The system keyring is unavailable. Please try again.",
+                ) from None
+
+    def _keyring_from_config(self) -> KeyringBackend | None:
+        keyring_class: str = self._conf.get("auth", "keyring").strip()
+        if keyring_class == "automatic":
+            return None
+        try:
+            return load_keyring(keyring_class)
+        except Exception:
+            raise KeyringAccessError(
+                "Could not load the secure keyring",
+                "Restore the configured system keyring and try again.",
+            ) from None
+
+    def _get_keyring(self) -> KeyringBackend:
+        if self._keyring is None:
+            self._keyring = self._best_secure_keyring()
+        self._require_secure(self._keyring)
+        return self._keyring
+
+    @staticmethod
+    def _best_secure_keyring() -> KeyringBackend:
+        try:
+            rings = keyring.backend.get_all_keyring()
+            secure_rings = [
+                ring
+                for ring in rings
+                if VaultSecretStorage._is_secure(ring) and ring.priority > 0
+            ]
+            if not secure_rings:
+                raise NoKeyringError
+            return max(secure_rings, key=lambda ring: ring.priority)
+        except (KeyringLocked, InitError, NoKeyringError):
+            raise KeyringAccessError(
+                "No secure keyring available",
+                "Configure a secure system keyring and try again.",
+            ) from None
+        except Exception:
+            raise KeyringAccessError(
+                "Could not load the secure keyring",
+                "The system keyring is unavailable. Please try again.",
+            ) from None
+
+    @staticmethod
+    def _require_secure(ring: KeyringBackend) -> None:
+        if not VaultSecretStorage._is_secure(ring):
+            raise KeyringAccessError(
+                "Secure vault keyring required",
+                "Configure macOS Keychain, Secret Service, KWallet, or Windows "
+                "Credential Locker.",
+            )
+
+    @staticmethod
+    def _is_secure(ring: KeyringBackend) -> bool:
+        return isinstance(ring, secure_vault_keyring_backends) and not (
+            ring.__class__.__module__.startswith("keyrings.alt")
+            or ring.__class__.__module__.startswith("keyring.backends.chainer")
+        )
 
     def __repr__(self) -> str:
         return f"<{self.__class__.__name__}(config={self._config_name!r})>"
