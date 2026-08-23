@@ -82,7 +82,6 @@ SIDECAR_ERROR_CODES = frozenset(
         "not_found",
         "overlapping_roots",
         "request_too_large",
-        "storage_mapping_ambiguous",
         "storage_mapping_missing",
         "unknown_method",
         "vault_already_open",

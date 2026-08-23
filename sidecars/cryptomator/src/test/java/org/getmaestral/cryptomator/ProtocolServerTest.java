@@ -204,16 +204,17 @@ class ProtocolServerTest {
     }
 
     @Test
-    void rejectsAnAmbiguousPhysicalStorageMappingWithoutPaths() throws Exception {
+    void usesTheOfficialPhysicalPathWhenAnotherHardLinkExists() throws Exception {
         initialize();
         writeInline("/target.txt", "content".getBytes(StandardCharsets.UTF_8));
         JsonObject target = entryFor(callArray("storage_map", new JsonObject()), "/target.txt");
         Path storagePath = vault.resolve(target.get("storage_path").getAsString());
         Files.createLink(vault.resolve("d/storage-map-duplicate"), storagePath);
 
-        JsonObject response = callForResponse("storage_map", new JsonObject());
-        assertEquals("storage_mapping_ambiguous", errorCode(response));
-        assertFalse(response.toString().contains(temporaryDirectory.toString()));
+        JsonObject mappedAgain =
+                entryFor(callArray("storage_map", new JsonObject()), "/target.txt");
+        assertEquals(target, mappedAgain);
+        assertFalse(mappedAgain.toString().contains(temporaryDirectory.toString()));
     }
 
     @Test

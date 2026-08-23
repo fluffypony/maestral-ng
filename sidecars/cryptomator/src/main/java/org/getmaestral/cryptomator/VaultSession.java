@@ -7,6 +7,7 @@ package org.getmaestral.cryptomator;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
 
+import org.cryptomator.cryptofs.CryptoFileSystem;
 import org.cryptomator.cryptofs.CryptoFileSystemProperties;
 import org.cryptomator.cryptofs.CryptoFileSystemProvider;
 import org.cryptomator.cryptofs.VaultConfig;
@@ -22,7 +23,6 @@ import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.CopyOption;
 import java.nio.file.DirectoryStream;
 import java.nio.file.FileAlreadyExistsException;
-import java.nio.file.FileSystem;
 import java.nio.file.FileVisitResult;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
@@ -39,16 +39,13 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Base64;
 import java.util.Comparator;
-import java.util.HashMap;
 import java.util.HexFormat;
 import java.util.List;
-import java.util.Map;
 import java.util.UUID;
 
 final class VaultSession implements AutoCloseable {
     static final int MAX_INLINE_BYTES = 1024 * 1024;
     static final int MAX_SNAPSHOT_ENTRIES = 1_000_000;
-    private static final long MAX_STORAGE_NODES = 6L * MAX_SNAPSHOT_ENTRIES + 4096;
     static final String MASTERKEY_FILE = "masterkey.cryptomator";
     static final String CONFIG_FILE = "vault.cryptomator";
 
@@ -58,10 +55,10 @@ final class VaultSession implements AutoCloseable {
 
     private final Path exchangeRoot;
     private final Path vaultPath;
-    private final FileSystem fileSystem;
+    private final CryptoFileSystem fileSystem;
     private final Path cleartextRoot;
 
-    private VaultSession(Path exchangeRoot, Path vaultPath, FileSystem fileSystem) {
+    private VaultSession(Path exchangeRoot, Path vaultPath, CryptoFileSystem fileSystem) {
         this.exchangeRoot = exchangeRoot;
         this.vaultPath = vaultPath;
         this.fileSystem = fileSystem;
@@ -96,7 +93,7 @@ final class VaultSession implements AutoCloseable {
         boolean installed = false;
         try {
             initializeVaultFiles(temporary, passphrase);
-            try (FileSystem validation = openFileSystem(temporary, passphrase)) {
+            try (CryptoFileSystem validation = openFileSystem(temporary, passphrase)) {
                 // Opening the new vault verifies its signed config and protected master key.
                 if (!validation.isOpen()) {
                     throw new IOException("The new vault did not open.");
@@ -123,7 +120,7 @@ final class VaultSession implements AutoCloseable {
         }
         vault = vault.toRealPath(LinkOption.NOFOLLOW_LINKS);
         requireSeparateRoots(exchangeRoot, vault);
-        FileSystem fs = openFileSystem(vault, passphrase);
+        CryptoFileSystem fs = openFileSystem(vault, passphrase);
         return new VaultSession(exchangeRoot, vault, fs);
     }
 
@@ -181,55 +178,23 @@ final class VaultSession implements AutoCloseable {
 
     JsonArray storageMap() throws IOException {
         List<StorageEntry> entries = storageEntries();
-        Map<Object, StorageMatch> matchesByKey = new HashMap<>();
-        for (StorageEntry entry : entries) {
-            StorageMatch previous =
-                    matchesByKey.putIfAbsent(entry.fileKey(), new StorageMatch(entry));
-            if (previous != null) {
-                throw ambiguousStorageMapping();
-            }
-        }
-
         Path storageRoot = vaultPath.resolve("d").normalize();
-        long nodeCount = 0;
-        try (var paths = Files.walk(storageRoot)) {
-            var iterator = paths.iterator();
-            while (iterator.hasNext()) {
-                Path path = iterator.next();
-                nodeCount++;
-                if (nodeCount > MAX_STORAGE_NODES) {
-                    throw new SidecarException(
-                            "vault_too_large",
-                            "The vault storage map has too many physical nodes.");
-                }
-
-                BasicFileAttributes attrs;
-                try {
-                    attrs =
-                            Files.readAttributes(
-                                    path, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
-                } catch (NoSuchFileException ignored) {
-                    continue;
-                }
-                Object fileKey = attrs.fileKey();
-                if (fileKey == null) {
-                    continue;
-                }
-                StorageMatch match = matchesByKey.get(fileKey);
-                if (match == null || !match.entry().accepts(attrs)) {
-                    continue;
-                }
-                if (match.storagePath() != null && !match.storagePath().equals(path)) {
-                    throw ambiguousStorageMapping();
-                }
-                match.setStoragePath(path);
-            }
-        }
-
         JsonArray result = new JsonArray();
         for (StorageEntry entry : entries) {
-            Path storagePath = matchesByKey.get(entry.fileKey()).storagePath();
-            if (storagePath == null) {
+            Path storagePath = entry.storagePath();
+            BasicFileAttributes attrs;
+            try {
+                attrs =
+                        Files.readAttributes(
+                                storagePath,
+                                BasicFileAttributes.class,
+                                LinkOption.NOFOLLOW_LINKS);
+            } catch (NoSuchFileException exc) {
+                throw new SidecarException(
+                        "storage_mapping_missing",
+                        "A vault entry has no physical storage mapping.");
+            }
+            if (!entry.accepts(attrs)) {
                 throw new SidecarException(
                         "storage_mapping_missing",
                         "A vault entry has no physical storage mapping.");
@@ -365,7 +330,8 @@ final class VaultSession implements AutoCloseable {
         CryptoFileSystemProvider.initialize(vault, properties(vault, passphrase), MASTERKEY_URI);
     }
 
-    private static FileSystem openFileSystem(Path vault, char[] passphrase) throws IOException {
+    private static CryptoFileSystem openFileSystem(Path vault, char[] passphrase)
+            throws IOException {
         return CryptoFileSystemProvider.newFileSystem(vault, properties(vault, passphrase));
     }
 
@@ -529,13 +495,11 @@ final class VaultSession implements AutoCloseable {
             BasicFileAttributes attrs =
                     Files.readAttributes(
                             path, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
-            Object fileKey = attrs.fileKey();
-            if (fileKey == null) {
-                throw new SidecarException(
-                        "storage_mapping_missing",
-                        "A vault entry has no physical storage mapping.");
-            }
-            entries.add(new StorageEntry(toLogicalPath(path), storageType(attrs), fileKey));
+            entries.add(
+                    new StorageEntry(
+                            toLogicalPath(path),
+                            storageType(attrs),
+                            fileSystem.getCiphertextPath(path)));
         }
         return entries;
     }
@@ -582,12 +546,6 @@ final class VaultSession implements AutoCloseable {
                     "storage_mapping_missing", "A vault entry has no physical storage mapping.");
         }
         return result.toString();
-    }
-
-    private static SidecarException ambiguousStorageMapping() {
-        return new SidecarException(
-                "storage_mapping_ambiguous",
-                "A vault entry has more than one physical storage mapping.");
     }
 
     private String sha256(Path path) throws IOException {
@@ -652,30 +610,9 @@ final class VaultSession implements AutoCloseable {
         return result.isEmpty() ? "/" : result.toString();
     }
 
-    private record StorageEntry(String logicalPath, String type, Object fileKey) {
+    private record StorageEntry(String logicalPath, String type, Path storagePath) {
         boolean accepts(BasicFileAttributes attrs) {
             return type.equals("directory") ? attrs.isDirectory() : attrs.isRegularFile();
-        }
-    }
-
-    private static final class StorageMatch {
-        private final StorageEntry entry;
-        private Path storagePath;
-
-        private StorageMatch(StorageEntry entry) {
-            this.entry = entry;
-        }
-
-        StorageEntry entry() {
-            return entry;
-        }
-
-        Path storagePath() {
-            return storagePath;
-        }
-
-        void setStoragePath(Path storagePath) {
-            this.storagePath = storagePath;
         }
     }
 }
