@@ -578,6 +578,18 @@ class VirtualFileController:
             content_hash = metadata.content_hash
             size = metadata.size
             symlink_target = metadata.symlink_target
+        if old is not None and (
+            old.path_lower != metadata.path_lower
+            or old.path_cased != metadata.path_display
+            or bool(old.is_directory) != is_directory
+            or old.revision != revision
+            or old.content_hash != content_hash
+            or old.size != size
+            or old.symlink_target != symlink_target
+        ):
+            self._ensure_native_item_mutable(
+                provider_id, "Cannot apply the remote file change"
+            )
         native_only = is_directory or symlink_target is not None
         unchanged_revision = old is not None and old.revision == revision
         if old is not None and unchanged_revision:
@@ -662,6 +674,10 @@ class VirtualFileController:
             records = (
                 store.tree(record.path_lower) if bool(record.is_directory) else [record]
             )
+            for item in records:
+                self._ensure_native_item_mutable(
+                    item.provider_id, "Cannot apply the remote deletion"
+                )
             deleting_records = [
                 self._copy_record(
                     item,
@@ -955,8 +971,21 @@ class VirtualFileController:
                 raise ValueError("The native recovery result has invalid identities")
             native_ids.add(native_record.provider_id)
             native_by_id[native_record.provider_id] = native_record
-        for orphan_id in sorted(native_ids - desired_ids):
-            self._backend.remove(orphan_id)
+        orphan_records = [
+            native_by_id[provider_id] for provider_id in native_ids - desired_ids
+        ]
+        if any(record.dirty or record.open_count for record in orphan_records):
+            raise VirtualFileBusyError(
+                "Cannot recover the virtual root",
+                "An untracked native item has local changes or is open. Its content "
+                "was preserved.",
+            )
+        for orphan in sorted(
+            orphan_records,
+            key=lambda item: item.path.count("/"),
+            reverse=True,
+        ):
+            self._backend.remove(orphan.provider_id)
 
         deleting = [
             record
@@ -1106,6 +1135,18 @@ class VirtualFileController:
                 f"No virtual file has provider ID {provider_id!r}.",
             )
         return record
+
+    def _ensure_native_item_mutable(self, provider_id: str, operation: str) -> None:
+        """Reject a native mutation which could destroy local content or an open file."""
+        if not self.running:
+            return
+        native = self._backend.inspect(provider_id)
+        if native is not None and (native.dirty or native.open_count):
+            raise VirtualFileBusyError(
+                operation,
+                "The native item has local changes or is open. Its content was "
+                "preserved.",
+            )
 
     @staticmethod
     def _copy_record(

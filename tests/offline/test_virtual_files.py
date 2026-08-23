@@ -225,6 +225,41 @@ def test_remote_deletion_cancels_in_flight_hydration(
         controller.close()
 
 
+def test_remote_changes_preserve_dirty_native_content(
+    config_name: str, tmp_path: Path
+) -> None:
+    provider = FakeVirtualProvider()
+    backend = FakeVirtualFileBackend()
+    controller = make_controller(config_name, tmp_path, provider, backend)
+    try:
+        first = provider.add_file("file-1", "/file.txt", "rev-1", b"remote")
+        controller.reconcile_remote_change(first)
+        backend.open("file-1")
+        backend.items["file-1"].content = b"local changes"
+        backend.set_access_state("file-1", dirty=True)
+
+        second = provider.add_file("file-1", "/file.txt", "rev-2", b"new remote")
+        with pytest.raises(VirtualFileBusyError, match="content was preserved"):
+            controller.reconcile_remote_change(second)
+
+        assert controller.get_status("file-1")["revision"] == "rev-1"
+        assert backend.items["file-1"].content == b"local changes"
+
+        with pytest.raises(VirtualFileBusyError, match="content was preserved"):
+            controller.reconcile_remote_change(
+                DeletedMetadata(
+                    name="file.txt",
+                    path_lower="/file.txt",
+                    path_display="/file.txt",
+                )
+            )
+
+        assert controller.get_status("file-1")["revision"] == "rev-1"
+        assert backend.items["file-1"].content == b"local changes"
+    finally:
+        controller.close()
+
+
 def test_remote_folder_move_and_deletion_reconcile_the_full_tree(
     config_name: str, tmp_path: Path
 ) -> None:
@@ -422,6 +457,66 @@ def test_restart_removes_native_items_missing_from_durable_state(
     try:
         assert second.list_status() == []
         assert backend.items == {}
+    finally:
+        second.close()
+
+
+def test_restart_preserves_a_dirty_native_orphan(
+    config_name: str, tmp_path: Path
+) -> None:
+    provider = FakeVirtualProvider()
+    backend = FakeVirtualFileBackend()
+    first = make_controller(config_name, tmp_path, provider, backend)
+    metadata = provider.add_file("file-1", "/file.txt", "rev-1", b"remote")
+    first.reconcile_remote_change(metadata)
+    backend.open("file-1")
+    backend.items["file-1"].content = b"local changes"
+    backend.set_access_state("file-1", dirty=True)
+    first.stop()
+    with first._lock:
+        first._get_store().delete("file-1")
+    first.close()
+
+    root = tmp_path / "virtual-root"
+    second = VirtualFileController(
+        config_name,
+        provider,  # type: ignore[arg-type]
+        backend,
+        database_path=str(tmp_path / "virtual-files.db"),
+        remote_polling=False,
+    )
+    try:
+        with pytest.raises(VirtualFileBusyError, match="content was preserved"):
+            second.start(str(root))
+        assert backend.items["file-1"].content == b"local changes"
+        assert not any(call == ("remove", "file-1") for call in backend.calls)
+    finally:
+        second.close()
+
+
+def test_restart_removes_clean_orphans_from_children_up(
+    config_name: str, tmp_path: Path
+) -> None:
+    provider = FakeVirtualProvider()
+    backend = FakeVirtualFileBackend()
+    first = make_controller(config_name, tmp_path, provider, backend)
+    first.reconcile_remote_change(make_folder("folder-1", "/Folder"))
+    child = provider.add_file("file-1", "/Folder/Child.txt", "rev-1", b"data")
+    first.reconcile_remote_change(child)
+    first.stop()
+    with first._lock:
+        first._get_store().delete("file-1")
+        first._get_store().delete("folder-1")
+    first.close()
+    backend.require_empty_directories = True
+
+    second = make_controller(config_name, tmp_path, provider, backend)
+    try:
+        remove_calls = [call for call in backend.calls if call[0] == "remove"]
+        assert remove_calls[-2:] == [
+            ("remove", "file-1"),
+            ("remove", "folder-1"),
+        ]
     finally:
         second.close()
 
