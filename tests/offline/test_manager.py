@@ -37,8 +37,12 @@ def reserve_unlink_reset(m: Maestral) -> None:
             provider="dropbox",
             account_id="old-account",
             keyring="automatic",
+            sync_mode="mirror",
             root_path="/old/dropbox",
+            source_root_path="/old/dropbox",
+            source_root_identity=None,
             root_marker_id="a" * 32,
+            native_registration_committed=False,
         )
     finally:
         m.manager._finish_internal_operation(stop_state)
@@ -881,8 +885,12 @@ def test_unlink_reservation_refuses_a_restarted_manager(m: Maestral) -> None:
                 provider="dropbox",
                 account_id="old-account",
                 keyring="automatic",
+                sync_mode="mirror",
                 root_path="/old/dropbox",
+                source_root_path="/old/dropbox",
+                source_root_identity=None,
                 root_marker_id="a" * 32,
+                native_registration_committed=False,
             )
     finally:
         m.manager.running.clear()
