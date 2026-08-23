@@ -125,6 +125,9 @@ def migrate_index_table(connection: sqlite3.Connection) -> None:
             connection.commit()
             return
 
+        source_row_count = connection.execute(
+            'SELECT count(*) FROM "index"'
+        ).fetchone()[0]
         connection.execute(_CREATE_INDEX_TABLE)
         connection.execute("""
             INSERT INTO "_maestral_index_new" (
@@ -148,6 +151,11 @@ def migrate_index_table(connection: sqlite3.Connection) -> None:
                 symlink_target
             FROM "index"
             """)
+        copied_row_count = connection.execute(
+            'SELECT count(*) FROM "_maestral_index_new"'
+        ).fetchone()[0]
+        if copied_row_count != source_row_count:
+            raise IndexMigrationError("Sync index migration lost rows")
         connection.execute('DROP TABLE "index"')
         connection.execute('ALTER TABLE "_maestral_index_new" RENAME TO "index"')
         connection.execute(
