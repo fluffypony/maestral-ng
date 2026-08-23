@@ -183,12 +183,21 @@ def test_encryption_configuration_rebuilds_provider_stack(
     assert isinstance(unselected_maestral.client, EncryptedRemoteProvider)
     assert unselected_maestral.sync.client is unselected_maestral.client
     assert unselected_maestral.encryption_enabled is True
+    assert unselected_maestral.encryption_vault_ready is False
     assert unselected_maestral.encryption_vault_path == "/Maestral Vault"
     assert unselected_maestral.encryption_cache_path == str(cache_path)
     assert unselected_maestral.encryption_vault_open is False
     assert config.get("encryption", "enabled") is True
+    assert config.get("encryption", "vault_ready") is False
     assert config.get("encryption", "remote_path") == "/Maestral Vault"
     assert config.get("encryption", "cache_path") == str(cache_path)
+
+    initialise = Mock(return_value=None)
+    monkeypatch.setattr(unselected_maestral.client, "initialise_vault", initialise)
+    unselected_maestral.initialise_encrypted_vault("vault password")
+    initialise.assert_called_once_with("vault password")
+    assert unselected_maestral.encryption_vault_ready is True
+    assert config.get("encryption", "vault_ready") is True
 
     unselected_maestral.set_provider("google_drive")
     assert isinstance(unselected_maestral.client, EncryptedRemoteProvider)
@@ -198,6 +207,7 @@ def test_encryption_configuration_rebuilds_provider_stack(
     unselected_maestral.disable_encryption()
     assert isinstance(unselected_maestral.client, GoogleDriveProvider)
     assert unselected_maestral.encryption_enabled is False
+    assert unselected_maestral.encryption_vault_ready is False
     assert unselected_maestral.encryption_vault_path == ""
     assert unselected_maestral.encryption_cache_path == ""
 
@@ -216,8 +226,10 @@ def test_encryption_configuration_is_exposed_over_rpc(
     assert "unlock_encrypted_vault" in handshake["methods"]
     assert "lock_encrypted_vault" in handshake["methods"]
     assert "encryption_enabled" in handshake["properties"]["read"]
+    assert "encryption_vault_ready" in handshake["properties"]["read"]
     assert "encryption_vault_open" in handshake["properties"]["read"]
     assert snapshot["encryption_enabled"] is False
+    assert snapshot["encryption_vault_ready"] is False
     assert snapshot["encryption_vault_path"] == ""
     assert snapshot["encryption_cache_path"] == ""
     assert snapshot["encryption_vault_open"] is False

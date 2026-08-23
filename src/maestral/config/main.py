@@ -31,6 +31,7 @@ DEFAULTS_CONFIG: _DefaultsType = {
     },
     "encryption": {
         "enabled": False,  # wrap the remote provider in a Cryptomator vault
+        "vault_ready": False,  # a new or attached vault passed validation
         "remote_path": "",  # absolute provider path of the format-8 vault
         "cache_path": "",  # private local ciphertext mirror
     },

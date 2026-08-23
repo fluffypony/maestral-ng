@@ -493,6 +493,14 @@ class Maestral:
         return path
 
     @property
+    def encryption_vault_ready(self) -> bool:
+        """Whether a new or attached vault passed validation."""
+        ready = self._conf.get("encryption", "vault_ready")
+        if not isinstance(ready, bool):
+            raise ValueError("The encrypted vault state is invalid")
+        return ready
+
+    @property
     def encryption_cache_path(self) -> str:
         """The private local ciphertext mirror used by Cryptomator."""
         path = self._conf.get("encryption", "cache_path")
@@ -552,7 +560,7 @@ class Maestral:
             raise
 
     def _save_encryption_settings(
-        self, enabled: bool, remote_path: str, cache_path: str
+        self, enabled: bool, vault_ready: bool, remote_path: str, cache_path: str
     ) -> None:
         """Save all encryption settings as one configuration update."""
         with self._conf._lock:
@@ -560,6 +568,7 @@ class Maestral:
             save_generation = self._conf.save_generation
             try:
                 self._conf.set("encryption", "enabled", enabled, save=False)
+                self._conf.set("encryption", "vault_ready", vault_ready, save=False)
                 self._conf.set("encryption", "remote_path", remote_path, save=False)
                 self._conf.set("encryption", "cache_path", cache_path, save=False)
                 self._conf.save()
@@ -622,7 +631,7 @@ class Maestral:
             )
             old_client = self.client
             try:
-                self._save_encryption_settings(True, remote_path, resolved_cache)
+                self._save_encryption_settings(True, False, remote_path, resolved_cache)
                 self.client = new_client
                 self.sync.client = new_client
             except BaseException:
@@ -647,7 +656,7 @@ class Maestral:
             )
             old_client = self.client
             try:
-                self._save_encryption_settings(False, "", "")
+                self._save_encryption_settings(False, False, "", "")
                 self.client = new_client
                 self.sync.client = new_client
             except BaseException:
@@ -663,11 +672,23 @@ class Maestral:
         """Create and open the configured remote Cryptomator vault."""
         with self.sync.sync_lock:
             self._encrypted_client().initialise_vault(password)
+            self._save_encryption_settings(
+                True,
+                True,
+                self.encryption_vault_path,
+                self.encryption_cache_path,
+            )
 
     def attach_encrypted_vault(self, password: str) -> None:
         """Open an existing remote Cryptomator vault and save its password."""
         with self.sync.sync_lock:
             self._encrypted_client().attach_vault(password)
+            self._save_encryption_settings(
+                True,
+                True,
+                self.encryption_vault_path,
+                self.encryption_cache_path,
+            )
 
     def unlock_encrypted_vault(self) -> None:
         """Open the configured vault with its saved keyring password."""
@@ -1013,6 +1034,7 @@ class Maestral:
             "version": self.version,
             "provider": self.provider,
             "encryption_enabled": self.encryption_enabled,
+            "encryption_vault_ready": self.encryption_vault_ready,
             "encryption_vault_path": self.encryption_vault_path,
             "encryption_cache_path": self.encryption_cache_path,
             "encryption_vault_open": self.encryption_vault_open,
