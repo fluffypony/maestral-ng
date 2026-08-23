@@ -17,7 +17,7 @@ import time
 import uuid
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import AbstractContextManager, contextmanager, nullcontext
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import (
@@ -122,6 +122,7 @@ class VaultSecretStore(Protocol):
 
 
 _PhysicalKind = Literal["file", "directory"]
+_PhysicalOperationKind = Literal["move", "mkdir", "upload", "remove"]
 _WINDOWS_RESERVED_NAMES = {
     "CON",
     "PRN",
@@ -137,7 +138,26 @@ class _LocalPhysicalEntry:
     kind: _PhysicalKind
     identity: tuple[int, int, _PhysicalKind]
     size: int
+    modified_ns: int
     sha256: str | None
+
+
+@dataclass(frozen=True)
+class _RemotePhysicalEntry:
+    kind: _PhysicalKind
+    provider_id: str | None
+    rev: str | None
+
+
+@dataclass(frozen=True)
+class _PhysicalOperation:
+    kind: _PhysicalOperationKind
+    target: str
+    expected_kind: _PhysicalKind
+    source: str | None = None
+    expected_id: str | None = None
+    expected_rev: str | None = None
+    sha256: str | None = None
 
 
 def _path_depth(path: str) -> int:
@@ -160,6 +180,7 @@ class PhysicalVaultMirror:
     """Mirror one remote Cryptomator vault into a private ciphertext directory."""
 
     _OWNER_MARKER_CONTENT = b"maestral-cryptomator-cache-v1\n"
+    _STATE_SCHEMA = 1
 
     def __init__(
         self,
@@ -172,6 +193,7 @@ class PhysicalVaultMirror:
         self.local_root = Path(local_root).absolute()
         self._remote: dict[str, FileMetadata | FolderMetadata] = {}
         self._remote_root_id: str | None = None
+        self._manifest_local: dict[str, _LocalPhysicalEntry] = {}
 
     @staticmethod
     def _normalise_remote_root(path: str) -> str:
@@ -210,6 +232,18 @@ class PhysicalVaultMirror:
     def owner_marker(self) -> Path:
         return self.local_root.with_name(
             f".{self.local_root.name}.maestral-cryptomator-cache"
+        )
+
+    @property
+    def manifest_path(self) -> Path:
+        return self.local_root.with_name(
+            f".{self.local_root.name}.maestral-cryptomator-manifest.json"
+        )
+
+    @property
+    def journal_path(self) -> Path:
+        return self.local_root.with_name(
+            f".{self.local_root.name}.maestral-cryptomator-transaction.json"
         )
 
     def claim_local_root(self, *, allow_nonempty: bool) -> None:
@@ -282,15 +316,19 @@ class PhysicalVaultMirror:
         """Download one consistent remote ciphertext snapshot and return its cursor."""
         self.claim_local_root(allow_nonempty=False)
         self.ensure_remote_root(create=False)
+        self.resume_pending_transaction()
         remote, cursor = self._list_remote()
         self._materialise(remote)
         self._remote = remote
+        local = self.snapshot_local(reuse_manifest=False)
+        self._save_manifest(local, remote)
         return cursor
 
     def initialise_remote(self) -> None:
         """Create an empty remote root and upload the current local vault."""
         self.claim_local_root(allow_nonempty=True)
         self.ensure_remote_root(create=True)
+        self.resume_pending_transaction()
         remote, _ = self._list_remote()
         if remote:
             raise EncryptedVaultError(
@@ -300,7 +338,9 @@ class PhysicalVaultMirror:
         self._remote = {}
         self.commit({})
 
-    def snapshot_local(self) -> dict[str, _LocalPhysicalEntry]:
+    def snapshot_local(
+        self, *, reuse_manifest: bool = True
+    ) -> dict[str, _LocalPhysicalEntry]:
         """Return a no-follow snapshot of every local ciphertext object."""
         root_stat = os.lstat(self.local_root)
         if not stat.S_ISDIR(root_stat.st_mode) or stat.S_ISLNK(root_stat.st_mode):
@@ -309,6 +349,7 @@ class PhysicalVaultMirror:
                 "The local ciphertext root must be a private directory.",
             )
 
+        cached = self._load_manifest_local() if reuse_manifest else {}
         result: dict[str, _LocalPhysicalEntry] = {}
         for current, dir_names, file_names in os.walk(
             self.local_root, topdown=True, followlinks=False
@@ -328,7 +369,19 @@ class PhysicalVaultMirror:
                     digest = None
                 elif stat.S_ISREG(file_stat.st_mode):
                     kind = "file"
-                    digest = self._sha256(path)
+                    old_entry = cached.get(relative)
+                    identity = (file_stat.st_dev, file_stat.st_ino, kind)
+                    if (
+                        old_entry is not None
+                        and old_entry.kind == kind
+                        and old_entry.identity == identity
+                        and old_entry.size == file_stat.st_size
+                        and old_entry.modified_ns == file_stat.st_mtime_ns
+                        and old_entry.sha256 is not None
+                    ):
+                        digest = old_entry.sha256
+                    else:
+                        digest = self._sha256(path)
                 else:
                     raise EncryptedVaultError(
                         "Encrypted vault mirror is unsafe",
@@ -338,35 +391,795 @@ class PhysicalVaultMirror:
                     kind,
                     (file_stat.st_dev, file_stat.st_ino, kind),
                     file_stat.st_size,
+                    file_stat.st_mtime_ns,
                     digest,
                 )
         return result
 
     def commit(self, before: Mapping[str, _LocalPhysicalEntry]) -> None:
-        """Apply a closed vault's physical changes to the remote provider."""
+        """Durably apply a closed vault's physical changes to the remote provider."""
         after = self.snapshot_local()
-        self._require_matching_baseline(before)
-        remote = self._remote.copy()
+        if self.journal_path.exists():
+            self.resume_pending_transaction()
+            self._require_matching_baseline(before)
+        else:
+            self._require_matching_baseline(before)
+        journal = self._new_journal(before, after)
+        self._write_json(self.journal_path, journal)
+        self._execute_journal(journal)
 
-        self._remove_type_conflicts(after, remote)
-        directory_moves = self._directory_moves(before, after)
-        self._apply_directory_moves(directory_moves, after, remote)
-
-        transformed_before = self._transform_snapshot(before, directory_moves)
-        file_moves = self._file_moves(transformed_before, after)
-        self._apply_file_moves(file_moves, remote)
-        transformed_before = self._transform_snapshot(transformed_before, file_moves)
-
-        self._create_directories(after, remote)
-        self._upload_files(transformed_before, after, remote)
-        self._remove_stale(after, remote)
-
-        if set(remote) != set(after):
+    def resume_pending_transaction(self) -> None:
+        """Resume a durable ciphertext transaction without replacing local state."""
+        if not self.journal_path.exists():
+            return
+        journal = self._read_json(self.journal_path)
+        if (
+            journal.get("schema") != self._STATE_SCHEMA
+            or journal.get("remote_root") != self.remote_root
+            or journal.get("remote_root_id") != self.remote_root_id
+        ):
             raise EncryptedVaultError(
-                "Encrypted vault update failed",
-                "The remote ciphertext tree does not match the local transaction.",
+                "Encrypted transaction belongs to another vault",
+                "Keep the ciphertext cache and restore its matching account settings.",
+            )
+        desired_value = journal.get("desired")
+        if not isinstance(desired_value, dict):
+            raise self._invalid_journal()
+        desired = self._decode_local_entries(desired_value)
+        current = self.snapshot_local(reuse_manifest=False)
+        if not self._same_local_content(current, desired):
+            raise EncryptedVaultError(
+                "Encrypted transaction local state changed",
+                "Restore the private ciphertext cache before another remote update.",
+            )
+        remote, _ = self._list_remote()
+        self._remote = remote
+        self._execute_journal(journal)
+
+    def _new_journal(
+        self,
+        before: Mapping[str, _LocalPhysicalEntry],
+        after: Mapping[str, _LocalPhysicalEntry],
+    ) -> dict[str, object]:
+        remote, _ = self._list_remote()
+        self._require_same_remote_state(self._remote, remote)
+        self._remote = remote
+        transaction_id = uuid.uuid4().hex
+        operations = self._build_operations(before, after, transaction_id)
+        return {
+            "schema": self._STATE_SCHEMA,
+            "transaction_id": transaction_id,
+            "remote_root": self.remote_root,
+            "remote_root_id": self.remote_root_id,
+            "baseline": self._encode_remote_entries(remote),
+            "before": self._encode_local_entries(before),
+            "desired": self._encode_local_entries(after),
+            "operations": [asdict(operation) for operation in operations],
+            "completed": 0,
+            "started": None,
+            "results": {},
+        }
+
+    def _build_operations(
+        self,
+        before: Mapping[str, _LocalPhysicalEntry],
+        after: Mapping[str, _LocalPhysicalEntry],
+        transaction_id: str,
+    ) -> list[_PhysicalOperation]:
+        operations: list[_PhysicalOperation] = []
+        remote = {
+            path: self._remote_state(metadata)
+            for path, metadata in self._remote.items()
+        }
+        working_before = dict(before)
+        backup_index = 0
+
+        def drop_local_prefix(path: str) -> None:
+            for candidate in tuple(working_before):
+                if candidate == path or _is_below(candidate, path):
+                    working_before.pop(candidate)
+
+        def move_remote_prefix(source: str, target: str) -> None:
+            moved = {
+                _replace_prefix(path, source, target): entry
+                for path, entry in remote.items()
+                if path == source or _is_below(path, source)
+            }
+            for path in tuple(remote):
+                if path == source or _is_below(path, source):
+                    remote.pop(path)
+            remote.update(moved)
+
+        def quarantine(path: str) -> None:
+            nonlocal backup_index
+            entry = remote.get(path)
+            if entry is None or entry.provider_id is None:
+                raise EncryptedVaultError(
+                    "Encrypted transaction cannot preserve a conflict",
+                    "Refresh the ciphertext cache and try again.",
+                )
+            while True:
+                backup_index += 1
+                target = f"maestral-tx-{transaction_id}-{backup_index:04d}.c9r"
+                if target not in remote and target not in after:
+                    break
+            operations.append(
+                _PhysicalOperation(
+                    "move",
+                    target,
+                    entry.kind,
+                    source=path,
+                    expected_id=entry.provider_id,
+                    expected_rev=entry.rev,
+                )
+            )
+            move_remote_prefix(path, target)
+            drop_local_prefix(path)
+
+        conflicts = sorted(
+            (
+                path
+                for path, local in after.items()
+                if path in remote and remote[path].kind != local.kind
+            ),
+            key=_path_depth,
+        )
+        conflict_roots: list[str] = []
+        for path in conflicts:
+            if not any(_is_below(path, parent) for parent in conflict_roots):
+                conflict_roots.append(path)
+                quarantine(path)
+
+        def ensure_parent_chain(path: str) -> None:
+            parent = posixpath.dirname(path)
+            if not parent:
+                return
+            components = parent.split("/")
+            for index in range(1, len(components) + 1):
+                candidate = "/".join(components[:index])
+                existing = remote.get(candidate)
+                if existing is not None:
+                    if existing.kind != "directory":
+                        raise EncryptedVaultError(
+                            "Encrypted transaction parent is not a folder",
+                            "Refresh the ciphertext cache and try again.",
+                        )
+                    continue
+                desired = after.get(candidate)
+                if desired is None or desired.kind != "directory":
+                    raise EncryptedVaultError(
+                        "Encrypted transaction parent is missing",
+                        "Restore the local ciphertext cache and try again.",
+                    )
+                operations.append(_PhysicalOperation("mkdir", candidate, "directory"))
+                remote[candidate] = _RemotePhysicalEntry("directory", None, None)
+
+        directory_moves = self._directory_moves(working_before, after)
+        for source, target in directory_moves:
+            blocker = remote.get(target)
+            expected = remote.get(source)
+            if blocker is not None and (
+                expected is None or blocker.provider_id != expected.provider_id
+            ):
+                quarantine(target)
+        directory_moves = self._directory_moves(working_before, after)
+        for source, target in sorted(
+            directory_moves, key=lambda move: _path_depth(move[1])
+        ):
+            expected = remote.get(source)
+            if (
+                expected is None
+                or expected.kind != "directory"
+                or expected.provider_id is None
+            ):
+                raise EncryptedVaultError(
+                    "Encrypted transaction lost a folder move source",
+                    "Refresh the ciphertext cache and try again.",
+                )
+            ensure_parent_chain(target)
+            operations.append(
+                _PhysicalOperation(
+                    "move",
+                    target,
+                    "directory",
+                    source=source,
+                    expected_id=expected.provider_id,
+                )
+            )
+            move_remote_prefix(source, target)
+
+        working_before = self._transform_snapshot(working_before, directory_moves)
+        file_moves = self._file_moves(working_before, after)
+        for source, target in file_moves:
+            blocker = remote.get(target)
+            expected = remote.get(source)
+            if blocker is not None and (
+                expected is None or blocker.provider_id != expected.provider_id
+            ):
+                quarantine(target)
+        file_moves = self._file_moves(working_before, after)
+        for source, target in file_moves:
+            expected = remote.get(source)
+            if (
+                expected is None
+                or expected.kind != "file"
+                or expected.provider_id is None
+            ):
+                raise EncryptedVaultError(
+                    "Encrypted transaction lost a file move source",
+                    "Refresh the ciphertext cache and try again.",
+                )
+            ensure_parent_chain(target)
+            operations.append(
+                _PhysicalOperation(
+                    "move",
+                    target,
+                    "file",
+                    source=source,
+                    expected_id=expected.provider_id,
+                    expected_rev=expected.rev,
+                )
+            )
+            remote[target] = expected
+            remote.pop(source)
+
+        working_before = self._transform_snapshot(working_before, file_moves)
+        for path, entry in sorted(after.items(), key=lambda item: _path_depth(item[0])):
+            if entry.kind == "directory" and path not in remote:
+                ensure_parent_chain(path)
+                operations.append(_PhysicalOperation("mkdir", path, "directory"))
+                remote[path] = _RemotePhysicalEntry("directory", None, None)
+
+        for path, local_entry in sorted(after.items()):
+            if local_entry.kind != "file":
+                continue
+            previous = working_before.get(path)
+            current = remote.get(path)
+            if current is None:
+                expected_id = None
+                expected_rev = None
+            elif current.kind != "file":
+                raise EncryptedVaultError(
+                    "Encrypted transaction file target is a folder",
+                    "Refresh the ciphertext cache and try again.",
+                )
+            elif previous is not None and previous.sha256 == local_entry.sha256:
+                continue
+            else:
+                expected_id = current.provider_id
+                expected_rev = current.rev
+            ensure_parent_chain(path)
+            operations.append(
+                _PhysicalOperation(
+                    "upload",
+                    path,
+                    "file",
+                    source=path,
+                    expected_id=expected_id,
+                    expected_rev=expected_rev,
+                    sha256=local_entry.sha256,
+                )
+            )
+            remote[path] = _RemotePhysicalEntry("file", expected_id, None)
+
+        stale_directories = sorted(
+            (
+                path
+                for path, entry in remote.items()
+                if path not in after and entry.kind == "directory"
+            ),
+            key=_path_depth,
+        )
+        directory_roots: list[str] = []
+        for path in stale_directories:
+            if not any(_is_below(path, root) for root in directory_roots):
+                directory_roots.append(path)
+        stale_files = [
+            path
+            for path, entry in remote.items()
+            if path not in after
+            and entry.kind == "file"
+            and not any(_is_below(path, root) for root in directory_roots)
+        ]
+        for path in sorted(stale_files, key=_path_depth, reverse=True):
+            remote_entry = remote[path]
+            if remote_entry.provider_id is None:
+                raise self._invalid_journal()
+            operations.append(
+                _PhysicalOperation(
+                    "remove",
+                    path,
+                    "file",
+                    expected_id=remote_entry.provider_id,
+                    expected_rev=remote_entry.rev,
+                )
+            )
+            remote.pop(path)
+        for path in sorted(directory_roots, key=_path_depth, reverse=True):
+            remote_entry = remote[path]
+            if remote_entry.provider_id is None:
+                raise self._invalid_journal()
+            operations.append(
+                _PhysicalOperation(
+                    "remove",
+                    path,
+                    "directory",
+                    expected_id=remote_entry.provider_id,
+                )
+            )
+            for candidate in tuple(remote):
+                if candidate == path or _is_below(candidate, path):
+                    remote.pop(candidate)
+
+        if set(remote) != set(after) or any(
+            remote[path].kind != after[path].kind for path in after
+        ):
+            raise EncryptedVaultError(
+                "Encrypted transaction plan is incomplete",
+                "Keep the ciphertext cache and report this error.",
+            )
+        return operations
+
+    def _execute_journal(self, journal: dict[str, object]) -> None:
+        operations_value = journal.get("operations")
+        completed = journal.get("completed")
+        started = journal.get("started")
+        results = journal.get("results")
+        if (
+            not isinstance(operations_value, list)
+            or not isinstance(completed, int)
+            or isinstance(completed, bool)
+            or not 0 <= completed <= len(operations_value)
+            or (started is not None and started != completed)
+            or not isinstance(results, dict)
+        ):
+            raise self._invalid_journal()
+        operations = [self._decode_operation(value) for value in operations_value]
+        for index in range(completed, len(operations)):
+            recovering = journal.get("started") == index
+            if not recovering:
+                journal["started"] = index
+                self._write_json(self.journal_path, journal)
+            result = self._execute_operation(operations[index], recovering=recovering)
+            if result is not None:
+                results[str(index)] = asdict(self._remote_state(result))
+            journal["completed"] = index + 1
+            journal["started"] = None
+            self._write_json(self.journal_path, journal)
+
+        desired_value = journal.get("desired")
+        if not isinstance(desired_value, dict):
+            raise self._invalid_journal()
+        desired = self._decode_local_entries(desired_value)
+        remote, _ = self._list_remote()
+        if set(remote) != set(desired) or any(
+            self._remote_state(remote[path]).kind != desired[path].kind
+            for path in desired
+        ):
+            raise EncryptedVaultError(
+                "Encrypted transaction did not converge",
+                "Keep the ciphertext cache and retry the remote update.",
+            )
+        local = self.snapshot_local(reuse_manifest=False)
+        if not self._same_local_content(local, desired):
+            raise EncryptedVaultError(
+                "Encrypted transaction local state changed",
+                "Restore the private ciphertext cache before another remote update.",
             )
         self._remote = remote
+        self._save_manifest(local, remote)
+        self._unlink_durable(self.journal_path)
+
+    def _execute_operation(
+        self, operation: _PhysicalOperation, *, recovering: bool
+    ) -> FileMetadata | FolderMetadata | None:
+        target_path = self._remote_path(operation.target)
+        target = self.provider.get_metadata(target_path)
+        source = (
+            self.provider.get_metadata(self._remote_path(operation.source))
+            if operation.source is not None
+            else None
+        )
+
+        if operation.kind == "move":
+            if operation.source is None or operation.expected_id is None:
+                raise self._invalid_journal()
+            if recovering and source is None:
+                self._require_expected_remote(target, operation)
+                return cast(FileMetadata | FolderMetadata, target)
+            self._require_expected_remote(source, operation)
+            if target is not None:
+                raise EncryptedVaultError(
+                    "Encrypted transaction move target exists",
+                    "Keep the ciphertext cache and resolve the remote conflict.",
+                )
+            moved = self.provider.move(self._remote_path(operation.source), target_path)
+            self._require_expected_remote(moved, operation)
+            return moved
+
+        if operation.kind == "mkdir":
+            if recovering and isinstance(target, FolderMetadata):
+                return target
+            if target is not None:
+                raise EncryptedVaultError(
+                    "Encrypted transaction folder target exists",
+                    "Keep the ciphertext cache and resolve the remote conflict.",
+                )
+            return self.provider.make_dir(target_path)
+
+        if operation.kind == "upload":
+            if operation.source is None or operation.sha256 is None:
+                raise self._invalid_journal()
+            if recovering and isinstance(target, FileMetadata):
+                if (
+                    operation.expected_id is not None
+                    and target.id != operation.expected_id
+                ):
+                    raise EncryptedVaultError(
+                        "Encrypted transaction file identity changed",
+                        "Keep the ciphertext cache and resolve the remote conflict.",
+                    )
+                baseline_revision = operation.expected_rev
+                if baseline_revision is None or target.rev != baseline_revision:
+                    if self._remote_file_sha256(target) == operation.sha256:
+                        return target
+                    raise EncryptedVaultError(
+                        "Encrypted transaction file content changed",
+                        "Keep the ciphertext cache and resolve the remote conflict.",
+                    )
+            if operation.expected_id is None:
+                if target is not None:
+                    raise EncryptedVaultError(
+                        "Encrypted transaction file target exists",
+                        "Keep the ciphertext cache and resolve the remote conflict.",
+                    )
+                mode = WriteMode.Add
+            else:
+                self._require_expected_remote(target, operation)
+                mode = WriteMode.Update
+            source_path = self._local_physical_path(self.local_root, operation.source)
+            return self.provider.upload(
+                source_path,
+                target_path,
+                write_mode=mode,
+                update_rev=operation.expected_rev,
+                autorename=False,
+            )
+
+        if operation.kind == "remove":
+            if operation.expected_id is None:
+                raise self._invalid_journal()
+            if recovering and target is None:
+                return None
+            self._require_expected_remote(target, operation)
+            return self.provider.remove(target_path, parent_rev=operation.expected_rev)
+
+        raise self._invalid_journal()
+
+    def _require_expected_remote(
+        self, metadata: Metadata | None, operation: _PhysicalOperation
+    ) -> None:
+        expected_type = (
+            FileMetadata if operation.expected_kind == "file" else FolderMetadata
+        )
+        if not isinstance(metadata, expected_type) or (
+            operation.expected_id is not None and metadata.id != operation.expected_id
+        ):
+            raise EncryptedVaultError(
+                "Encrypted transaction remote identity changed",
+                "Keep the ciphertext cache and resolve the remote conflict.",
+            )
+        if (
+            operation.expected_rev is not None
+            and isinstance(metadata, FileMetadata)
+            and metadata.rev != operation.expected_rev
+        ):
+            raise EncryptedVaultError(
+                "Encrypted transaction remote revision changed",
+                "Keep the ciphertext cache and resolve the remote conflict.",
+            )
+
+    def _remote_file_sha256(self, metadata: FileMetadata) -> str:
+        parent = self.local_root.parent
+        descriptor, name = tempfile.mkstemp(prefix=".maestral-verify-", dir=parent)
+        os.close(descriptor)
+        path = Path(name)
+        try:
+            downloaded = self.provider.download(
+                metadata.path_display,
+                str(path),
+                rev=metadata.rev,
+                provider_id=metadata.id,
+            )
+            if downloaded.id != metadata.id or downloaded.rev != metadata.rev:
+                raise EncryptedVaultError(
+                    "Encrypted transaction verification changed",
+                    "Retry the remote update.",
+                )
+            return self._sha256(path)
+        finally:
+            path.unlink(missing_ok=True)
+
+    @staticmethod
+    def _remote_state(
+        metadata: FileMetadata | FolderMetadata,
+    ) -> _RemotePhysicalEntry:
+        if isinstance(metadata, FileMetadata):
+            return _RemotePhysicalEntry("file", metadata.id, metadata.rev)
+        return _RemotePhysicalEntry("directory", metadata.id, None)
+
+    def _require_same_remote_state(
+        self,
+        expected: Mapping[str, FileMetadata | FolderMetadata],
+        current: Mapping[str, FileMetadata | FolderMetadata],
+    ) -> None:
+        if set(expected) != set(current) or any(
+            self._remote_state(expected[path]) != self._remote_state(current[path])
+            for path in expected
+        ):
+            raise EncryptedVaultError(
+                "Encrypted vault changed before commit",
+                "Refresh the ciphertext cache and try again.",
+            )
+
+    @staticmethod
+    def _same_local_content(
+        left: Mapping[str, _LocalPhysicalEntry],
+        right: Mapping[str, _LocalPhysicalEntry],
+    ) -> bool:
+        return set(left) == set(right) and all(
+            left[path].kind == right[path].kind
+            and left[path].size == right[path].size
+            and left[path].sha256 == right[path].sha256
+            for path in left
+        )
+
+    def _save_manifest(
+        self,
+        local: Mapping[str, _LocalPhysicalEntry],
+        remote: Mapping[str, FileMetadata | FolderMetadata],
+    ) -> None:
+        root_stat = os.lstat(self.local_root)
+        manifest: dict[str, object] = {
+            "schema": self._STATE_SCHEMA,
+            "remote_root": self.remote_root,
+            "remote_root_id": self.remote_root_id,
+            "cache_identity": [root_stat.st_dev, root_stat.st_ino],
+            "local": self._encode_local_entries(local),
+            "remote": self._encode_remote_entries(remote),
+        }
+        self._write_json(self.manifest_path, manifest)
+        self._manifest_local = dict(local)
+
+    def _load_manifest_local(self) -> dict[str, _LocalPhysicalEntry]:
+        if self._manifest_local:
+            return self._manifest_local
+        if not self.manifest_path.exists():
+            return {}
+        manifest = self._read_json(self.manifest_path)
+        local_value = manifest.get("local")
+        cache_identity = manifest.get("cache_identity")
+        if (
+            manifest.get("schema") != self._STATE_SCHEMA
+            or manifest.get("remote_root") != self.remote_root
+            or manifest.get("remote_root_id") != self.remote_root_id
+            or not isinstance(local_value, dict)
+            or not isinstance(cache_identity, list)
+            or len(cache_identity) != 2
+            or any(
+                not isinstance(value, int) or isinstance(value, bool)
+                for value in cache_identity
+            )
+        ):
+            raise EncryptedVaultError(
+                "Encrypted cache manifest does not match this vault",
+                "Keep the ciphertext cache and restore its matching settings.",
+            )
+        root_stat = os.lstat(self.local_root)
+        if cache_identity != [root_stat.st_dev, root_stat.st_ino]:
+            return {}
+        self._manifest_local = self._decode_local_entries(local_value)
+        return self._manifest_local
+
+    @staticmethod
+    def _encode_local_entries(
+        entries: Mapping[str, _LocalPhysicalEntry],
+    ) -> dict[str, object]:
+        return {
+            path: {
+                "kind": entry.kind,
+                "identity": list(entry.identity),
+                "size": entry.size,
+                "modified_ns": entry.modified_ns,
+                "sha256": entry.sha256,
+            }
+            for path, entry in sorted(entries.items())
+        }
+
+    def _decode_local_entries(
+        self, entries: Mapping[str, object]
+    ) -> dict[str, _LocalPhysicalEntry]:
+        result: dict[str, _LocalPhysicalEntry] = {}
+        for path, raw_entry in entries.items():
+            if not isinstance(path, str) or not isinstance(raw_entry, dict):
+                raise self._invalid_journal()
+            self._remote_path(path)
+            if set(raw_entry) != {
+                "kind",
+                "identity",
+                "size",
+                "modified_ns",
+                "sha256",
+            }:
+                raise self._invalid_journal()
+            kind = raw_entry["kind"]
+            identity = raw_entry["identity"]
+            size = raw_entry["size"]
+            modified_ns = raw_entry["modified_ns"]
+            digest = raw_entry["sha256"]
+            if (
+                kind not in {"file", "directory"}
+                or not isinstance(identity, list)
+                or len(identity) != 3
+                or identity[2] != kind
+                or any(
+                    not isinstance(value, int) or isinstance(value, bool)
+                    for value in identity[:2]
+                )
+                or not isinstance(size, int)
+                or isinstance(size, bool)
+                or size < 0
+                or not isinstance(modified_ns, int)
+                or isinstance(modified_ns, bool)
+                or modified_ns < 0
+                or (
+                    kind == "file"
+                    and (
+                        not isinstance(digest, str)
+                        or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+                    )
+                )
+                or (kind == "directory" and digest is not None)
+            ):
+                raise self._invalid_journal()
+            result[path] = _LocalPhysicalEntry(
+                cast(_PhysicalKind, kind),
+                (
+                    cast(int, identity[0]),
+                    cast(int, identity[1]),
+                    cast(_PhysicalKind, kind),
+                ),
+                size,
+                modified_ns,
+                cast(str | None, digest),
+            )
+        return result
+
+    @staticmethod
+    def _encode_remote_entries(
+        entries: Mapping[str, FileMetadata | FolderMetadata],
+    ) -> dict[str, object]:
+        return {
+            path: asdict(PhysicalVaultMirror._remote_state(entry))
+            for path, entry in sorted(entries.items())
+        }
+
+    def _decode_operation(self, value: object) -> _PhysicalOperation:
+        if not isinstance(value, dict) or set(value) != {
+            "kind",
+            "target",
+            "expected_kind",
+            "source",
+            "expected_id",
+            "expected_rev",
+            "sha256",
+        }:
+            raise self._invalid_journal()
+        kind = value["kind"]
+        target = value["target"]
+        expected_kind = value["expected_kind"]
+        source = value["source"]
+        expected_id = value["expected_id"]
+        expected_rev = value["expected_rev"]
+        digest = value["sha256"]
+        if (
+            kind not in {"move", "mkdir", "upload", "remove"}
+            or not isinstance(target, str)
+            or expected_kind not in {"file", "directory"}
+            or (source is not None and not isinstance(source, str))
+            or (expected_id is not None and not isinstance(expected_id, str))
+            or (expected_rev is not None and not isinstance(expected_rev, str))
+            or (digest is not None and not isinstance(digest, str))
+            or (digest is not None and re.fullmatch(r"[0-9a-f]{64}", digest) is None)
+        ):
+            raise self._invalid_journal()
+        self._remote_path(target)
+        if source is not None:
+            self._remote_path(source)
+        return _PhysicalOperation(
+            cast(_PhysicalOperationKind, kind),
+            target,
+            cast(_PhysicalKind, expected_kind),
+            source,
+            expected_id,
+            expected_rev,
+            digest,
+        )
+
+    def _read_json(self, path: Path) -> dict[str, object]:
+        try:
+            file_stat = os.lstat(path)
+            if (
+                not stat.S_ISREG(file_stat.st_mode)
+                or stat.S_ISLNK(file_stat.st_mode)
+                or file_stat.st_nlink != 1
+                or file_stat.st_size > 512 * 1024 * 1024
+            ):
+                raise self._invalid_journal()
+            flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+            descriptor = os.open(path, flags)
+            with os.fdopen(descriptor, "rb") as source:
+                if os.fstat(source.fileno()) != file_stat:
+                    raise self._invalid_journal()
+                raw = source.read(512 * 1024 * 1024 + 1)
+            value = json.loads(raw.decode("utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise self._invalid_journal() from exc
+        if not isinstance(value, dict):
+            raise self._invalid_journal()
+        return cast(dict[str, object], value)
+
+    def _write_json(self, path: Path, value: Mapping[str, object]) -> None:
+        parent = path.parent
+        parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        payload = json.dumps(
+            value, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{path.name}.", dir=parent
+        )
+        temporary = Path(temporary_name)
+        try:
+            os.fchmod(descriptor, 0o600)
+            with os.fdopen(descriptor, "wb") as destination:
+                destination.write(payload)
+                destination.flush()
+                os.fsync(destination.fileno())
+            os.replace(temporary, path)
+            os.chmod(path, 0o600)
+            self._sync_directory(parent)
+        except BaseException:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+            temporary.unlink(missing_ok=True)
+            raise
+
+    def _unlink_durable(self, path: Path) -> None:
+        path.unlink()
+        self._sync_directory(path.parent)
+
+    @staticmethod
+    def _sync_directory(path: Path) -> None:
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        try:
+            descriptor = os.open(path, flags)
+        except OSError:
+            return
+        try:
+            os.fsync(descriptor)
+        except OSError:
+            pass
+        finally:
+            os.close(descriptor)
+
+    @staticmethod
+    def _invalid_journal() -> EncryptedVaultError:
+        return EncryptedVaultError(
+            "Encrypted transaction state is invalid",
+            "Keep the ciphertext cache and restore its transaction journal.",
+        )
 
     def _list_remote(
         self,
@@ -607,21 +1420,19 @@ class PhysicalVaultMirror:
         before: Mapping[str, _LocalPhysicalEntry],
         after: Mapping[str, _LocalPhysicalEntry],
     ) -> list[tuple[str, str]]:
-        removed = {
-            entry.identity: path
-            for path, entry in before.items()
-            if entry.kind == "directory" and path not in after
-        }
-        added = {
-            entry.identity: path
-            for path, entry in after.items()
-            if entry.kind == "directory" and path not in before
-        }
+        removed: dict[tuple[int, int, _PhysicalKind], list[str]] = {}
+        added: dict[tuple[int, int, _PhysicalKind], list[str]] = {}
+        for path, entry in before.items():
+            if entry.kind == "directory" and path not in after:
+                removed.setdefault(entry.identity, []).append(path)
+        for path, entry in after.items():
+            if entry.kind == "directory" and path not in before:
+                added.setdefault(entry.identity, []).append(path)
         candidates = sorted(
             (
-                (source, added[identity])
-                for identity, source in removed.items()
-                if identity in added
+                (sources[0], added[identity][0])
+                for identity, sources in removed.items()
+                if len(sources) == 1 and len(added.get(identity, [])) == 1
             ),
             key=lambda move: _path_depth(move[0]),
         )
@@ -641,20 +1452,18 @@ class PhysicalVaultMirror:
         before: Mapping[str, _LocalPhysicalEntry],
         after: Mapping[str, _LocalPhysicalEntry],
     ) -> list[tuple[str, str]]:
-        removed = {
-            entry.identity: path
-            for path, entry in before.items()
-            if entry.kind == "file" and path not in after
-        }
-        added = {
-            entry.identity: path
-            for path, entry in after.items()
-            if entry.kind == "file" and path not in before
-        }
+        removed: dict[tuple[int, int, _PhysicalKind], list[str]] = {}
+        added: dict[tuple[int, int, _PhysicalKind], list[str]] = {}
+        for path, entry in before.items():
+            if entry.kind == "file" and path not in after:
+                removed.setdefault(entry.identity, []).append(path)
+        for path, entry in after.items():
+            if entry.kind == "file" and path not in before:
+                added.setdefault(entry.identity, []).append(path)
         moves = [
-            (source, added[identity])
-            for identity, source in removed.items()
-            if identity in added
+            (sources[0], added[identity][0])
+            for identity, sources in removed.items()
+            if len(sources) == 1 and len(added.get(identity, [])) == 1
         ]
 
         moved_sources = {source for source, _ in moves}

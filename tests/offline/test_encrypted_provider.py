@@ -515,6 +515,73 @@ def test_refresh_replaces_only_the_private_ciphertext_mirror(tmp_path: Path) -> 
     assert (provider.root / "Outside").is_dir()
 
 
+def test_ciphertext_transaction_resumes_after_lost_upload_reply(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    local = tmp_path / "local-vault"
+    local.mkdir()
+    write_vault(local)
+    remote = FakeRemoteProvider(tmp_path / "remote")
+    mirror = PhysicalVaultMirror(remote, "/Encrypted", local)
+    mirror.initialise_remote()
+
+    before = mirror.snapshot_local()
+    (local / "d" / "aa" / "new.c9r").write_bytes(b"new ciphertext")
+    original_upload = remote.upload
+    failed = False
+
+    def upload_then_disconnect(*args: object, **kwargs: object) -> FileMetadata:
+        nonlocal failed
+        result = original_upload(*args, **kwargs)  # type: ignore[arg-type]
+        if not failed:
+            failed = True
+            raise ConnectionError("reply lost after upload")
+        return result
+
+    monkeypatch.setattr(remote, "upload", upload_then_disconnect)
+    with pytest.raises(ConnectionError, match="reply lost"):
+        mirror.commit(before)
+
+    assert mirror.journal_path.is_file()
+    assert (local / "d" / "aa" / "new.c9r").read_bytes() == b"new ciphertext"
+    monkeypatch.setattr(remote, "upload", original_upload)
+
+    restarted = PhysicalVaultMirror(remote, "/Encrypted", local)
+    restarted.claim_local_root(allow_nonempty=False)
+    restarted.ensure_remote_root(create=False)
+    restarted.resume_pending_transaction()
+
+    assert not restarted.journal_path.exists()
+    assert (
+        remote.root / "Encrypted" / "d" / "aa" / "new.c9r"
+    ).read_bytes() == b"new ciphertext"
+
+
+def test_ciphertext_transaction_keeps_old_objects_until_uploads_finish(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    local = tmp_path / "local-vault"
+    local.mkdir()
+    write_vault(local)
+    remote = FakeRemoteProvider(tmp_path / "remote")
+    mirror = PhysicalVaultMirror(remote, "/Encrypted", local)
+    mirror.initialise_remote()
+
+    before = mirror.snapshot_local()
+    (local / "d" / "aa" / "file.c9r").unlink()
+    (local / "d" / "aa" / "replacement.c9r").write_bytes(b"different ciphertext")
+
+    def reject_upload(*_args: object, **_kwargs: object) -> FileMetadata:
+        raise ConnectionError("upload unavailable")
+
+    monkeypatch.setattr(remote, "upload", reject_upload)
+    with pytest.raises(ConnectionError, match="unavailable"):
+        mirror.commit(before)
+
+    assert (remote.root / "Encrypted" / "d" / "aa" / "file.c9r").is_file()
+    assert not (remote.root / "Encrypted" / "d" / "aa" / "replacement.c9r").exists()
+
+
 def test_local_ciphertext_snapshot_rejects_symbolic_links(tmp_path: Path) -> None:
     local = tmp_path / "local-vault"
     local.mkdir()
