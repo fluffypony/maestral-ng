@@ -10,6 +10,9 @@ import base64
 import hashlib
 import html
 import json
+import mimetypes
+import os
+import posixpath
 import random
 import re
 import secrets
@@ -17,25 +20,78 @@ import threading
 import time
 import unicodedata
 from collections import defaultdict
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import PurePosixPath
 from queue import Empty, Queue
-from typing import Any, BinaryIO, Final, Protocol, TypeVar, cast
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    BinaryIO,
+    Final,
+    Protocol,
+    TypeVar,
+    cast,
+    overload,
+)
 from urllib.parse import parse_qs, urlencode, urlparse
 
 import requests
 
 from maestral import __version__
-from maestral.exceptions import MaestralApiError
+from maestral.config import MaestralState
+from maestral.core import (
+    Account,
+    AccountType,
+    DeletedMetadata,
+    FileMetadata,
+    FolderMetadata,
+    FullAccount,
+    LinkAccessLevel,
+    LinkAudience,
+    ListFolderResult,
+    Metadata,
+    PersonalSpaceUsage,
+    RootInfo,
+    SharedLinkMetadata,
+    UserRootInfo,
+    WriteMode,
+)
+from maestral.exceptions import (
+    DataChangedError,
+    DataCorruptionError,
+    FileConflictError,
+    FolderConflictError,
+    InvalidDbidError,
+    IsAFolderError,
+    MaestralApiError,
+    NotAFolderError,
+    NotFoundError,
+    NotLinkedError,
+    ProviderConnectionError,
+    ProviderServerError,
+    UnsupportedFileError,
+    UnsupportedProviderOperationError,
+)
+from maestral.keyring import CredentialStorage
+from maestral.logging import scoped_logger
+from maestral.utils import natural_size
+from maestral.utils.hashing import ContentHasherFactory, md5_content_hasher
+from maestral.utils.path import normalize, opener_no_symlink
+
+if TYPE_CHECKING:
+    from maestral.models import SyncEvent
 
 GOOGLE_DRIVE_SCOPE: Final = "https://www.googleapis.com/auth/drive"
 GOOGLE_AUTH_URL: Final = "https://accounts.google.com/o/oauth2/v2/auth"
 GOOGLE_TOKEN_URL: Final = "https://oauth2.googleapis.com/token"
 GOOGLE_DRIVE_API: Final = "https://www.googleapis.com/drive/v3"
 GOOGLE_DRIVE_UPLOAD_API: Final = "https://www.googleapis.com/upload/drive/v3"
+GOOGLE_DESKTOP_CLIENT_ID: Final = ""
+GOOGLE_CLIENT_ID_ENV: Final = "MAESTRAL_GOOGLE_CLIENT_ID"
 
 FOLDER_MIME: Final = "application/vnd.google-apps.folder"
 SHORTCUT_MIME: Final = "application/vnd.google-apps.shortcut"
@@ -87,6 +143,14 @@ class GoogleDriveError(MaestralApiError):
         super().__init__(title, message)
         self.status = status
         self.reason = reason
+
+
+class GoogleDriveConnectionError(GoogleDriveError, ProviderConnectionError):
+    """A connection failure after Drive request retries."""
+
+
+class GoogleDriveServerError(GoogleDriveError, ProviderServerError):
+    """A temporary Drive service failure after request retries."""
 
 
 class HttpSession(Protocol):
@@ -183,7 +247,7 @@ class GoogleOAuth:
         if not client_id or any(char.isspace() for char in client_id):
             raise ValueError("A Google OAuth client ID is required")
         self.client_id = client_id
-        self._session = session or requests.Session()
+        self._session = cast(HttpSession, session or requests.Session())
         self._clock = clock
         self._timeout = timeout
 
@@ -640,6 +704,18 @@ class DriveChangePage:
 
 
 @dataclass(frozen=True)
+class GoogleAbout:
+    """Account and storage fields returned by Drive's about endpoint."""
+
+    account_id: str
+    display_name: str
+    email: str
+    profile_photo_url: str | None
+    storage_used: int
+    storage_limit: int | None
+
+
+@dataclass(frozen=True)
 class ProjectedDriveItem:
     """A Drive item and its deterministic local path."""
 
@@ -682,6 +758,9 @@ class DriveProjection:
 
     def path_for_id(self, file_id: str) -> str | None:
         return self._path_by_id.get(file_id)
+
+    def item_for_id(self, file_id: str) -> DriveItem | None:
+        return self._items.get(file_id)
 
     def item_for_path(self, path: str) -> DriveItem | None:
         file_id = self._id_by_path_key.get(_path_collision_key(path))
@@ -840,6 +919,38 @@ class GoogleDriveClient:
         """Return My Drive's root resource and stable ID."""
         return self.get_item("root")
 
+    def get_about(self) -> GoogleAbout:
+        """Return account identity and storage quota data."""
+        payload = self._json_request(
+            "GET",
+            f"{GOOGLE_DRIVE_API}/about",
+            params={
+                "fields": (
+                    "user(displayName,emailAddress,permissionId,photoLink),"
+                    "storageQuota(limit,usage)"
+                )
+            },
+        )
+        user = payload.get("user")
+        quota = payload.get("storageQuota")
+        if not isinstance(user, dict) or not isinstance(quota, dict):
+            raise _invalid_response("The Drive account data is missing.")
+        account_id = _required_string(user, "permissionId")
+        display_name = _required_string(user, "displayName")
+        email = _required_string(user, "emailAddress")
+        storage_used = _optional_nonnegative_int(quota.get("usage"), "storage usage")
+        storage_limit = _optional_nonnegative_int(quota.get("limit"), "storage limit")
+        if storage_used is None:
+            raise _invalid_response("The Drive storage usage is missing.")
+        return GoogleAbout(
+            account_id=account_id,
+            display_name=display_name,
+            email=email,
+            profile_photo_url=_optional_string(user.get("photoLink"), "photo link"),
+            storage_used=storage_used,
+            storage_limit=storage_limit,
+        )
+
     def get_item(self, file_id: str) -> DriveItem:
         """Return one current file resource by stable ID."""
         _validate_file_id(file_id)
@@ -936,7 +1047,12 @@ class GoogleDriveClient:
             )
         return DriveChangePage(tuple(changes), next_token, start_token)
 
-    def download_blob(self, file_id: str, destination: BinaryIO) -> DriveItem:
+    def download_blob(
+        self,
+        file_id: str,
+        destination: BinaryIO,
+        progress: Callable[[int], None] | None = None,
+    ) -> DriveItem:
         """Download one blob after checking its current capabilities."""
         item = self.get_item(file_id)
         if item.is_folder or item.is_google_native or item.is_shortcut:
@@ -959,6 +1075,8 @@ class GoogleDriveClient:
             for chunk in response.iter_content(1024 * 1024):
                 if chunk:
                     destination.write(chunk)
+                    if progress:
+                        progress(destination.tell())
         except (OSError, requests.RequestException) as exc:
             raise GoogleDriveError(
                 "Google Drive download failed", "The file transfer stopped early."
@@ -1255,7 +1373,7 @@ class GoogleDriveClient:
                 )
             except requests.RequestException as exc:
                 if attempt == _MAX_RETRIES:
-                    raise GoogleDriveError(
+                    raise GoogleDriveConnectionError(
                         "Google Drive request failed", "The service is not available."
                     ) from exc
                 self._backoff(attempt, None)
@@ -1282,6 +1400,13 @@ class GoogleDriveClient:
 
             status = response.status_code
             response.close()
+            if retryable:
+                raise GoogleDriveServerError(
+                    "Google Drive service failed",
+                    message,
+                    status=status,
+                    reason=reason,
+                )
             raise GoogleDriveError(
                 "Google Drive request failed",
                 message,
@@ -1321,6 +1446,844 @@ class GoogleDriveClient:
         if delay is None or delay < 0 or delay > 120:
             delay = min(32.0, float(2**attempt)) + self._random.random()
         self._sleep(delay)
+
+
+class GoogleDriveProvider:
+    """Provider-neutral adapter for Google Drive's ID-based data model."""
+
+    provider_id = "google_drive"
+    api_url = GOOGLE_DRIVE_API
+    content_hasher_factory: ContentHasherFactory
+
+    def __init__(
+        self,
+        config_name: str,
+        cred_storage: CredentialStorage,
+        *,
+        session: HttpSession | None = None,
+        client_id: str | None = None,
+        drive_client: GoogleDriveClient | None = None,
+        bandwidth_limit_up: float = 0,
+        bandwidth_limit_down: float = 0,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> None:
+        self.config_name = config_name
+        self._cred_storage = cred_storage
+        self._state = MaestralState(config_name)
+        self._logger = scoped_logger(__name__, config_name)
+        self._session = cast(HttpSession, session or requests.Session())
+        self._configured_client_id = client_id
+        self._drive_client = drive_client
+        self._oauth: GoogleOAuth | None = None
+        self._oauth_loopback: GoogleOAuthLoopback | None = None
+        self._oauth_request: GoogleOAuthRequest | None = None
+        self._projection: DriveProjection | None = None
+        self._projection_cursor: str | None = None
+        self._root_id = self._state.get("account", "path_root_nsid")
+        self._cached_account_info: FullAccount | None = None
+        self._account_id = cred_storage.account_id
+        self._pending_tokens: GoogleTokens | None = None
+        self._allow_plaintext_keyring = False
+        self._sleep = sleep
+        self.content_hasher_factory = md5_content_hasher
+        self.bandwidth_limit_up = bandwidth_limit_up
+        self.bandwidth_limit_down = bandwidth_limit_down
+
+    @property
+    def linked(self) -> bool:
+        return self._drive_client is not None or self._cred_storage.token is not None
+
+    @property
+    def drive(self) -> GoogleDriveClient:
+        if self._drive_client is None:
+            token = self._cred_storage.token
+            if token is None:
+                raise NotLinkedError(
+                    "No Google credentials set",
+                    "Link a Google Drive account first.",
+                )
+            tokens = GoogleTokens.from_json(token)
+            self._drive_client = GoogleDriveClient(
+                self._oauth_client(),
+                tokens,
+                self._save_refreshed_tokens,
+                session=self._session,
+            )
+        return self._drive_client
+
+    def _client_id(self) -> str:
+        client_id = (
+            self._configured_client_id
+            or os.environ.get(GOOGLE_CLIENT_ID_ENV, "")
+            or GOOGLE_DESKTOP_CLIENT_ID
+        )
+        if not client_id:
+            raise GoogleDriveError(
+                "Google Drive client ID is missing",
+                f"Set {GOOGLE_CLIENT_ID_ENV} to a Google desktop OAuth client ID.",
+            )
+        return client_id
+
+    def _oauth_client(self) -> GoogleOAuth:
+        if self._oauth is None:
+            self._oauth = GoogleOAuth(self._client_id(), session=self._session)
+        return self._oauth
+
+    def _save_refreshed_tokens(self, tokens: GoogleTokens) -> None:
+        if self._account_id is None:
+            self._pending_tokens = tokens
+            return
+        self._cred_storage.save_creds(
+            self._account_id,
+            tokens.to_json(),
+            allow_plaintext=True,
+        )
+
+    def get_auth_url(self) -> str:
+        self._close_auth_flow()
+        loopback = GoogleOAuthLoopback()
+        loopback.__enter__()
+        try:
+            request = loopback.authorization_request(self._oauth_client())
+        except BaseException:
+            loopback.__exit__(None, None, None)
+            raise
+        self._oauth_loopback = loopback
+        self._oauth_request = request
+        return request.url
+
+    def link(
+        self,
+        code: str | None = None,
+        refresh_token: str | None = None,
+        access_token: str | None = None,
+        allow_plaintext_keyring: bool = False,
+    ) -> int:
+        self._allow_plaintext_keyring = allow_plaintext_keyring
+        try:
+            if refresh_token is not None:
+                tokens = GoogleTokens(
+                    access_token=access_token or "refresh-required",
+                    refresh_token=refresh_token,
+                    expires_at=0,
+                    scope=GOOGLE_DRIVE_SCOPE,
+                )
+            elif access_token is not None:
+                raise GoogleDriveError(
+                    "Google authorization failed",
+                    "Google Drive requires a long-lived refresh token.",
+                    reason="invalid_token",
+                )
+            else:
+                request = self._oauth_request
+                loopback = self._oauth_loopback
+                if request is None or loopback is None:
+                    raise RuntimeError(
+                        "Start the Google authorization flow with get_auth_url first."
+                    )
+                auth_code = code or loopback.wait_for_code()
+                tokens = self._oauth_client().exchange_code(request, auth_code)
+
+            self._drive_client = GoogleDriveClient(
+                self._oauth_client(),
+                tokens,
+                self._save_refreshed_tokens,
+                session=self._session,
+            )
+            about = self.drive.get_about()
+            root = self.drive.get_root()
+            saved_tokens = self._pending_tokens or self.drive.tokens
+            self._account_id = about.account_id
+            self._cred_storage.save_creds(
+                about.account_id,
+                saved_tokens.to_json(),
+                allow_plaintext=allow_plaintext_keyring,
+            )
+            self._pending_tokens = None
+            self._root_id = root.id
+            self._save_account_state(about, root.id)
+            self._cached_account_info = self._account_from_about(about, root.id)
+            return 0
+        except GoogleDriveError as exc:
+            self._drive_client = None
+            if exc.title == "Google Drive client ID is missing":
+                raise
+            if exc.reason in {"invalid_grant", "invalid_token"} or exc.status in {
+                400,
+                401,
+            }:
+                return 1
+            self._logger.debug("Google Drive link failed", exc_info=True)
+            return 2
+        finally:
+            self._close_auth_flow()
+
+    def _close_auth_flow(self) -> None:
+        if self._oauth_loopback is not None:
+            self._oauth_loopback.__exit__(None, None, None)
+        self._oauth_loopback = None
+        self._oauth_request = None
+
+    def unlink(self) -> None:
+        try:
+            self._cred_storage.delete_creds()
+        finally:
+            self._drive_client = None
+            self._projection = None
+            self._projection_cursor = None
+            self._cached_account_info = None
+            self._account_id = None
+            self._pending_tokens = None
+            self._close_auth_flow()
+
+    def close(self) -> None:
+        self._close_auth_flow()
+        close = getattr(self._session, "close", None)
+        if callable(close):
+            close()
+
+    def __enter__(self) -> GoogleDriveProvider:
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        self.close()
+
+    @property
+    def account_info(self) -> FullAccount:
+        if self._cached_account_info is None:
+            return self.get_account_info()
+        return self._cached_account_info
+
+    @property
+    def namespace_id(self) -> str:
+        if not self._root_id:
+            self._root_id = self.drive.get_root().id
+        return self._root_id
+
+    @property
+    def is_team_space(self) -> bool:
+        return False
+
+    @overload
+    def get_account_info(self, dbid: None = None) -> FullAccount: ...
+
+    @overload
+    def get_account_info(self, dbid: str) -> Account: ...
+
+    def get_account_info(self, dbid: str | None = None) -> Account:
+        if (
+            dbid is not None
+            and self._account_id is not None
+            and dbid != self._account_id
+        ):
+            raise InvalidDbidError(
+                "Google account not found", "The account ID is not linked."
+            )
+        about = self.drive.get_about()
+        if dbid is not None and dbid != about.account_id:
+            raise InvalidDbidError(
+                "Google account not found", "The account ID is not linked."
+            )
+        root_id = self.namespace_id
+        self._account_id = about.account_id
+        self._save_account_state(about, root_id)
+        account = self._account_from_about(about, root_id)
+        self._cached_account_info = account
+        if dbid is None:
+            return account
+        return Account(
+            account.account_id,
+            account.display_name,
+            account.email,
+            account.email_verified,
+            account.profile_photo_url,
+            account.disabled,
+        )
+
+    def _account_from_about(self, about: GoogleAbout, root_id: str) -> FullAccount:
+        return FullAccount(
+            account_id=about.account_id,
+            display_name=about.display_name,
+            email=about.email,
+            email_verified=True,
+            profile_photo_url=about.profile_photo_url,
+            disabled=False,
+            country=None,
+            locale="en",
+            team=None,
+            team_member_id=None,
+            account_type=AccountType.Other,
+            root_info=UserRootInfo(root_id, root_id),
+        )
+
+    def _save_account_state(self, about: GoogleAbout, root_id: str) -> None:
+        self._state.set("account", "email", about.email)
+        self._state.set("account", "display_name", about.display_name)
+        self._state.set("account", "abbreviated_name", about.display_name[:2])
+        self._state.set("account", "type", AccountType.Other.value)
+        self._state.set("account", "path_root_type", "user")
+        self._state.set("account", "path_root_nsid", root_id)
+        self._state.set("account", "home_path", "")
+
+    def get_space_usage(self) -> PersonalSpaceUsage:
+        about = self.drive.get_about()
+        allocated = about.storage_limit or about.storage_used
+        usage = PersonalSpaceUsage(about.storage_used, allocated, None)
+        if about.storage_limit:
+            percent = about.storage_used / about.storage_limit
+            space_usage = f"{percent:.1%} of {natural_size(allocated)} used"
+        else:
+            space_usage = f"{natural_size(about.storage_used)} used"
+        self._state.set("account", "usage", space_usage)
+        self._state.set("account", "usage_type", "individual")
+        self._state.set("account", "usage_used", usage.used)
+        self._state.set("account", "usage_allocated", usage.allocated)
+        return usage
+
+    def update_path_root(self, root_info: RootInfo) -> None:
+        if not isinstance(root_info, UserRootInfo):
+            raise GoogleDriveError(
+                "Google Drive root is invalid",
+                "Google Drive does not support a team-space path root.",
+            )
+        self._root_id = root_info.root_namespace_id
+        self._state.set("account", "path_root_type", "user")
+        self._state.set("account", "path_root_nsid", self._root_id)
+        self._state.set("account", "home_path", "")
+
+    def _refresh_projection(self) -> DriveProjection:
+        root = self.drive.get_root()
+        items = [item for item in self.drive.list_all_items() if item.id != root.id]
+        projection = DriveProjection(root.id, [root, *items])
+        self._root_id = root.id
+        self._projection = projection
+        return projection
+
+    def _ensure_projection(self) -> DriveProjection:
+        return self._projection or self._refresh_projection()
+
+    @staticmethod
+    def _normalise_remote_path(path: str) -> str:
+        if not isinstance(path, str) or "\x00" in path:
+            raise ValueError("The remote path is not valid")
+        if path in {"", "/"}:
+            return "/"
+        if not path.startswith("/"):
+            raise ValueError("The remote path must start with '/'")
+        normalised = posixpath.normpath(path)
+        if normalised == "/" or normalised.startswith("/../"):
+            raise ValueError("The remote path is not valid")
+        return normalised
+
+    @staticmethod
+    def _path_lower(path: str) -> str:
+        return normalize(path)
+
+    def _metadata_for(self, item: DriveItem, path: str) -> Metadata:
+        path = self._normalise_remote_path(path)
+        name = posixpath.basename(path)
+        path_lower = self._path_lower(path)
+        if item.is_folder:
+            return FolderMetadata(name, path_lower, path, item.id, False)
+
+        modified = item.modified_time or datetime.fromtimestamp(0, timezone.utc)
+        projection = self._ensure_projection()
+        if item.stub_extension is not None:
+            content = projection.native_stub(item.id)
+            hasher = self.content_hasher_factory()
+            hasher.update(content)
+            size = len(content)
+            checksum = hasher.hexdigest()
+        else:
+            if item.md5_checksum is None:
+                raise GoogleDriveError(
+                    "Google Drive returned invalid data",
+                    "A downloadable file has no MD5 checksum.",
+                )
+            size = item.size or 0
+            checksum = item.md5_checksum
+        return FileMetadata(
+            name=name,
+            path_lower=path_lower,
+            path_display=path,
+            id=item.id,
+            client_modified=modified,
+            server_modified=modified,
+            rev=item.version,
+            size=size,
+            symlink_target=None,
+            shared=False,
+            modified_by=self._account_id,
+            is_downloadable=True,
+            content_hash=checksum,
+        )
+
+    def _metadata_for_id(self, file_id: str) -> Metadata | None:
+        projection = self._ensure_projection()
+        item = projection.item_for_id(file_id)
+        path = projection.path_for_id(file_id)
+        if item is None or path is None:
+            return None
+        return self._metadata_for(item, path)
+
+    def get_metadata(
+        self, remote_path: str, include_deleted: bool = False
+    ) -> Metadata | None:
+        if remote_path.startswith("rev:"):
+            raise self._unsupported("revision metadata")
+        del include_deleted
+        remote_path = self._normalise_remote_path(remote_path)
+        if remote_path == "/":
+            root = self.drive.get_root()
+            return FolderMetadata("", "/", "/", root.id, False)
+        projection = self._ensure_projection()
+        item = projection.item_for_path(remote_path)
+        if item is None:
+            return None
+        projected_path = projection.path_for_id(item.id)
+        if projected_path is None:
+            return None
+        return self._metadata_for(item, projected_path)
+
+    def _listed_metadata(self, remote_path: str, recursive: bool) -> list[Metadata]:
+        projection = self._ensure_projection()
+        prefix = remote_path.rstrip("/") + "/"
+        entries: list[Metadata] = []
+        for projected in projection.projected_items():
+            path = projected.path
+            if remote_path == "/":
+                relative = path[1:]
+            elif path.startswith(prefix):
+                relative = path[len(prefix) :]
+            else:
+                continue
+            if not recursive and "/" in relative:
+                continue
+            entries.append(self._metadata_for(projected.item, path))
+        return entries
+
+    def list_folder(
+        self,
+        remote_path: str,
+        recursive: bool = False,
+        include_deleted: bool = False,
+        include_mounted_folders: bool = True,
+        include_non_downloadable_files: bool = False,
+    ) -> ListFolderResult:
+        return next(
+            self.list_folder_iterator(
+                remote_path,
+                recursive,
+                include_deleted,
+                include_mounted_folders,
+                include_non_downloadable_files=include_non_downloadable_files,
+            )
+        )
+
+    def list_folder_iterator(
+        self,
+        remote_path: str,
+        recursive: bool = False,
+        include_deleted: bool = False,
+        include_mounted_folders: bool = True,
+        limit: int | None = None,
+        include_non_downloadable_files: bool = False,
+    ) -> Iterator[ListFolderResult]:
+        del include_deleted, include_mounted_folders, limit
+        del include_non_downloadable_files
+        remote_path = self._normalise_remote_path(remote_path)
+        cursor = self.drive.get_start_page_token()
+        self._refresh_projection()
+        self._projection_cursor = cursor
+        yield ListFolderResult(
+            self._listed_metadata(remote_path, recursive),
+            False,
+            cursor,
+        )
+
+    def list_remote_changes_iterator(
+        self,
+        last_cursor: str,
+        indexed_paths: Mapping[str, str] | None = None,
+    ) -> Iterator[ListFolderResult]:
+        _validate_page_token(last_cursor)
+        known_paths = dict(indexed_paths or {})
+        apply_pages = (
+            self._projection is not None and self._projection_cursor == last_cursor
+        )
+        if not apply_pages:
+            self._refresh_projection()
+
+        token = last_cursor
+        seen_tokens = {token}
+        while True:
+            page = self.drive.list_changes(token)
+            projection = self._ensure_projection()
+            if apply_pages:
+                projection.apply_changes(page.changes)
+            changed_ids = {change.file_id for change in page.changes}
+            current_paths = {
+                projected.item.id: projected.path
+                for projected in projection.projected_items()
+            }
+            entries: list[Metadata] = []
+            for file_id, old_path in sorted(known_paths.items()):
+                new_path = current_paths.get(file_id)
+                if new_path is None or self._path_lower(new_path) != self._path_lower(
+                    old_path
+                ):
+                    entries.append(
+                        DeletedMetadata(
+                            posixpath.basename(old_path),
+                            self._path_lower(old_path),
+                            old_path,
+                        )
+                    )
+            for file_id, new_path in sorted(current_paths.items()):
+                known_path = known_paths.get(file_id)
+                path_changed = known_path is not None and self._path_lower(
+                    known_path
+                ) != self._path_lower(new_path)
+                if file_id in changed_ids or path_changed:
+                    metadata = self._metadata_for_id(file_id)
+                    if metadata is not None:
+                        entries.append(metadata)
+
+            for file_id in tuple(known_paths):
+                if file_id not in current_paths:
+                    known_paths.pop(file_id, None)
+            for entry in entries:
+                if not isinstance(entry, DeletedMetadata):
+                    item_id = cast(FileMetadata | FolderMetadata, entry).id
+                    known_paths[item_id] = entry.path_display
+
+            next_token = page.next_page_token or page.new_start_page_token
+            assert next_token is not None
+            self._projection_cursor = next_token
+            yield ListFolderResult(
+                entries, page.next_page_token is not None, next_token
+            )
+            if page.next_page_token is None:
+                break
+            if next_token in seen_tokens:
+                raise GoogleDriveError(
+                    "Google Drive returned invalid data",
+                    "A change page token was repeated.",
+                )
+            seen_tokens.add(next_token)
+            token = next_token
+
+    def wait_for_remote_changes(self, last_cursor: str, timeout: int = 40) -> bool:
+        if timeout <= 0:
+            raise ValueError("Timeout must be positive")
+        self._sleep(min(float(timeout), 5.0))
+        return bool(self.drive.list_changes(last_cursor).changes)
+
+    def download(
+        self,
+        remote_path: str,
+        local_path: str | BinaryIO,
+        sync_event: SyncEvent | None = None,
+        *,
+        rev: str | None = None,
+        provider_id: str | None = None,
+    ) -> FileMetadata:
+        if remote_path.startswith("rev:"):
+            raise self._unsupported("revision download")
+        remote_path = self._normalise_remote_path(remote_path)
+        projection = self._ensure_projection()
+        item = (
+            projection.item_for_id(provider_id)
+            if provider_id is not None
+            else projection.item_for_path(remote_path)
+        )
+        if item is None:
+            raise NotFoundError("Google Drive item not found", dbx_path=remote_path)
+        if item.is_folder:
+            raise IsAFolderError("Cannot download folder", dbx_path=remote_path)
+        if rev is not None and item.version != rev:
+            raise DataChangedError(
+                "Google Drive file changed",
+                "The remote version changed before download.",
+                dbx_path=remote_path,
+            )
+        projected_path = projection.path_for_id(item.id)
+        if projected_path is None:
+            raise NotFoundError("Google Drive item not found", dbx_path=remote_path)
+        destination: AbstractContextManager[BinaryIO]
+        if isinstance(local_path, str):
+            destination = open(local_path, "wb", opener=opener_no_symlink)
+        else:
+            destination = nullcontext(local_path)
+
+        with destination as file:
+            file.seek(0)
+            file.truncate()
+            hasher = self.content_hasher_factory()
+
+            class HashingWriter:
+                def write(inner_self, data: bytes) -> int:
+                    hasher.update(data)
+                    result = file.write(data)
+                    if sync_event is not None:
+                        sync_event.completed = file.tell()
+                    return result
+
+                def tell(inner_self) -> int:
+                    return file.tell()
+
+            if item.stub_extension is not None:
+                data = projection.native_stub(item.id)
+                HashingWriter().write(data)
+            else:
+                self.drive.download_blob(item.id, cast(BinaryIO, HashingWriter()))
+            metadata = cast(FileMetadata, self._metadata_for(item, projected_path))
+            if hasher.hexdigest() != metadata.content_hash:
+                raise DataCorruptionError(
+                    "Data corrupted", "Retry the Google Drive download."
+                )
+            file.flush()
+            try:
+                timestamp = metadata.client_modified.timestamp()
+                os.utime(file.fileno(), (time.time(), timestamp))
+            except (AttributeError, OSError):
+                pass
+        return metadata
+
+    def upload(
+        self,
+        local_file: str | os.PathLike[str] | BinaryIO,
+        remote_path: str,
+        write_mode: WriteMode = WriteMode.Add,
+        update_rev: str | None = None,
+        autorename: bool = False,
+        sync_event: SyncEvent | None = None,
+        *,
+        local_path: str | None = None,
+    ) -> FileMetadata:
+        remote_path = self._normalise_remote_path(remote_path)
+        parent_path, name = posixpath.split(remote_path)
+        parent_path = parent_path or "/"
+        projection = self._ensure_projection()
+        parent = self._item_for_folder(parent_path)
+        existing = projection.item_for_path(remote_path)
+        if existing is not None and existing.is_folder:
+            raise IsAFolderError("Cannot upload over folder", dbx_path=remote_path)
+        if existing is not None and existing.stub_extension is not None:
+            raise UnsupportedFileError(
+                "Google link documents are read-only",
+                "Edit the native document in Google Drive.",
+                dbx_path=remote_path,
+            )
+        if write_mode is WriteMode.Add and existing is not None and not autorename:
+            raise FileConflictError("File already exists", dbx_path=remote_path)
+        if write_mode is WriteMode.Update:
+            if existing is None or update_rev is None or existing.version != update_rev:
+                raise FileConflictError(
+                    "File changed on Google Drive", dbx_path=remote_path
+                )
+
+        source_path: str | None
+        source_context: AbstractContextManager[BinaryIO]
+        if isinstance(local_file, (str, bytes, os.PathLike)):
+            source_path = os.fsdecode(local_file)
+            source_context = open(source_path, "rb", opener=opener_no_symlink)
+        else:
+            source_path = local_path
+            source_context = nullcontext(local_file)
+
+        with source_context as source:
+            source.seek(0)
+            try:
+                initial_stat = os.fstat(source.fileno())
+                size = initial_stat.st_size
+            except (AttributeError, OSError):
+                source.seek(0, os.SEEK_END)
+                size = source.tell()
+                source.seek(0)
+                initial_stat = None
+
+            hasher = self.content_hasher_factory()
+            while chunk := source.read(1024 * 1024):
+                hasher.update(chunk)
+            checksum = hasher.hexdigest()
+            if initial_stat is not None and os.fstat(source.fileno()) != initial_stat:
+                raise DataChangedError(
+                    "File changed during hashing", local_path=source_path
+                )
+            source.seek(0)
+            mime_type = mimetypes.guess_type(name)[0] or "application/octet-stream"
+            update_id = (
+                existing.id
+                if existing is not None and write_mode is not WriteMode.Add
+                else None
+            )
+            session_url = self.drive.start_resumable_upload(
+                name=name,
+                parent_id=parent.id,
+                mime_type=mime_type,
+                size=size,
+                file_id=update_id,
+            )
+            item = self.drive.upload_resumable(
+                session_url,
+                source,
+                size,
+                progress=(
+                    (lambda completed: setattr(sync_event, "completed", completed))
+                    if sync_event is not None
+                    else None
+                ),
+            )
+            if initial_stat is not None and os.fstat(source.fileno()) != initial_stat:
+                raise DataChangedError(
+                    "File changed during upload", local_path=source_path
+                )
+        if item.md5_checksum != checksum:
+            raise DataCorruptionError(
+                "Data corrupted", "Retry the Google Drive upload."
+            )
+        projection.apply_changes((DriveChange(item.id, False, item, None),))
+        metadata = self._metadata_for_id(item.id)
+        if not isinstance(metadata, FileMetadata):
+            raise GoogleDriveError(
+                "Google Drive returned invalid data",
+                "The uploaded file has no projected path.",
+            )
+        return metadata
+
+    def _item_for_folder(self, path: str) -> DriveItem:
+        path = self._normalise_remote_path(path)
+        item: DriveItem | None
+        if path == "/":
+            item = self.drive.get_root()
+        else:
+            item = self._ensure_projection().item_for_path(path)
+        if item is None:
+            raise NotFoundError("Folder not found", dbx_path=path)
+        if not item.is_folder:
+            raise NotAFolderError("Not a folder", dbx_path=path)
+        return item
+
+    def make_dir(self, remote_path: str, autorename: bool = False) -> FolderMetadata:
+        remote_path = self._normalise_remote_path(remote_path)
+        parent_path, name = posixpath.split(remote_path)
+        projection = self._ensure_projection()
+        existing = projection.item_for_path(remote_path)
+        if existing is not None and not autorename:
+            raise FolderConflictError("Folder already exists", dbx_path=remote_path)
+        parent = self._item_for_folder(parent_path or "/")
+        item = self.drive.create_folder(name, parent.id)
+        projection.apply_changes((DriveChange(item.id, False, item, None),))
+        metadata = self._metadata_for_id(item.id)
+        if not isinstance(metadata, FolderMetadata):
+            raise GoogleDriveError(
+                "Google Drive returned invalid data",
+                "The created folder has no projected path.",
+            )
+        return metadata
+
+    def move(
+        self, remote_path: str, new_path: str, autorename: bool = False
+    ) -> FileMetadata | FolderMetadata:
+        remote_path = self._normalise_remote_path(remote_path)
+        new_path = self._normalise_remote_path(new_path)
+        projection = self._ensure_projection()
+        item = projection.item_for_path(remote_path)
+        if item is None:
+            raise NotFoundError("Item not found", dbx_path=remote_path)
+        destination = projection.item_for_path(new_path)
+        if destination is not None and destination.id != item.id and not autorename:
+            error_type = (
+                FolderConflictError if destination.is_folder else FileConflictError
+            )
+            raise error_type("Destination already exists", dbx_path=new_path)
+        parent_path, new_name = posixpath.split(new_path)
+        new_parent = self._item_for_folder(parent_path or "/")
+        old_parent_id = item.parent_id or self.namespace_id
+        old_projected_name = posixpath.basename(remote_path)
+        if new_name == old_projected_name:
+            new_name = item.name
+        elif item.stub_extension and new_name.endswith(item.stub_extension):
+            new_name = new_name[: -len(item.stub_extension)]
+        moved = self.drive.move_item(
+            item.id,
+            old_parent_id=old_parent_id,
+            new_parent_id=new_parent.id,
+            new_name=new_name,
+        )
+        projection.apply_changes((DriveChange(moved.id, False, moved, None),))
+        metadata = self._metadata_for_id(moved.id)
+        if not isinstance(metadata, (FileMetadata, FolderMetadata)):
+            raise GoogleDriveError(
+                "Google Drive returned invalid data", "The moved item is unreachable."
+            )
+        return metadata
+
+    def remove(
+        self, remote_path: str, parent_rev: str | None = None
+    ) -> FileMetadata | FolderMetadata:
+        remote_path = self._normalise_remote_path(remote_path)
+        projection = self._ensure_projection()
+        item = projection.item_for_path(remote_path)
+        if item is None:
+            raise NotFoundError("Item not found", dbx_path=remote_path)
+        if parent_rev is not None and item.version != parent_rev:
+            raise FileConflictError(
+                "Item changed on Google Drive", dbx_path=remote_path
+            )
+        metadata = self._metadata_for(item, remote_path)
+        if not isinstance(metadata, (FileMetadata, FolderMetadata)):
+            raise GoogleDriveError(
+                "Google Drive returned invalid data", "The item metadata is invalid."
+            )
+        self.drive.delete_item(item.id)
+        projection.apply_changes((DriveChange(item.id, True, None, None),))
+        return metadata
+
+    def _unsupported(self, operation: str) -> UnsupportedProviderOperationError:
+        return UnsupportedProviderOperationError(
+            f"Google Drive does not support {operation}",
+            "This operation is available only for providers which expose it.",
+        )
+
+    def share_dir(
+        self, remote_path: str, force_async: bool = False
+    ) -> FolderMetadata | None:
+        del remote_path, force_async
+        raise self._unsupported("shared folders")
+
+    def list_revisions(
+        self, remote_path: str, mode: str = "path", limit: int = 10
+    ) -> list[FileMetadata]:
+        del remote_path, mode, limit
+        raise self._unsupported("revision history")
+
+    def restore(self, remote_path: str, rev: str) -> FileMetadata:
+        del remote_path, rev
+        raise self._unsupported("revision restore")
+
+    def create_shared_link(
+        self,
+        remote_path: str,
+        visibility: LinkAudience = LinkAudience.Public,
+        access_level: LinkAccessLevel = LinkAccessLevel.Viewer,
+        allow_download: bool | None = None,
+        password: str | None = None,
+        expires: datetime | None = None,
+    ) -> SharedLinkMetadata:
+        del remote_path, visibility, access_level, allow_download, password, expires
+        raise self._unsupported("shared links")
+
+    def revoke_shared_link(self, url: str) -> None:
+        del url
+        raise self._unsupported("shared links")
+
+    def list_shared_links(
+        self, remote_path: str | None = None, *, direct_only: bool = False
+    ) -> list[SharedLinkMetadata]:
+        del remote_path, direct_only
+        raise self._unsupported("shared links")
 
 
 def _base64url(value: bytes) -> str:

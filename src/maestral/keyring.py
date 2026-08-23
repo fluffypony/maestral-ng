@@ -71,15 +71,20 @@ class CredentialStorage:
         other application in the same user session get access to *all* saved passwords.
 
     :param config_name: Name of maestral config.
+    :param provider: Remote provider which owns the credentials.
     """
 
     _lock = RLock()
 
-    def __init__(self, config_name: str) -> None:
+    def __init__(self, config_name: str, provider: str | None = None) -> None:
         self._config_name = config_name
         self._logger = scoped_logger(__name__, config_name)
 
         self._conf = MaestralConfig(config_name)
+        configured_provider = provider or self._conf.get("auth", "provider")
+        self._provider = configured_provider.strip().lower().replace("-", "_")
+        if self._provider not in {"dropbox", "google_drive"}:
+            raise ValueError(f"Unknown remote provider {configured_provider!r}")
 
         # defer keyring access until token requested by user
         self._token: str | None = None
@@ -152,6 +157,10 @@ class CredentialStorage:
         return ring
 
     def _get_accessor(self, account_id: str) -> str:
+        return f"config:{self._config_name}:{self._provider}:{account_id}"
+
+    def _get_legacy_dropbox_accessor(self, account_id: str) -> str:
+        """Return the accessor used before credentials were provider-scoped."""
         return f"config:{self._config_name}:{account_id}"
 
     @property
@@ -185,21 +194,31 @@ class CredentialStorage:
         :raises KeyringAccessError: if the system keyring is locked or otherwise cannot
             be accessed (for example if the app bundle signature has been invalidated).
         """
-        if not (self.keyring and self.account_id):
+        ring = self.keyring
+        account_id = self.account_id
+        if not (ring and account_id):
             return
 
-        self._logger.debug(f"Using keyring: {self.keyring}")
+        self._logger.debug(f"Using keyring: {ring}")
 
-        accessor = self._get_accessor(self.account_id)
+        accessor = self._get_accessor(account_id)
 
         try:
-            token = self.keyring.get_password("Maestral", accessor)
+            token = ring.get_password("Maestral", accessor)
+            if token is None and self._provider == "dropbox":
+                legacy_accessor = self._get_legacy_dropbox_accessor(account_id)
+                token = ring.get_password("Maestral", legacy_accessor)
+                if token is not None:
+                    # This is a one-time migration of installed credentials. Keep the
+                    # old value if either keyring write fails so no token is lost.
+                    ring.set_password("Maestral", accessor, token)
+                    try:
+                        ring.delete_password("Maestral", legacy_accessor)
+                    except PasswordDeleteError:
+                        pass
         except (KeyringLocked, InitError):
             title = "Could not load auth token"
-            msg = (
-                f"{self.keyring.name} is locked. Please unlock the keyring "
-                "and try again."
-            )
+            msg = f"{ring.name} is locked. Please unlock the keyring and try again."
             new_exc = KeyringAccessError(title, msg)
             self._logger.error(title, exc_info=exc_info_tuple(new_exc))
             raise new_exc
@@ -332,9 +351,24 @@ class CredentialStorage:
 
             if ring and target_account_id:
                 accessor = self._get_accessor(target_account_id)
+                accessors = [accessor]
+                if self._provider == "dropbox":
+                    accessors.append(
+                        self._get_legacy_dropbox_accessor(target_account_id)
+                    )
 
                 try:
-                    ring.delete_password("Maestral", accessor)
+                    last_missing_error: PasswordDeleteError | None = None
+                    removed = False
+                    for candidate in accessors:
+                        try:
+                            ring.delete_password("Maestral", candidate)
+                        except PasswordDeleteError as exc:
+                            last_missing_error = exc
+                            continue
+                        removed = True
+                    if not removed and last_missing_error is not None:
+                        self._logger.info(str(last_missing_error))
                 except (KeyringLocked, InitError):
                     title = "Could not delete auth token"
                     msg = (
@@ -344,9 +378,6 @@ class CredentialStorage:
                     error = KeyringAccessError(title, msg)
                     self._logger.error(title, exc_info=exc_info_tuple(error))
                     raise error
-                except PasswordDeleteError as exc:
-                    # password does not exist in keyring
-                    self._logger.info(str(exc))
                 except Exception as e:
                     title = "Could not delete auth token"
                     new_exc = KeyringAccessError(title, str(e))

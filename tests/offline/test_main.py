@@ -274,6 +274,7 @@ def test_link_refuses_old_root_recovery_after_interrupted_unlink(
     journal = {
         "kind": "unlink",
         "phase": "queue",
+        "provider": "dropbox",
         "account_id": "old-account",
         "keyring": "automatic",
         "credentials_deleted": False,
@@ -299,6 +300,7 @@ def test_reset_marker_remains_until_root_bound_recovery_is_clear(m: Maestral) ->
     journal = {
         "kind": "unlink",
         "phase": "queue",
+        "provider": "dropbox",
         "account_id": "old-account",
         "keyring": "automatic",
         "credentials_deleted": True,

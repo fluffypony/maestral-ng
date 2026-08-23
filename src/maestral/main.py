@@ -34,7 +34,6 @@ except ImportError:
 
 # local imports
 from . import __version__
-from .client import DropboxClient
 from .config import MaestralConfig, MaestralState, validate_config_name
 from .constants import (
     CONNECTING,
@@ -81,6 +80,7 @@ from .logging import (
 )
 from .manager import SyncManager
 from .models import SyncErrorEntry, SyncEvent, SyncStatus
+from .providers.base import create_provider, normalise_provider_name
 from .sync import SyncDirection, SyncEngine
 from .utils import exc_info_tuple, get_newer_version
 from .utils.appdirs import get_cache_path, get_data_path
@@ -168,6 +168,7 @@ class Maestral:
         log_to_stderr: bool = False,
         event_loop: AbstractEventLoop | None = None,
         shutdown_future: Future[bool] | None = None,
+        provider: str | None = None,
     ) -> None:
         # Check system compatibility.
         self._check_system_compatibility()
@@ -175,9 +176,24 @@ class Maestral:
         self._loop = event_loop
         self._config_name = validate_config_name(config_name)
         self._conf = MaestralConfig(self.config_name)
+        configured_provider = normalise_provider_name(
+            self._conf.get("auth", "provider")
+        )
+        if provider is not None:
+            selected_provider = normalise_provider_name(provider)
+            if (
+                self._conf.get("auth", "account_id")
+                and selected_provider != configured_provider
+            ):
+                raise ValueError("Unlink the current account before changing provider")
+            if selected_provider != configured_provider:
+                self._conf.set("auth", "provider", selected_provider)
+            configured_provider = selected_provider
+        self._provider = configured_provider
         self._state = MaestralState(self.config_name)
         self._logger = scoped_logger(__name__, self.config_name)
-        self.cred_storage = CredentialStorage(self.config_name)
+        self.cred_storage = CredentialStorage(self.config_name, self.provider)
+        self._migrate_pending_unlink_provider()
         self._resume_pending_unlink_credentials()
         self._notification_snooze_until = 0.0
 
@@ -193,7 +209,8 @@ class Maestral:
         self._check_and_run_post_update_scripts()
 
         # Set up sync infrastructure.
-        self.client = DropboxClient(
+        self.client = create_provider(
+            self.provider,
             self.config_name,
             self.cred_storage,
             bandwidth_limit_up=self.bandwidth_limit_up,
@@ -341,6 +358,7 @@ class Maestral:
                 self.sync._ensure_unlink_recovery_clear()
                 self.manager.begin_unlink_reset(
                     stop_state,
+                    provider=self.provider,
                     account_id=self._conf.get("auth", "account_id"),
                     keyring=self._conf.get("auth", "keyring"),
                     root_path=self._conf.get("sync", "path"),
@@ -394,11 +412,21 @@ class Maestral:
             return True
         account_id = journal.get("account_id")
         keyring_name = journal.get("keyring")
-        if not isinstance(account_id, str) or not isinstance(keyring_name, str):
+        provider = journal.get("provider")
+        if (
+            not isinstance(account_id, str)
+            or not isinstance(keyring_name, str)
+            or not isinstance(provider, str)
+        ):
             return False
 
         try:
-            self.cred_storage.delete_creds(account_id, keyring_name)
+            storage = (
+                self.cred_storage
+                if provider == self.provider
+                else CredentialStorage(self.config_name, provider)
+            )
+            storage.delete_creds(account_id, keyring_name)
         except KeyringAccessError:
             self._logger.debug("Could not remove token from keyring", exc_info=True)
             return False
@@ -412,12 +440,29 @@ class Maestral:
             self._state.set("recovery", "sync_reset", journal)
         return True
 
+    def _migrate_pending_unlink_provider(self) -> None:
+        """Scope an old pending unlink to its only supported provider."""
+        journal = self._state.get("recovery", "sync_reset")
+        if (
+            isinstance(journal, dict)
+            and journal.get("kind") == "unlink"
+            and "provider" not in journal
+        ):
+            migrated = journal.copy()
+            migrated["provider"] = "dropbox"
+            self._state.set("recovery", "sync_reset", migrated)
+
     # ==== Methods to access config and saved state ====================================
 
     @property
     def config_name(self) -> str:
         """The selected configuration."""
         return self._config_name
+
+    @property
+    def provider(self) -> str:
+        """The selected remote storage provider."""
+        return self._provider
 
     def set_conf(self, section: str, name: str, value: Any) -> None:
         """
@@ -1872,7 +1917,7 @@ class Maestral:
         """
         self._check_linked()
         return self.client.create_shared_link(
-            dbx_path=dbx_path,
+            dbx_path,
             visibility=visibility,
             password=password,
             access_level=access_level,

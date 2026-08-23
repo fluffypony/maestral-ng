@@ -2,7 +2,7 @@ import inspect
 import logging
 import os
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import MagicMock, Mock
 
 import click
 from click.testing import CliRunner
@@ -66,6 +66,46 @@ def test_help() -> None:
     assert result_no_arg.output.startswith("Usage: main [OPTIONS] COMMAND [ARGS]")
 
     assert result_no_arg.output == result_help_arg.output
+
+
+def test_auth_link_selects_provider_before_client_creation(
+    config_name: str, monkeypatch
+) -> None:
+    fake_client = MagicMock()
+    fake_client.__enter__.return_value = fake_client
+    fake_client.pending_link = True
+    fake_client.link.return_value = 0
+    created_with: list[str] = []
+
+    def client(config: str, fallback: bool) -> Mock:
+        del fallback
+        created_with.append(MaestralConfig(config).get("auth", "provider"))
+        return fake_client
+
+    monkeypatch.setattr(daemon_module, "MaestralClient", client)
+    monkeypatch.setattr(daemon_module, "is_running", lambda _name: False)
+
+    result = CliRunner().invoke(
+        main,
+        [
+            "auth",
+            "link",
+            "--provider",
+            "google-drive",
+            "--refresh-token",
+            "token",
+            "-c",
+            config_name,
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert created_with == ["google_drive"]
+    fake_client.link.assert_called_once_with(
+        refresh_token="token",
+        access_token=None,
+        allow_plaintext_keyring=False,
+    )
 
 
 def test_config_cleanup_keeps_unlinked_recovery_journal(

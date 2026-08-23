@@ -4,8 +4,11 @@ import base64
 import hashlib
 import io
 import json
+import os
 from collections.abc import Mapping
+from dataclasses import replace
 from datetime import timezone
+from types import SimpleNamespace
 from typing import Any
 from urllib.error import HTTPError
 from urllib.parse import parse_qs, urlparse
@@ -14,17 +17,23 @@ from urllib.request import urlopen
 import pytest
 import requests
 
+from maestral.config import MaestralConfig, remove_configuration
+from maestral.core import DeletedMetadata, FileMetadata, FolderMetadata, WriteMode
+from maestral.exceptions import UnsupportedProviderOperationError
 from maestral.providers.google_drive import (
     GOOGLE_DRIVE_SCOPE,
     DriveChange,
     DriveItem,
     DriveProjection,
+    GoogleAbout,
     GoogleDriveClient,
     GoogleDriveError,
+    GoogleDriveProvider,
     GoogleOAuth,
     GoogleOAuthLoopback,
     GoogleTokens,
 )
+from maestral.sync import SyncEngine
 
 
 class FakeSession:
@@ -482,3 +491,461 @@ def test_client_rejects_non_google_resumable_urls() -> None:
     client, _session, _saved = client_with_responses()
     with pytest.raises(ValueError):
         client.upload_resumable("https://example.com/upload/file", io.BytesIO(), 0)
+
+
+class FakeDriveAPI:
+    """Stateful fake for provider-level and sync-level Drive tests."""
+
+    def __init__(self, items: list[DriveItem], blobs: Mapping[str, bytes]) -> None:
+        self.root = drive_item(
+            "root-id",
+            "My Drive",
+            parent=None,
+            mime_type="application/vnd.google-apps.folder",
+        )
+        self.items = {item.id: item for item in items}
+        self.blobs = dict(blobs)
+        self.changes: list[DriveChange] = []
+        self.tokens: dict[str, int] = {}
+        self.generated_ids: list[str] = []
+        self.uploads: dict[str, tuple[str, str, str, int]] = {}
+        self.fail_upload = False
+        self._next_id = 1
+
+    def _token(self, offset: int) -> str:
+        token = f"opaque/{offset}+= cursor"
+        self.tokens[token] = offset
+        return token
+
+    def _record(self, change: DriveChange) -> None:
+        self.changes.append(change)
+
+    def get_root(self) -> DriveItem:
+        return self.root
+
+    def get_about(self) -> GoogleAbout:
+        return GoogleAbout(
+            "account-id",
+            "Drive User",
+            "drive@example.com",
+            None,
+            12,
+            100,
+        )
+
+    def list_all_items(self) -> list[DriveItem]:
+        return list(self.items.values())
+
+    def get_start_page_token(self) -> str:
+        return self._token(len(self.changes))
+
+    def list_changes(self, page_token: str):
+        from maestral.providers.google_drive import DriveChangePage
+
+        offset = self.tokens[page_token]
+        return DriveChangePage(
+            tuple(self.changes[offset:]),
+            None,
+            self._token(len(self.changes)),
+        )
+
+    def download_blob(
+        self,
+        file_id: str,
+        destination: Any,
+        progress: Any = None,
+    ) -> DriveItem:
+        destination.write(self.blobs[file_id])
+        if progress:
+            progress(destination.tell())
+        return self.items[file_id]
+
+    def generate_file_id(self) -> str:
+        file_id = f"generated-{self._next_id}"
+        self._next_id += 1
+        self.generated_ids.append(file_id)
+        return file_id
+
+    def create_folder(self, name: str, parent_id: str) -> DriveItem:
+        file_id = self.generate_file_id()
+        item = drive_item(
+            file_id,
+            name,
+            parent=parent_id,
+            mime_type="application/vnd.google-apps.folder",
+        )
+        self.items[file_id] = item
+        self._record(DriveChange(file_id, False, item, None))
+        return item
+
+    def delete_item(self, file_id: str) -> None:
+        self.items.pop(file_id)
+        self.blobs.pop(file_id, None)
+        self._record(DriveChange(file_id, True, None, None))
+
+    def move_item(
+        self,
+        file_id: str,
+        *,
+        old_parent_id: str,
+        new_parent_id: str,
+        new_name: str,
+    ) -> DriveItem:
+        item = self.items[file_id]
+        assert item.parent_id == old_parent_id
+        moved = replace(
+            item,
+            name=new_name,
+            parent_id=new_parent_id,
+            version=str(int(item.version) + 1),
+        )
+        self.items[file_id] = moved
+        self._record(DriveChange(file_id, False, moved, None))
+        return moved
+
+    def start_resumable_upload(
+        self,
+        *,
+        name: str,
+        parent_id: str,
+        mime_type: str,
+        size: int,
+        file_id: str | None = None,
+    ) -> str:
+        file_id = file_id or self.generate_file_id()
+        session = f"fake-session-{len(self.uploads)}"
+        self.uploads[session] = (file_id, name, parent_id, size)
+        return session
+
+    def upload_resumable(
+        self,
+        session_url: str,
+        source: Any,
+        size: int,
+        *,
+        offset: int = 0,
+        chunk_size: int = 8 * 1024 * 1024,
+        progress: Any = None,
+    ) -> DriveItem:
+        del offset, chunk_size
+        if self.fail_upload:
+            raise GoogleDriveError("Fake upload failed", "The fake rejected the data.")
+        file_id, name, parent_id, expected_size = self.uploads[session_url]
+        assert size == expected_size
+        data = source.read()
+        assert len(data) == size
+        old = self.items.get(file_id)
+        if old is not None:
+            parent_id = old.parent_id or parent_id
+            version = str(int(old.version) + 1)
+        else:
+            version = "1"
+        item = drive_item(
+            file_id,
+            name,
+            parent=parent_id,
+            version=version,
+            size=str(size),
+            md5Checksum=hashlib.md5(data, usedforsecurity=False).hexdigest(),
+        )
+        self.items[file_id] = item
+        self.blobs[file_id] = data
+        self._record(DriveChange(file_id, False, item, None))
+        if progress:
+            progress(size)
+        return item
+
+    def external_move(self, file_id: str, parent_id: str, name: str) -> DriveItem:
+        item = self.items[file_id]
+        return self.move_item(
+            file_id,
+            old_parent_id=item.parent_id or "root-id",
+            new_parent_id=parent_id,
+            new_name=name,
+        )
+
+    def external_update(self, file_id: str, data: bytes) -> DriveItem:
+        item = self.items[file_id]
+        updated = replace(
+            item,
+            size=len(data),
+            md5_checksum=hashlib.md5(data, usedforsecurity=False).hexdigest(),
+            version=str(int(item.version) + 1),
+        )
+        self.items[file_id] = updated
+        self.blobs[file_id] = data
+        self._record(DriveChange(file_id, False, updated, None))
+        return updated
+
+
+def provider_with_fake_api(
+    config_name: str,
+    api: FakeDriveAPI,
+) -> GoogleDriveProvider:
+    credentials = SimpleNamespace(account_id="account-id", token=None)
+    return GoogleDriveProvider(
+        config_name,
+        credentials,  # type: ignore[arg-type]
+        drive_client=api,  # type: ignore[arg-type]
+        client_id="desktop-client",
+        sleep=lambda _delay: None,
+    )
+
+
+def test_provider_initial_listing_projects_duplicates_and_native_stubs(
+    config_name: str,
+) -> None:
+    first = drive_item("first", "Same.txt", md5Checksum="a" * 32)
+    second = drive_item("second", "same.TXT", md5Checksum="b" * 32)
+    native = drive_item(
+        "native",
+        "Plan",
+        mime_type="application/vnd.google-apps.document",
+        webViewLink="https://docs.google.com/document/d/native/edit",
+    )
+    api = FakeDriveAPI([first, second, native], {})
+    provider = provider_with_fake_api(config_name, api)
+
+    result = provider.list_folder("/", recursive=True)
+    paths = {entry.id: entry.path_display for entry in result.entries}  # type: ignore[attr-defined]
+    assert "(Drive " in paths["first"]
+    assert "(Drive " in paths["second"]
+    assert paths["native"] == "/Plan.gdoc"
+    assert result.cursor.startswith("opaque/")
+
+    destination = io.BytesIO()
+    metadata = provider.download("/Plan.gdoc", destination)
+    assert json.loads(destination.getvalue())["readOnly"] is True
+    assert (
+        metadata.content_hash
+        == hashlib.md5(destination.getvalue(), usedforsecurity=False).hexdigest()
+    )
+
+
+def test_provider_upload_download_move_delete_and_failure_rollback(
+    config_name: str,
+) -> None:
+    api = FakeDriveAPI([], {})
+    provider = provider_with_fake_api(config_name, api)
+    provider.list_folder("/", recursive=True)
+
+    uploaded = provider.upload(io.BytesIO(b"hello"), "/New.txt")
+    assert uploaded.id == api.generated_ids[-1]
+    assert (
+        uploaded.content_hash
+        == hashlib.md5(b"hello", usedforsecurity=False).hexdigest()
+    )
+    downloaded = io.BytesIO()
+    assert provider.download("/New.txt", downloaded).id == uploaded.id
+    assert downloaded.getvalue() == b"hello"
+
+    moved = provider.move("/New.txt", "/Moved.txt")
+    assert moved.id == uploaded.id
+    assert moved.path_display == "/Moved.txt"
+    removed = provider.remove("/Moved.txt", parent_rev=moved.rev)
+    assert removed.id == uploaded.id
+    assert provider.get_metadata("/Moved.txt") is None
+
+    before = provider._ensure_projection().projected_items()
+    api.fail_upload = True
+    with pytest.raises(GoogleDriveError, match="Fake upload failed"):
+        provider.upload(io.BytesIO(b"failed"), "/Failed.txt", WriteMode.Add)
+    assert provider._ensure_projection().projected_items() == before
+
+
+def test_provider_resumes_opaque_cursor_and_emits_identity_move(
+    config_name: str,
+) -> None:
+    note = drive_item("note", "Note.txt", md5Checksum="a" * 32)
+    folder = drive_item(
+        "folder",
+        "Folder",
+        mime_type="application/vnd.google-apps.folder",
+    )
+    api = FakeDriveAPI([note, folder], {"note": b"note"})
+    provider = provider_with_fake_api(config_name, api)
+    initial = provider.list_folder("/", recursive=True)
+    indexed = {
+        entry.id: entry.path_display
+        for entry in initial.entries
+        if isinstance(entry, (FileMetadata, FolderMetadata))
+    }
+
+    api.external_move("note", "folder", "Moved.txt")
+    resumed_provider = provider_with_fake_api(config_name, api)
+    pages = list(resumed_provider.list_remote_changes_iterator(initial.cursor, indexed))
+    assert len(pages) == 1
+    assert pages[0].cursor != initial.cursor
+    assert any(
+        isinstance(entry, DeletedMetadata) and entry.path_display == "/Note.txt"
+        for entry in pages[0].entries
+    )
+    moved = next(entry for entry in pages[0].entries if isinstance(entry, FileMetadata))
+    assert moved.id == "note"
+    assert moved.path_display == "/Folder/Moved.txt"
+
+
+def test_provider_folder_move_reprojects_the_full_subtree(config_name: str) -> None:
+    folder = drive_item(
+        "folder",
+        "Old",
+        mime_type="application/vnd.google-apps.folder",
+    )
+    child = drive_item(
+        "child",
+        "Child.txt",
+        parent="folder",
+        md5Checksum="a" * 32,
+    )
+    api = FakeDriveAPI([folder, child], {"child": b"child"})
+    provider = provider_with_fake_api(config_name, api)
+    initial = provider.list_folder("/", recursive=True)
+    indexed = {
+        entry.id: entry.path_display
+        for entry in initial.entries
+        if isinstance(entry, (FileMetadata, FolderMetadata))
+    }
+
+    api.external_move("folder", "root-id", "New")
+    page = next(provider.list_remote_changes_iterator(initial.cursor, indexed))
+
+    assert {
+        entry.path_display
+        for entry in page.entries
+        if isinstance(entry, DeletedMetadata)
+    } == {"/Old", "/Old/Child.txt"}
+    assert {
+        entry.path_display
+        for entry in page.entries
+        if isinstance(entry, (FileMetadata, FolderMetadata))
+    } == {"/New", "/New/Child.txt"}
+
+
+def test_provider_native_stub_rejects_content_updates(config_name: str) -> None:
+    native = drive_item(
+        "native",
+        "Plan",
+        mime_type="application/vnd.google-apps.document",
+    )
+    provider = provider_with_fake_api(config_name, FakeDriveAPI([native], {}))
+    provider.list_folder("/", recursive=True)
+
+    with pytest.raises(Exception, match="read-only"):
+        provider.upload(
+            io.BytesIO(b"changed"),
+            "/Plan.gdoc",
+            WriteMode.Update,
+            update_rev="1",
+        )
+
+
+def test_provider_saves_refreshed_tokens_through_scoped_storage(
+    config_name: str,
+) -> None:
+    credentials = SimpleNamespace(account_id="account-id", token=None)
+    saved: list[tuple[str, str, bool]] = []
+
+    def save_creds(account_id: str, token: str, allow_plaintext: bool = False) -> None:
+        saved.append((account_id, token, allow_plaintext))
+
+    credentials.save_creds = save_creds  # type: ignore[attr-defined]
+    provider = GoogleDriveProvider(
+        config_name,
+        credentials,  # type: ignore[arg-type]
+        drive_client=FakeDriveAPI([], {}),  # type: ignore[arg-type]
+        client_id="desktop-client",
+    )
+    refreshed = GoogleTokens("new-access", "saved-refresh", 9999, GOOGLE_DRIVE_SCOPE)
+
+    provider._save_refreshed_tokens(refreshed)
+
+    assert saved == [("account-id", refreshed.to_json(), True)]
+
+
+def test_provider_account_space_and_unsupported_optional_apis(
+    config_name: str,
+) -> None:
+    provider = provider_with_fake_api(config_name, FakeDriveAPI([], {}))
+
+    account = provider.get_account_info()
+    usage = provider.get_space_usage()
+
+    assert account.account_id == "account-id"
+    assert account.email == "drive@example.com"
+    assert account.root_info.root_namespace_id == "root-id"
+    assert usage.used == 12
+    assert usage.allocated == 100
+    with pytest.raises(UnsupportedProviderOperationError):
+        provider.list_revisions("/File.txt")
+    with pytest.raises(UnsupportedProviderOperationError):
+        provider.create_shared_link("/File.txt")
+
+
+def test_provider_requires_explicit_google_client_id(
+    config_name: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("MAESTRAL_GOOGLE_CLIENT_ID", raising=False)
+    credentials = SimpleNamespace(account_id=None, token=None)
+    provider = GoogleDriveProvider(config_name, credentials)  # type: ignore[arg-type]
+
+    with pytest.raises(GoogleDriveError, match="MAESTRAL_GOOGLE_CLIENT_ID"):
+        provider.get_auth_url()
+
+
+def test_sync_engine_initial_index_and_local_upload_use_drive_md5(
+    config_name: str,
+    tmp_path: Any,
+) -> None:
+    data = b"remote data"
+    remote = drive_item(
+        "remote",
+        "Remote.txt",
+        size=str(len(data)),
+        md5Checksum=hashlib.md5(data, usedforsecurity=False).hexdigest(),
+    )
+    api = FakeDriveAPI([remote], {"remote": data})
+    MaestralConfig(config_name).set("auth", "provider", "google_drive")
+    provider = provider_with_fake_api(config_name, api)
+    sync = SyncEngine(provider)
+    root = tmp_path / "Drive"
+    root.mkdir()
+    sync.dropbox_path = os.fspath(root)
+    sync.create_root_marker()
+    try:
+        sync.download_sync_cycle()
+        assert (root / "Remote.txt").read_bytes() == data
+        assert sync._state.get("sync", "cursors") == {
+            "google_drive": sync.remote_cursor
+        }
+        assert sync._state.get("sync", "cursor") == ""
+        entry = sync.get_index_entry("/remote.txt")
+        assert entry is not None
+        assert entry.provider_id == "remote"
+        assert (
+            entry.content_hash == hashlib.md5(data, usedforsecurity=False).hexdigest()
+        )
+
+        (root / "Local.txt").write_bytes(b"local data")
+        sync.upload_local_changes_while_inactive()
+        uploaded = provider.get_metadata("/Local.txt")
+        assert isinstance(uploaded, FileMetadata)
+        assert (
+            uploaded.content_hash
+            == hashlib.md5(b"local data", usedforsecurity=False).hexdigest()
+        )
+
+        api.external_move("remote", "root-id", "Moved remote.txt")
+        api.external_update("remote", b"updated remote data")
+        sync.download_sync_cycle()
+        assert not (root / "Remote.txt").exists()
+        assert (root / "Moved remote.txt").read_bytes() == b"updated remote data"
+        assert sync.get_index_entry("/moved remote.txt").provider_id == "remote"  # type: ignore[union-attr]
+
+        api.delete_item("remote")
+        sync.download_sync_cycle()
+        assert not (root / "Moved remote.txt").exists()
+        assert sync.get_index_entry("/moved remote.txt") is None
+    finally:
+        sync._connection.close()
+        remove_configuration(config_name)

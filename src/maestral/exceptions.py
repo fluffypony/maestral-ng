@@ -105,7 +105,11 @@ class NotAFolderError(SyncError):
     """Raised when a folder is required but a file is provided."""
 
 
-class DropboxServerError(SyncError):
+class ProviderServerError(SyncError):
+    """Raised when a remote provider reports a temporary server failure."""
+
+
+class DropboxServerError(ProviderServerError):
     """Raised in case of internal Dropbox errors."""
 
 
@@ -136,7 +140,11 @@ class SymlinkError(SyncError):
 # ==== errors which are not related to a specific sync event ===========================
 
 
-class DropboxConnectionError(MaestralApiError):
+class ProviderConnectionError(MaestralApiError):
+    """Raised when a connection to the selected remote provider fails."""
+
+
+class DropboxConnectionError(ProviderConnectionError):
     """Raised when the connection to Dropbox fails"""
 
 
@@ -207,6 +215,10 @@ class BusyError(MaestralApiError):
 
 class UnsupportedFileTypeForDiff(MaestralApiError):
     """Raised when a diff for an unsupported file type was issued."""
+
+
+class UnsupportedProviderOperationError(MaestralApiError):
+    """Raised when the selected provider does not implement an optional operation."""
 
 
 class SharedLinkError(MaestralApiError):

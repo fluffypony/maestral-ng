@@ -932,13 +932,13 @@ def test_rooted_delete_uses_deterministic_quarantine(monkeypatch, tmp_path):
     if platform.system() == "Windows":
         real_snapshot_opened = path_module._windows_snapshot_opened
 
-        def checked_snapshot_opened(path, handle, info):
+        def checked_snapshot_opened(path, handle, info, content_hasher_factory):
             nonlocal snapshot_in_quarantine
             if os.path.normcase(path) == os.path.normcase(str(quarantine)):
                 snapshot_in_quarantine = True
                 assert not tree.exists()
                 assert quarantine.exists()
-            return real_snapshot_opened(path, handle, info)
+            return real_snapshot_opened(path, handle, info, content_hasher_factory)
 
         monkeypatch.setattr(
             path_module,
@@ -948,13 +948,18 @@ def test_rooted_delete_uses_deterministic_quarantine(monkeypatch, tmp_path):
     else:
         real_snapshot_at = path_module._posix_snapshot_at
 
-        def checked_snapshot_at(parent_fd, name, absolute_path):
+        def checked_snapshot_at(parent_fd, name, absolute_path, content_hasher_factory):
             nonlocal snapshot_in_quarantine
             if name == quarantine.name:
                 snapshot_in_quarantine = True
                 assert not tree.exists()
                 assert quarantine.exists()
-            return real_snapshot_at(parent_fd, name, absolute_path)
+            return real_snapshot_at(
+                parent_fd,
+                name,
+                absolute_path,
+                content_hasher_factory,
+            )
 
         monkeypatch.setattr(
             path_module,

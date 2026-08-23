@@ -66,7 +66,6 @@ from watchdog.events import (
 )
 
 # local imports
-from .client import DropboxClient
 from .config import MaestralConfig, MaestralState
 from .constants import (
     CASE_CHANGE_TEMP_PREFIX,
@@ -130,6 +129,7 @@ from .models import (
     SyncEvent,
     SyncStatus,
 )
+from .providers.base import RemoteProvider
 from .utils import exc_info_tuple, sanitize_string
 from .utils.appdirs import get_data_path
 from .utils.caches import LRUCache
@@ -652,7 +652,7 @@ class SyncEngine:
 
     def __init__(
         self,
-        client: DropboxClient,
+        client: RemoteProvider,
         event_callback: Callable[[Sequence[SyncEvent]], None] | None = None,
     ) -> None:
         self.client = client
@@ -665,6 +665,7 @@ class SyncEngine:
 
         self._conf = MaestralConfig(self.config_name)
         self._state = MaestralState(self.config_name)
+        self._migrate_remote_cursor()
         self.reload_cached_config()
 
         self.event_callback = event_callback
@@ -802,7 +803,7 @@ class SyncEngine:
 
         path = osp.normpath(osp.abspath(osp.expanduser(path)))
         if expected_root_identity is not None:
-            rooted_item_snapshot(
+            self._snapshot_local_item(
                 path,
                 path,
                 expected_root_identity=expected_root_identity,
@@ -819,7 +820,7 @@ class SyncEngine:
             self._publish_dropbox_path(path, expected_root_identity)
 
         if expected_root_identity is not None:
-            rooted_item_snapshot(
+            self._snapshot_local_item(
                 path,
                 path,
                 expected_root_identity=expected_root_identity,
@@ -1142,7 +1143,7 @@ class SyncEngine:
         """Read one recovery path identity and propagate uncertain I/O errors."""
         local_path = self.to_local_path_from_cased(dbx_path_cased)
         try:
-            return rooted_item_snapshot(
+            return self._snapshot_local_item(
                 local_path,
                 self.dropbox_path,
                 expected_root_identity=self.confirmed_root_identity,
@@ -1658,9 +1659,25 @@ class SyncEngine:
                 local_path,
                 self.dropbox_path,
                 expected_root_identity=self.confirmed_root_identity,
+                content_hasher_factory=self.client.content_hasher_factory,
             )
         except (FileNotFoundError, NotADirectoryError):
             return {}
+
+    def _snapshot_local_item(
+        self,
+        local_path: str,
+        root_path: str,
+        *,
+        expected_root_identity: tuple[int, ...] | None = None,
+    ) -> TreeSnapshotIdentity:
+        """Capture one item with the selected provider's content hash."""
+        return rooted_item_snapshot(
+            local_path,
+            root_path,
+            expected_root_identity=expected_root_identity,
+            content_hasher_factory=self.client.content_hasher_factory,
+        )
 
     def _stable_download_conflict(
         self, event: SyncEvent
@@ -2129,7 +2146,7 @@ class SyncEngine:
             )
 
         try:
-            actual_identity = rooted_item_snapshot(
+            actual_identity = self._snapshot_local_item(
                 local_path,
                 self.dropbox_path,
                 expected_root_identity=self.confirmed_root_identity,
@@ -2257,7 +2274,7 @@ class SyncEngine:
                 changed = changed or child_result.changed
                 if changed and record_partial_failure:
                     try:
-                        current_identity = rooted_item_snapshot(
+                        current_identity = self._snapshot_local_item(
                             local_path,
                             self.dropbox_path,
                             expected_root_identity=self.confirmed_root_identity,
@@ -2476,17 +2493,56 @@ class SyncEngine:
 
     @property
     def remote_cursor(self) -> str:
-        """Cursor from last sync with remote Dropbox. The value is updated and saved to
-        the config file on every successful download of remote changes."""
-        return self._state.get("sync", "cursor")
+        """Opaque cursor from the last sync with the selected provider."""
+        cursors = self._state.get("sync", "cursors")
+        if not isinstance(cursors, dict) or any(
+            not isinstance(key, str) or not isinstance(value, str)
+            for key, value in cursors.items()
+        ):
+            raise ValueError("The provider cursor state is invalid")
+        return cursors.get(self.client.provider_id, "")
 
     @remote_cursor.setter
     def remote_cursor(self, cursor: str) -> None:
         """Setter: last_cursor"""
+        if not isinstance(cursor, str):
+            raise TypeError("The remote cursor must be a string")
         with self.sync_lock:
-            self._state.set("sync", "cursor", cursor)
+            cursors = self._state.get("sync", "cursors")
+            if not isinstance(cursors, dict):
+                raise ValueError("The provider cursor state is invalid")
+            updated_cursors = cursors.copy()
+            updated_cursors[self.client.provider_id] = cursor
+            with self._state._lock:
+                snapshot = self._state._configuration_snapshot()
+                save_generation = self._state.save_generation
+                try:
+                    self._state.set("sync", "cursors", updated_cursors, save=False)
+                    if self.client.provider_id == "dropbox":
+                        self._state.set("sync", "cursor", cursor, save=False)
+                    self._state.save()
+                except BaseException:
+                    if not self._state.save_committed_since(save_generation):
+                        self._state._restore_configuration_snapshot(snapshot)
+                    raise
 
         self._logger.debug("Remote cursor saved: %s", cursor)
+
+    def _migrate_remote_cursor(self) -> None:
+        """Move the legacy Dropbox cursor to provider-scoped state once."""
+        cursors = self._state.get("sync", "cursors")
+        legacy_cursor = self._state.get("sync", "cursor")
+        if not isinstance(cursors, dict):
+            raise ValueError("The provider cursor state is invalid")
+        if (
+            self.client.provider_id == "dropbox"
+            and isinstance(legacy_cursor, str)
+            and legacy_cursor
+            and "dropbox" not in cursors
+        ):
+            migrated = cursors.copy()
+            migrated["dropbox"] = legacy_cursor
+            self._state.set("sync", "cursors", migrated)
 
     @property
     def local_cursor(self) -> float:
@@ -2556,6 +2612,19 @@ class SyncEngine:
             raise ValueError("The sync reset journal is invalid")
         kind = journal.get("kind")
         phase = journal.get("phase")
+        # Remove this one-shot upgrade after pre-provider state files are unsupported.
+        legacy_unlink_keys = {
+            "kind",
+            "phase",
+            "account_id",
+            "keyring",
+            "credentials_deleted",
+            "root_path",
+            "root_marker_id",
+        }
+        if kind == "unlink" and set(journal) == legacy_unlink_keys:
+            journal["provider"] = "dropbox"
+            self._state.set("recovery", "sync_reset", journal)
         if kind == "sync":
             if set(journal) != {"kind", "phase"} or phase not in {
                 "pending",
@@ -2568,6 +2637,7 @@ class SyncEngine:
                 != {
                     "kind",
                     "phase",
+                    "provider",
                     "account_id",
                     "keyring",
                     "credentials_deleted",
@@ -2575,6 +2645,7 @@ class SyncEngine:
                     "root_marker_id",
                 }
                 or phase not in {"pending", "config", "queue"}
+                or journal.get("provider") not in {"dropbox", "google_drive"}
                 or not isinstance(journal.get("account_id"), str)
                 or not isinstance(journal.get("keyring"), str)
                 or not isinstance(journal.get("credentials_deleted"), bool)
@@ -2616,6 +2687,7 @@ class SyncEngine:
         self,
         kind: str,
         *,
+        provider: str = "",
         account_id: str = "",
         keyring: str = "automatic",
         root_path: str = "",
@@ -2633,7 +2705,10 @@ class SyncEngine:
                     self._ensure_unlink_recovery_clear()
                 journal = {"kind": kind, "phase": "pending"}
                 if kind == "unlink":
+                    if provider not in {"dropbox", "google_drive"}:
+                        raise ValueError("The unlink provider is invalid")
                     journal.update(
+                        provider=provider,
                         account_id=account_id,
                         keyring=keyring,
                         credentials_deleted=False,
@@ -3075,7 +3150,10 @@ class SyncEngine:
                 return cache_entry.hash_str
 
         with convert_api_errors(local_path=local_path):
-            hash_str, mtime = content_hash(local_path)
+            hash_str, mtime = content_hash(
+                local_path,
+                content_hasher_factory=self.client.content_hasher_factory,
+            )
 
         self._save_local_hash(stat.st_ino, local_path, hash_str, mtime)
 
@@ -3298,7 +3376,7 @@ class SyncEngine:
                 os.fsync(marker_file.fileno())
 
             temp_file.close()
-            temp_identity = rooted_item_snapshot(
+            temp_identity = self._snapshot_local_item(
                 temp_file.path,
                 self.dropbox_path,
                 expected_root_identity=self.confirmed_root_identity,
@@ -3443,6 +3521,7 @@ class SyncEngine:
                             expected_root_identity=self.confirmed_root_identity,
                             expected_target_identity=cache_snapshot[child_path][:6],
                             expected_tree_snapshot=child_snapshot,
+                            content_hasher_factory=(self.client.content_hasher_factory),
                         )
                 rooted_rmdir(
                     self._file_cache_path,
@@ -3637,7 +3716,7 @@ class SyncEngine:
         """Reserve and journal an internal path before moving local data."""
         self.ensure_cache_dir_present()
         source_identity = list(
-            rooted_item_snapshot(
+            self._snapshot_local_item(
                 local_path,
                 self.dropbox_path,
                 expected_root_identity=self.confirmed_root_identity,
@@ -3972,6 +4051,9 @@ class SyncEngine:
                                 expected_target_identity=held_identity[:6],
                                 expected_tree_snapshot=held_snapshot,
                                 quarantine_path=discard_path,
+                                content_hasher_factory=(
+                                    self.client.content_hasher_factory
+                                ),
                             )
                         except OSError as deletion_error:
                             backup_snapshot = self._snapshot_local_tree(backup_path)
@@ -4641,7 +4723,7 @@ class SyncEngine:
             skip_local_access=True,
         )
         try:
-            identity = rooted_item_snapshot(
+            identity = self._snapshot_local_item(
                 event.local_path,
                 self.dropbox_path,
                 expected_root_identity=self.confirmed_root_identity,
@@ -5827,7 +5909,7 @@ class SyncEngine:
                 local_path=event.local_path,
             )
 
-        hasher = DropboxContentHasher()
+        hasher = self.client.content_hasher_factory()
         file.seek(0)
         while data := file.read(1024 * 1024):
             hasher.update(data)
@@ -5849,7 +5931,7 @@ class SyncEngine:
     ) -> bool:
         """Return whether the rooted upload name still identifies the held file."""
         try:
-            current_identity = rooted_item_snapshot(
+            current_identity = self._snapshot_local_item(
                 event.local_path,
                 self.dropbox_path,
                 expected_root_identity=self.confirmed_root_identity,
@@ -5923,7 +6005,7 @@ class SyncEngine:
                             )
                         ):
                             try:
-                                current_identity = rooted_item_snapshot(
+                                current_identity = self._snapshot_local_item(
                                     event.local_path,
                                     self.dropbox_path,
                                     expected_root_identity=(
@@ -6014,7 +6096,7 @@ class SyncEngine:
         )
         if needs_rescan:
             try:
-                current_identity = rooted_item_snapshot(
+                current_identity = self._snapshot_local_item(
                     event.local_path,
                     self.dropbox_path,
                     expected_root_identity=self.confirmed_root_identity,
@@ -6124,7 +6206,7 @@ class SyncEngine:
                         event.dbx_path,
                     )
                     try:
-                        current_identity = rooted_item_snapshot(
+                        current_identity = self._snapshot_local_item(
                             event.local_path,
                             self.dropbox_path,
                             expected_root_identity=self.confirmed_root_identity,
@@ -6269,7 +6351,7 @@ class SyncEngine:
             return SyncStatus.Conflict
 
         try:
-            rooted_item_snapshot(
+            self._snapshot_local_item(
                 event.local_path,
                 self.dropbox_path,
                 expected_root_identity=self.confirmed_root_identity,
@@ -6795,7 +6877,13 @@ class SyncEngine:
             # Pick up where we left off. This may be an interrupted indexing /
             # pagination through changes or a completely new set of changes.
             self._logger.debug("Fetching remote changes since cursor: %s", last_cursor)
-            changes_iter = self.client.list_remote_changes_iterator(last_cursor)
+            indexed_paths = {
+                entry.provider_id: entry.dbx_path_cased for entry in self.iter_index()
+            }
+            changes_iter = self.client.list_remote_changes_iterator(
+                last_cursor,
+                indexed_paths=indexed_paths,
+            )
 
         for changes in changes_iter:
             changes = self._clean_remote_changes(changes)
@@ -7763,9 +7851,11 @@ class SyncEngine:
                 with self._parallel_down_semaphore:
                     with tmp_file.open("wb") as download_file:
                         md = self.client.download(
-                            f"rev:{event.rev}",
+                            event.dbx_path,
                             download_file,
                             sync_event=event,
+                            rev=event.rev,
+                            provider_id=event.dbx_id,
                         )
                 event = SyncEvent.from_metadata(md, self)
             except SyncError as err:
@@ -7889,7 +7979,7 @@ class SyncEngine:
                     if not tmp_file.closed:
                         with tmp_file.open("rb") as staged_file:
                             initial_tmp_identity = self._open_file_identity(staged_file)
-                            hasher = DropboxContentHasher()
+                            hasher = self.client.content_hasher_factory()
                             while data := staged_file.read(1024 * 1024):
                                 hasher.update(data)
                             expected_tmp_identity = self._open_file_identity(
@@ -7905,7 +7995,7 @@ class SyncEngine:
                                 "Downloaded file changed before installation"
                             )
                     else:
-                        tmp_identity = rooted_item_snapshot(
+                        tmp_identity = self._snapshot_local_item(
                             tmp_fname,
                             self.dropbox_path,
                             expected_root_identity=self.confirmed_root_identity,
@@ -7942,7 +8032,7 @@ class SyncEngine:
                             "Cannot track downloaded file",
                             "The local publication reservation changed.",
                         )
-                    installed_identity = rooted_item_snapshot(
+                    installed_identity = self._snapshot_local_item(
                         event.local_path,
                         self.dropbox_path,
                         expected_root_identity=self.confirmed_root_identity,
@@ -8588,7 +8678,7 @@ class SyncEngine:
             return None
         try:
             return list(
-                rooted_item_snapshot(
+                self._snapshot_local_item(
                     local_path,
                     self.dropbox_path,
                     expected_root_identity=self.confirmed_root_identity,
@@ -8807,7 +8897,7 @@ class SyncEngine:
         self._logger.debug('Rescanning "%s"', local_path)
 
         try:
-            local_identity = rooted_item_snapshot(
+            local_identity = self._snapshot_local_item(
                 local_path,
                 self.dropbox_path,
                 expected_root_identity=self.confirmed_root_identity,
@@ -8847,7 +8937,7 @@ class SyncEngine:
             for entry in entries:
                 child_path = self.to_local_path_from_cased(entry.dbx_path_cased)
                 try:
-                    rooted_item_snapshot(
+                    self._snapshot_local_item(
                         child_path,
                         self.dropbox_path,
                         expected_root_identity=self.confirmed_root_identity,
@@ -8909,7 +8999,7 @@ class SyncEngine:
             return
 
         try:
-            identity = rooted_item_snapshot(
+            identity = self._snapshot_local_item(
                 local_path,
                 self.dropbox_path,
                 expected_root_identity=self.confirmed_root_identity,

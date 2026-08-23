@@ -136,7 +136,7 @@ def link_dialog(
     m: MaestralClient | Maestral, allow_plaintext_keyring: bool = False
 ) -> None:
     """
-    A CLI dialog for linking a Dropbox account.
+    A CLI dialog for linking the selected remote provider.
 
     :param m: Client for the Maestral daemon.
     :param allow_plaintext_keyring: Whether to allow storage of the refresh token in
@@ -145,10 +145,12 @@ def link_dialog(
     authorize_url = m.get_auth_url()
 
     info(f"Linking new account for '{m.config_name}' config")
-    info("Retrieving auth code from Dropbox")
+    provider = m.provider
+    provider_name = "Google Drive" if provider == "google_drive" else "Dropbox"
+    info(f"Authorizing {provider_name}")
     choice = select(
         "How would you like to you link your account?",
-        options=["Open Dropbox website", "Print auth URL to console"],
+        options=[f"Open {provider_name} website", "Print auth URL to console"],
     )
 
     if choice == 0:
@@ -156,6 +158,17 @@ def link_dialog(
     else:
         info("Open the URL below to retrieve an auth code:")
         info(authorize_url)
+
+    if provider == "google_drive":
+        res = m.link(allow_plaintext_keyring=allow_plaintext_keyring)
+        if res == 0:
+            email = m.get_state("account", "email")
+            ok(f"Linked to {email}")
+        elif res == 1:
+            warn("Google rejected the authorization response")
+        else:
+            warn("Could not connect to Google Drive")
+        return
 
     res = -1
     while res != 0:
@@ -298,12 +311,17 @@ def resume(m: Maestral) -> None:
         ok("Syncing resumed.")
 
 
-@click.group(help="Link, unlink and view the Dropbox account.")
+@click.group(help="Link, unlink and view the remote account.")
 def auth() -> None:
     pass
 
 
-@auth.command(name="link", help="Link a new Dropbox account.")
+@auth.command(name="link", help="Link a new remote account.")
+@click.option(
+    "--provider",
+    type=click.Choice(["dropbox", "google-drive"], case_sensitive=False),
+    help="Select the remote storage provider for this configuration.",
+)
 @click.option(
     "--relink",
     "-r",
@@ -327,7 +345,7 @@ def auth() -> None:
     default=False,
     help="Allow plain text token storage if no secure keyring is available.",
 )
-@inject_client(fallback=True, existing_config=False)
+@inject_client(fallback=True, existing_config=False, select_provider=True)
 @convert_api_errors
 def auth_link(
     m: Maestral,
@@ -388,13 +406,15 @@ def auth_status(config_name: str) -> None:
     state = MaestralState(config_name)
 
     dbid = conf.get("auth", "account_id")
+    provider = conf.get("auth", "provider")
     email = state.get("account", "email")
     account_type = state.get("account", "type").capitalize()
 
     echo("")
+    echo(f"Provider:      {provider}")
     echo(f"Email:         {email}")
     echo(f"Account type:  {account_type}")
-    echo(f"Dropbox ID:    {dbid}")
+    echo(f"Account ID:    {dbid}")
     echo("")
 
 

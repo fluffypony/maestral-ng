@@ -44,7 +44,7 @@ except ImportError:  # pragma: no cover - Windows only
 from ..constants import IS_LINUX, IS_WINDOWS, MOVE_TEMP_PREFIX, REMOVE_TEMP_PREFIX
 
 # local imports
-from .hashing import DropboxContentHasher
+from .hashing import ContentHasherFactory, DropboxContentHasher
 
 F_GETPATH = 50
 _WINDOWS_LINK_REPARSE_TAGS = {
@@ -802,6 +802,7 @@ def _posix_delete_expected_at(
     recursive: bool,
     expect_directory: bool | None = None,
     expected_tree_snapshot: dict[str, TreeSnapshotIdentity] | None = None,
+    content_hasher_factory: ContentHasherFactory = DropboxContentHasher,
     quarantine: tuple[int, str, str] | None = None,
 ) -> None:
     """Move an entry out of reach, validate it, and delete only the match."""
@@ -839,6 +840,7 @@ def _posix_delete_expected_at(
                     item_parent_fd,
                     item_name,
                     absolute_path,
+                    content_hasher_factory,
                 )
                 if not _tree_snapshots_match(
                     actual_tree_snapshot,
@@ -997,6 +999,7 @@ def _windows_delete_path(
     expect_directory: bool | None = None,
     expected_target_identity: tuple[int, ...] | None = None,
     expected_tree_snapshot: dict[str, TreeSnapshotIdentity] | None = None,
+    content_hasher_factory: ContentHasherFactory = DropboxContentHasher,
     quarantine_path: str | None = None,
 ) -> None:  # pragma: no cover - Windows only
     handle = -1
@@ -1065,7 +1068,12 @@ def _windows_delete_path(
                 opened_path = path
 
             actual_tree_snapshot = _rebase_tree_snapshot(
-                _windows_snapshot_opened(opened_path, handle, info),
+                _windows_snapshot_opened(
+                    opened_path,
+                    handle,
+                    info,
+                    content_hasher_factory,
+                ),
                 opened_path,
                 path,
             )
@@ -1686,11 +1694,15 @@ def _rebase_tree_snapshot(
 
 
 def _hash_posix_file_at(
-    parent_fd: int, name: str, item_stat: os.stat_result, absolute_path: str
+    parent_fd: int,
+    name: str,
+    item_stat: os.stat_result,
+    absolute_path: str,
+    content_hasher_factory: ContentHasherFactory = DropboxContentHasher,
 ) -> tuple[os.stat_result, str]:
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
     file_fd = os.open(name, flags, dir_fd=parent_fd)
-    hasher = DropboxContentHasher()
+    hasher = content_hasher_factory()
     try:
         opened_stat = os.fstat(file_fd)
         if not _same_stat_identity(item_stat, opened_stat):
@@ -1726,13 +1738,20 @@ def _read_posix_link_at(
 
 
 def _posix_snapshot_at(
-    parent_fd: int, name: str, absolute_path: str
+    parent_fd: int,
+    name: str,
+    absolute_path: str,
+    content_hasher_factory: ContentHasherFactory = DropboxContentHasher,
 ) -> dict[str, TreeSnapshotIdentity]:
     item_stat = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
 
     if stat.S_ISREG(item_stat.st_mode):
         final_stat, content_identity = _hash_posix_file_at(
-            parent_fd, name, item_stat, absolute_path
+            parent_fd,
+            name,
+            item_stat,
+            absolute_path,
+            content_hasher_factory,
         )
         return {
             absolute_path: _snapshot_identity_with_content(final_stat, content_identity)
@@ -1760,7 +1779,14 @@ def _posix_snapshot_at(
         with os.scandir(child_fd) as entries:
             for entry in entries:
                 child_path = osp.join(absolute_path, entry.name)
-                snapshot.update(_posix_snapshot_at(child_fd, entry.name, child_path))
+                snapshot.update(
+                    _posix_snapshot_at(
+                        child_fd,
+                        entry.name,
+                        child_path,
+                        content_hasher_factory,
+                    )
+                )
 
         current_stat = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
         if not _same_snapshot_stat(opened_stat, current_stat):
@@ -1772,9 +1798,13 @@ def _posix_snapshot_at(
     return snapshot
 
 
-def _hash_windows_handle(path: str, handle: int) -> str:  # pragma: no cover
+def _hash_windows_handle(
+    path: str,
+    handle: int,
+    content_hasher_factory: ContentHasherFactory = DropboxContentHasher,
+) -> str:  # pragma: no cover
     kernel32 = _windows_kernel32()
-    hasher = DropboxContentHasher()
+    hasher = content_hasher_factory()
     buffer = ctypes.create_string_buffer(_SNAPSHOT_CHUNK_SIZE)
 
     while True:
@@ -1800,7 +1830,10 @@ def _windows_directory_names(path: str) -> tuple[str, ...]:  # pragma: no cover
 
 
 def _windows_snapshot_opened(
-    path: str, handle: int, info: _WindowsFileAttributeTagInfo
+    path: str,
+    handle: int,
+    info: _WindowsFileAttributeTagInfo,
+    content_hasher_factory: ContentHasherFactory = DropboxContentHasher,
 ) -> dict[str, TreeSnapshotIdentity]:  # pragma: no cover - Windows only
     item_stat = os.lstat(path)
     is_directory = bool(info.file_attributes & _FILE_ATTRIBUTE_DIRECTORY)
@@ -1814,7 +1847,7 @@ def _windows_snapshot_opened(
         return {path: _snapshot_identity_with_content(final_stat, f"symlink:{target}")}
 
     if not is_directory and stat.S_ISREG(item_stat.st_mode):
-        content_identity = _hash_windows_handle(path, handle)
+        content_identity = _hash_windows_handle(path, handle, content_hasher_factory)
         final_stat = os.lstat(path)
 
         if not _same_snapshot_stat(item_stat, final_stat):
@@ -1845,6 +1878,7 @@ def _windows_snapshot_opened(
                         child_path,
                         child_handle,
                         child_info,
+                        content_hasher_factory,
                     )
                 )
 
@@ -1866,6 +1900,7 @@ def _windows_snapshot_item_opened(
     path: str,
     handle: int,
     info: _WindowsFileAttributeTagInfo,
+    content_hasher_factory: ContentHasherFactory = DropboxContentHasher,
 ) -> TreeSnapshotIdentity:  # pragma: no cover - Windows only
     item_stat = os.lstat(path)
     is_directory = bool(info.file_attributes & _FILE_ATTRIBUTE_DIRECTORY)
@@ -1875,7 +1910,7 @@ def _windows_snapshot_item_opened(
         target = _normalize_windows_link_target(os.readlink(path))
         content_identity = f"symlink:{target}"
     elif not is_directory and stat.S_ISREG(item_stat.st_mode):
-        content_identity = _hash_windows_handle(path, handle)
+        content_identity = _hash_windows_handle(path, handle, content_hasher_factory)
     else:
         content_identity = None
 
@@ -1890,6 +1925,7 @@ def rooted_item_snapshot(
     root_path: str,
     *,
     expected_root_identity: tuple[int, ...] | None = None,
+    content_hasher_factory: ContentHasherFactory = DropboxContentHasher,
 ) -> TreeSnapshotIdentity:
     """Snapshot one item below a root without recursing into directories."""
     if _rooted_path_is_root(path, root_path):
@@ -1913,7 +1949,12 @@ def rooted_item_snapshot(
                     expected_root_identity,
                     absolute_root,
                 )
-                return _windows_snapshot_item_opened(absolute_root, handle, info)
+                return _windows_snapshot_item_opened(
+                    absolute_root,
+                    handle,
+                    info,
+                    content_hasher_factory,
+                )
             finally:
                 _close_windows_handle(handle)
 
@@ -1947,7 +1988,12 @@ def rooted_item_snapshot(
                 share_write=False,
             )
             try:
-                return _windows_snapshot_item_opened(absolute_path, handle, info)
+                return _windows_snapshot_item_opened(
+                    absolute_path,
+                    handle,
+                    info,
+                    content_hasher_factory,
+                )
             finally:
                 _close_windows_handle(handle)
 
@@ -1971,6 +2017,7 @@ def rooted_item_snapshot(
                 name,
                 item_stat,
                 absolute_path,
+                content_hasher_factory,
             )
             return _snapshot_identity_with_content(final_stat, content_identity)
 
@@ -2006,6 +2053,7 @@ def rooted_tree_snapshot(
     root_path: str,
     *,
     expected_root_identity: tuple[int, ...] | None = None,
+    content_hasher_factory: ContentHasherFactory = DropboxContentHasher,
 ) -> dict[str, TreeSnapshotIdentity]:
     """Snapshot one tree without following or releasing any of its ancestors.
 
@@ -2025,7 +2073,12 @@ def rooted_tree_snapshot(
                 share_write=False,
             )
             try:
-                return _windows_snapshot_opened(absolute_path, handle, info)
+                return _windows_snapshot_opened(
+                    absolute_path,
+                    handle,
+                    info,
+                    content_hasher_factory,
+                )
             finally:
                 _close_windows_handle(handle)
 
@@ -2034,7 +2087,12 @@ def rooted_tree_snapshot(
         name,
         absolute_path,
     ):
-        return _posix_snapshot_at(parent_fd, name, absolute_path)
+        return _posix_snapshot_at(
+            parent_fd,
+            name,
+            absolute_path,
+            content_hasher_factory,
+        )
 
 
 def delete(
@@ -2047,6 +2105,7 @@ def delete(
     expected_target_identity: tuple[int, ...] | None = None,
     expected_tree_snapshot: dict[str, TreeSnapshotIdentity] | None = None,
     quarantine_path: str | None = None,
+    content_hasher_factory: ContentHasherFactory = DropboxContentHasher,
 ) -> Optional[OSError]:
     """
     Deletes a file or folder at ``path``. Symlinks will not be followed.
@@ -2121,6 +2180,7 @@ def delete(
                         recursive=True,
                         expected_target_identity=target_identity,
                         expected_tree_snapshot=expected_tree_snapshot,
+                        content_hasher_factory=content_hasher_factory,
                         quarantine_path=absolute_quarantine_path,
                     )
             else:
@@ -2170,6 +2230,7 @@ def delete(
                             target_identity,
                             recursive=True,
                             expected_tree_snapshot=expected_tree_snapshot,
+                            content_hasher_factory=content_hasher_factory,
                             quarantine=quarantine,
                         )
         except OSError as exc:
@@ -3102,7 +3163,9 @@ def walk(
 
 
 def content_hash(
-    local_path: str, chunk_size: int = 65536
+    local_path: str,
+    chunk_size: int = 65536,
+    content_hasher_factory: ContentHasherFactory = DropboxContentHasher,
 ) -> Tuple[Optional[str], Optional[float]]:
     """
     Computes content hash of a local file.
@@ -3112,7 +3175,7 @@ def content_hash(
     :returns: Content hash to compare with Dropbox's content hash and mtime just before
         the hash was computed.
     """
-    hasher = DropboxContentHasher()
+    hasher = content_hasher_factory()
 
     try:
         mtime = os.lstat(local_path).st_mtime

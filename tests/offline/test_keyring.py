@@ -250,3 +250,41 @@ def test_delete_error(cred_storage: CredentialStorage) -> None:
     ):
         with pytest.raises(KeyringAccessError):
             cred_storage.delete_creds()
+
+
+def test_provider_scopes_keyring_accessors() -> None:
+    dropbox = CredentialStorage("scoped-config", "dropbox")
+    google = CredentialStorage("scoped-config", "google_drive")
+
+    assert dropbox._get_accessor("account") == ("config:scoped-config:dropbox:account")
+    assert google._get_accessor("account") == (
+        "config:scoped-config:google_drive:account"
+    )
+    remove_configuration("scoped-config")
+
+
+def test_load_migrates_legacy_dropbox_accessor() -> None:
+    storage = CredentialStorage("legacy-config", "dropbox")
+    ring = PlaintextKeyring()
+    ring.get_password = mock.Mock(  # type: ignore[method-assign]
+        side_effect=[None, "legacy-token"]
+    )
+    ring.set_password = mock.Mock()  # type: ignore[method-assign]
+    ring.delete_password = mock.Mock()  # type: ignore[method-assign]
+    storage.set_keyring_backend(ring)
+    MaestralConfig("legacy-config").set("auth", "account_id", "account")
+
+    storage.load_creds()
+
+    assert storage.token == "legacy-token"
+    assert ring.get_password.call_args_list == [
+        mock.call("Maestral", "config:legacy-config:dropbox:account"),
+        mock.call("Maestral", "config:legacy-config:account"),
+    ]
+    ring.set_password.assert_called_once_with(
+        "Maestral", "config:legacy-config:dropbox:account", "legacy-token"
+    )
+    ring.delete_password.assert_called_once_with(
+        "Maestral", "config:legacy-config:account"
+    )
+    remove_configuration("legacy-config")

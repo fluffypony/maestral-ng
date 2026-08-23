@@ -90,7 +90,10 @@ existing_config_option = click.option(
 
 
 def inject_client(
-    fallback: bool, existing_config: bool
+    fallback: bool,
+    existing_config: bool,
+    *,
+    select_provider: bool = False,
 ) -> Callable[[Callable[P, T]], Callable[P, Any]]:
     def decorator(f: Callable[P, T]) -> Callable[P, Any]:
         def wrapper(*args: P.args, **kwargs: P.kwargs) -> Any:
@@ -100,6 +103,28 @@ def inject_client(
 
             config_name = ctx.params.pop("config_name", "maestral")
             kwargs.pop("config_name", None)
+
+            if select_provider:
+                from ..config import MaestralConfig
+                from ..daemon import is_running
+                from ..providers.base import normalise_provider_name
+
+                requested = ctx.params.pop("provider", None)
+                kwargs.pop("provider", None)
+                if requested is not None:
+                    conf = MaestralConfig(config_name)
+                    current = normalise_provider_name(conf.get("auth", "provider"))
+                    selected = normalise_provider_name(requested)
+                    if conf.get("auth", "account_id") and selected != current:
+                        raise click.UsageError(
+                            "Unlink the current account before changing provider."
+                        )
+                    if selected != current and is_running(config_name):
+                        raise click.UsageError(
+                            "Stop the daemon before changing provider."
+                        )
+                    if selected != current:
+                        conf.set("auth", "provider", selected)
 
             try:
                 client = ctx.with_resource(

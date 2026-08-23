@@ -34,6 +34,7 @@ def reserve_unlink_reset(m: Maestral) -> None:
     try:
         m.manager.begin_unlink_reset(
             stop_state,
+            provider="dropbox",
             account_id="old-account",
             keyring="automatic",
             root_path="/old/dropbox",
@@ -877,6 +878,7 @@ def test_unlink_reservation_refuses_a_restarted_manager(m: Maestral) -> None:
         with pytest.raises(MaestralApiError, match="Sync started again"):
             m.manager.begin_unlink_reset(
                 stop_state,
+                provider="dropbox",
                 account_id="old-account",
                 keyring="automatic",
                 root_path="/old/dropbox",

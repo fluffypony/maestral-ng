@@ -4,9 +4,28 @@ from __future__ import annotations
 
 # system imports
 import hashlib
-from typing import BinaryIO, Union
+from collections.abc import Callable
+from typing import BinaryIO, Protocol, Union
 
 _WritableBuffer = Union[bytes, bytearray]
+
+
+class ContentHasher(Protocol):
+    """Hasher interface used by remote providers and local snapshots."""
+
+    def update(self, new_data: bytes | bytearray) -> None: ...
+
+    def digest(self) -> bytes: ...
+
+    def hexdigest(self) -> str: ...
+
+
+ContentHasherFactory = Callable[[], ContentHasher]
+
+
+def md5_content_hasher() -> ContentHasher:
+    """Return the hasher used for Google Drive blob checksums."""
+    return hashlib.md5(usedforsecurity=False)
 
 
 class DropboxContentHasher:
@@ -113,7 +132,7 @@ class StreamHasher:
     :param hasher: Hasher to use. Must implement an ``update`` method.
     """
 
-    def __init__(self, f: BinaryIO, hasher: DropboxContentHasher) -> None:
+    def __init__(self, f: BinaryIO, hasher: ContentHasher) -> None:
         self._f = f
         self._hasher = hasher
 

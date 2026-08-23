@@ -25,7 +25,6 @@ from typing_extensions import Concatenate, ParamSpec
 
 # local imports
 from . import __url__
-from .client import API_HOST
 from .config import MaestralConfig, MaestralState, PersistentMutableSet
 from .config.user import UserConfig
 from .constants import (
@@ -47,12 +46,12 @@ from .core import TeamRootInfo, UserRootInfo
 from .errorhandling import convert_api_errors
 from .exceptions import (
     CancelledError,
-    DropboxConnectionError,
-    DropboxServerError,
     InotifyError,
     MaestralApiError,
     NoDropboxDirError,
     PathRootError,
+    ProviderConnectionError,
+    ProviderServerError,
     SymlinkError,
 )
 from .fsevents import Observer, ObserverType
@@ -79,9 +78,6 @@ from .utils.path import (
 from .utils.path import unlink as rooted_unlink
 
 __all__ = ["SyncManager"]
-
-DROPBOX_API_HOSTNAME = "https://" + API_HOST
-
 
 P = ParamSpec("P")
 T = TypeVar("T")
@@ -412,6 +408,7 @@ class SyncManager:
         self,
         stop_state: _StopState,
         *,
+        provider: str,
         account_id: str,
         keyring: str,
         root_path: str,
@@ -430,6 +427,7 @@ class SyncManager:
             )
         self.sync._begin_sync_reset(
             "unlink",
+            provider=provider,
             account_id=account_id,
             keyring=keyring,
             root_path=root_path,
@@ -490,7 +488,7 @@ class SyncManager:
 
         self.sync.ensure_dropbox_folder_present()
 
-        if not check_connection(DROPBOX_API_HOSTNAME, logger=self._logger):
+        if not check_connection(self.sync.client.api_url, logger=self._logger):
             # Schedule autostart when connection becomes available.
             self.autostart.set()
             self._logger.info(CONNECTING)
@@ -2677,7 +2675,7 @@ class SyncManager:
         the user.
         """
         while not self._connection_helper_stop.is_set():
-            connected = check_connection(DROPBOX_API_HOSTNAME)
+            connected = check_connection(self.sync.client.api_url)
 
             if connected != self.connected:
                 # Log the status change.
@@ -2965,7 +2963,7 @@ class SyncManager:
         except CancelledError:
             # Shutdown will be handled externally.
             running.clear()
-        except (DropboxConnectionError, DropboxServerError):
+        except (ProviderConnectionError, ProviderServerError):
             self._logger.debug("Connection error", exc_info=True)
             self._logger.info(DISCONNECTED)
             self._signal_worker_stop(running, autostart, restart=True)

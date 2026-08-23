@@ -23,7 +23,8 @@ CONFIG_DIR_NAME = "maestral"
 
 DEFAULTS_CONFIG: _DefaultsType = {
     "auth": {
-        "account_id": "",  # dropbox account id
+        "provider": "dropbox",  # remote storage provider
+        "account_id": "",  # remote account id
         "keyring": "automatic",  # keychain backend to use for credential storage
         "token_access_type": "offline",
     },
@@ -69,7 +70,10 @@ DEFAULTS_STATE: _DefaultsType = {
         "update_notification_last": 0.0,
     },
     "sync": {  # sync state, updated by monitor
-        "cursor": "",  # remote cursor: represents last state synced from dropbox
+        # ``cursor`` is the migration source for profiles created before provider
+        # selection. Remove it after all supported profiles have written ``cursors``.
+        "cursor": "",
+        "cursors": {},  # provider-scoped opaque remote cursors
         "lastsync": 0.0,  # local cursor: time-stamp of last upload
         "last_reindex": 0.0,  # time-stamp of full last reindexing
         "indexing_counter": 0,  # counter for indexing progress between restarts

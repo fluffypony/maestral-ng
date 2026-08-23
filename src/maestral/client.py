@@ -21,6 +21,7 @@ from typing import (
     Callable,
     Iterable,
     Iterator,
+    Mapping,
     Sequence,
     TypeVar,
     cast,
@@ -83,7 +84,7 @@ from .exceptions import (
 from .keyring import CredentialStorage
 from .logging import scoped_logger
 from .utils import chunks, clamp, natural_size
-from .utils.hashing import DropboxContentHasher, StreamHasher
+from .utils.hashing import ContentHasherFactory, DropboxContentHasher, StreamHasher
 from .utils.path import delete, get_local_change_time_ns, opener_no_symlink
 
 if TYPE_CHECKING:
@@ -221,6 +222,9 @@ class DropboxClient:
     """
 
     SDK_VERSION: str = "2.0"
+    provider_id = "dropbox"
+    api_url = f"https://{API_HOST}"
+    content_hasher_factory: ContentHasherFactory = DropboxContentHasher
 
     MAX_TRANSFER_RETRIES = 10
     MAX_LIST_FOLDER_RETRIES = 3
@@ -813,6 +817,9 @@ class DropboxClient:
         dbx_path: str,
         local_path: str | BinaryIO,
         sync_event: SyncEvent | None = None,
+        *,
+        rev: str | None = None,
+        provider_id: str | None = None,
     ) -> FileMetadata:
         """
         Downloads a file from Dropbox to given local path.
@@ -825,8 +832,10 @@ class DropboxClient:
         :raises DataCorruptionError: if data is corrupted during download.
         """
 
+        del provider_id
+        download_identifier = f"rev:{rev}" if rev is not None else dbx_path
         with convert_api_errors(dbx_path=dbx_path):
-            md, http_resp = self.dbx.files_download(dbx_path)
+            md, http_resp = self.dbx.files_download(download_identifier)
 
             destination_path: str | None
             destination_identity: tuple[int, ...] | None = None
@@ -1700,7 +1709,9 @@ class DropboxClient:
         return self.flatten_results(list(iterator))
 
     def list_remote_changes_iterator(
-        self, last_cursor: str
+        self,
+        last_cursor: str,
+        indexed_paths: Mapping[str, str] | None = None,
     ) -> Iterator[ListFolderResult]:
         """
         Lists changes to the remote Dropbox since ``last_cursor``. Returns an iterator
@@ -1713,6 +1724,7 @@ class DropboxClient:
         :param last_cursor: Last to cursor to compare for changes.
         :returns: Iterator over remote changes since given cursor.
         """
+        del indexed_paths
         with convert_api_errors():
             res = self.dbx.files_list_folder_continue(last_cursor)
 
