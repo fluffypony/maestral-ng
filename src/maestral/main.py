@@ -258,7 +258,8 @@ class Maestral:
         self._virtual_file_backend_override = virtual_file_backend
         if self.sync_mode == VIRTUAL_MODE:
             selected_virtual_backend = (
-                virtual_file_backend or create_native_virtual_file_backend()
+                virtual_file_backend
+                or create_native_virtual_file_backend(self.config_name)
             )
         else:
             selected_virtual_backend = UnsupportedVirtualFileBackend()
@@ -968,7 +969,7 @@ class Maestral:
             if selected_mode == VIRTUAL_MODE:
                 backend = (
                     self._virtual_file_backend_override
-                    or create_native_virtual_file_backend()
+                    or create_native_virtual_file_backend(self.config_name)
                 )
                 if not backend.supported:
                     raise VirtualFilesUnsupportedError(
@@ -2848,7 +2849,19 @@ class Maestral:
                 "Please set up a local Dropbox directory using the GUI or CLI.",
             )
 
-        self.sync.ensure_dropbox_folder_present()
+        if self.sync_mode != VIRTUAL_MODE:
+            self.sync.ensure_dropbox_folder_present()
+            return
+
+        marker_id = self._conf.get("sync", "root_marker_id")
+        if self.virtual_files.running:
+            self.virtual_files.validate_root(self.sync.dropbox_path, marker_id)
+            return
+
+        try:
+            self.sync.ensure_dropbox_folder_present()
+        except NoDropboxDirError:
+            self.virtual_files.validate_root(self.sync.dropbox_path, marker_id)
 
     # ==== Housekeeping on update  =====================================================
 

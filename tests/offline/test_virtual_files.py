@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+import os
 import sqlite3
+import stat
+import subprocess
+import sys
 import threading
 import time
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -21,8 +26,8 @@ from maestral.main import Maestral
 from maestral.rpc import JsonRpcDispatcher
 from maestral.virtual_files import (
     HydrationState,
-    NativeFileIdentity,
     VirtualFileController,
+    VirtualFileIdentity,
 )
 
 from .virtual_files_fakes import (
@@ -85,6 +90,110 @@ def test_hydration_state_persists_by_stable_provider_id(
         assert backend.items["stable-1"].content == b"one"
     finally:
         second.close()
+
+
+def test_hydration_uses_a_private_profile_stage(
+    config_name: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    provider = FakeVirtualProvider()
+    backend = FakeVirtualFileBackend()
+    root = tmp_path / "virtual-root"
+    root.mkdir()
+    controller = VirtualFileController(
+        config_name,
+        provider,  # type: ignore[arg-type]
+        backend,
+        database_path=str(tmp_path / "virtual-files.db"),
+        remote_polling=False,
+    )
+    stage_directory = Path(controller._stage_directory)
+    stage_directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    stale = stage_directory / f"maestral-{config_name}-hydrate-stale"
+    stale.write_bytes(b"stale")
+    stale.chmod(0o600)
+    original_materialize = backend.materialize
+    captured: dict[str, object] = {}
+
+    def capture_stage(*args: object, **kwargs: object) -> None:
+        staged_path = Path(str(args[1]))
+        captured["path"] = staged_path
+        captured["mode"] = stat.S_IMODE(os.lstat(staged_path).st_mode)
+        captured["parent_mode"] = stat.S_IMODE(os.lstat(staged_path.parent).st_mode)
+        original_materialize(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(backend, "materialize", capture_stage)
+    controller.start(str(root))
+    try:
+        assert not stale.exists()
+        metadata = provider.add_file("file-1", "/file.txt", "rev-1", b"data")
+        controller.reconcile_remote_change(metadata)
+        backend.open("file-1")
+
+        staged_path = captured["path"]
+        assert isinstance(staged_path, Path)
+        assert staged_path.parent == stage_directory
+        assert captured["mode"] == 0o600
+        assert captured["parent_mode"] == 0o700
+        assert not staged_path.exists()
+    finally:
+        controller.close()
+
+
+def test_stage_cleanup_requires_the_profile_stage_lock(
+    config_name: str, tmp_path: Path
+) -> None:
+    provider = FakeVirtualProvider()
+    backend = FakeVirtualFileBackend()
+    root = tmp_path / "virtual-root"
+    root.mkdir()
+    controller = VirtualFileController(
+        config_name,
+        provider,  # type: ignore[arg-type]
+        backend,
+        database_path=str(tmp_path / "virtual-files.db"),
+        remote_polling=False,
+    )
+    stage_directory = Path(controller._stage_directory)
+    stage_directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    live_stage = stage_directory / f"maestral-{config_name}-hydrate-live"
+    live_stage.write_bytes(b"live")
+    live_stage.chmod(0o600)
+    ready = tmp_path / "stage-lock-ready"
+    holder = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import pathlib,sys; from fasteners import InterProcessLock; "
+                "lock=InterProcessLock(sys.argv[1]); assert lock.acquire(False); "
+                "pathlib.Path(sys.argv[2]).write_text('ready'); "
+                "sys.stdin.buffer.read(1); lock.release()"
+            ),
+            f"{stage_directory}.lock",
+            str(ready),
+        ],
+        stdin=subprocess.PIPE,
+    )
+    try:
+        deadline = time.monotonic() + 2
+        while not ready.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert ready.exists()
+        with pytest.raises(VirtualFileBusyError, match="Another process owns"):
+            controller.start(str(root))
+        assert live_stage.read_bytes() == b"live"
+
+        assert holder.stdin is not None
+        holder.stdin.write(b"x")
+        holder.stdin.close()
+        holder.wait(timeout=2)
+        controller.start(str(root))
+        assert not live_stage.exists()
+    finally:
+        if holder.poll() is None:
+            holder.terminate()
+            holder.wait(timeout=2)
+        controller.close()
 
 
 def test_pin_unpin_and_safe_eviction(config_name: str, tmp_path: Path) -> None:
@@ -365,6 +474,92 @@ def test_remote_changes_preserve_dirty_native_content(
         controller.close()
 
 
+def test_failed_staging_keeps_a_durable_move_journal(
+    config_name: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    provider = FakeVirtualProvider()
+    backend = FakeVirtualFileBackend()
+    controller = make_controller(config_name, tmp_path, provider, backend)
+    first = provider.add_file("file-1", "/file.txt", "rev-1", b"old")
+    controller.reconcile_remote_change(first)
+    original_upsert = backend.upsert
+
+    def fail_upsert(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise VirtualFileBusyError("Native item is busy", "Try again later.")
+
+    monkeypatch.setattr(backend, "upsert", fail_upsert)
+    second = provider.add_file("file-1", "/renamed.txt", "rev-2", b"new")
+    try:
+        with pytest.raises(VirtualFileBusyError):
+            controller.reconcile_remote_change(second)
+        assert str(controller.get_status("file-1")["path"]).startswith(
+            "/.maestral-stage-"
+        )
+        assert controller.get_status("file-1")["revision"] == "rev-1"
+
+        monkeypatch.setattr(backend, "upsert", original_upsert)
+        controller.reconcile_remote_change(second)
+        assert controller.get_status("file-1")["path"] == "/renamed.txt"
+        assert backend.items["file-1"].descriptor.revision == "rev-2"
+    finally:
+        controller.close()
+
+
+def test_upsert_uses_the_current_clean_native_identity(
+    config_name: str, tmp_path: Path
+) -> None:
+    provider = FakeVirtualProvider()
+    backend = FakeVirtualFileBackend()
+    controller = make_controller(config_name, tmp_path, provider, backend)
+    first = provider.add_file("file-1", "/file.txt", "rev-1", b"old")
+    controller.reconcile_remote_change(first)
+    backend.items["file-1"].descriptor = replace(
+        backend.items["file-1"].descriptor,
+        path="/native-drift.txt",
+    )
+    second = provider.add_file("file-1", "/file.txt", "rev-2", b"new")
+
+    try:
+        controller.reconcile_remote_change(second)
+        assert backend.items["file-1"].descriptor.path == "/file.txt"
+        assert backend.items["file-1"].descriptor.revision == "rev-2"
+    finally:
+        controller.close()
+
+
+def test_lost_staging_response_retries_the_durable_move_journal(
+    config_name: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    provider = FakeVirtualProvider()
+    backend = FakeVirtualFileBackend()
+    controller = make_controller(config_name, tmp_path, provider, backend)
+    first = provider.add_file("file-1", "/file.txt", "rev-1", b"old")
+    controller.reconcile_remote_change(first)
+    original_upsert = backend.upsert
+
+    def lose_response(*args: object, **kwargs: object) -> None:
+        original_upsert(*args, **kwargs)  # type: ignore[arg-type]
+        raise RuntimeError("The native response was lost")
+
+    monkeypatch.setattr(backend, "upsert", lose_response)
+    second = provider.add_file("file-1", "/renamed.txt", "rev-2", b"new")
+    try:
+        with pytest.raises(RuntimeError, match="response was lost"):
+            controller.reconcile_remote_change(second)
+        assert str(controller.get_status("file-1")["path"]).startswith(
+            "/.maestral-stage-"
+        )
+
+        monkeypatch.setattr(backend, "upsert", original_upsert)
+        controller.reconcile_remote_change(second)
+        assert controller.get_status("file-1")["path"] == "/renamed.txt"
+        assert controller.get_status("file-1")["revision"] == "rev-2"
+        assert backend.items["file-1"].descriptor.revision == "rev-2"
+    finally:
+        controller.close()
+
+
 def test_remote_folder_move_and_deletion_reconcile_the_full_tree(
     config_name: str, tmp_path: Path
 ) -> None:
@@ -613,7 +808,11 @@ def test_restart_deletes_a_replaced_target_before_finalising_a_staged_move(
     original_remove = backend.remove
 
     def fail_target_removal(*args: object, **kwargs: object) -> None:
-        if args[0] == "target":
+        identity = args[0]
+        if (
+            isinstance(identity, VirtualFileIdentity)
+            and identity.provider_id == "target"
+        ):
             raise RuntimeError("crash after native staging")
         original_remove(*args, **kwargs)  # type: ignore[arg-type]
 
@@ -643,7 +842,7 @@ def test_restart_deletes_a_replaced_target_before_finalising_a_staged_move(
             for index, call in enumerate(recovery_calls)
             if call[0] == "upsert"
             and call[1] == "file-a"
-            and isinstance(call[3], NativeFileIdentity)
+            and isinstance(call[3], VirtualFileIdentity)
             and call[3].path.startswith("/.maestral-stage-")
         )
         assert removal_index < final_move_index
@@ -691,7 +890,7 @@ def test_restart_finishes_a_crash_during_final_native_moves(
         assert staged.staging_source_path_cased is not None
         original_upsert(
             first._descriptor(staged),
-            expected=NativeFileIdentity(
+            expected_identity=VirtualFileIdentity(
                 staged.provider_id,
                 staged.staging_source_path_cased,
                 bool(staged.is_directory),
@@ -711,7 +910,7 @@ def test_restart_finishes_a_crash_during_final_native_moves(
         )
         original_upsert(
             first._descriptor(final),
-            expected=first._native_identity(staged),
+            expected_identity=first._native_identity(staged),
         )
     first.close()
 
@@ -1227,12 +1426,12 @@ def test_restart_finishes_folder_deletion_from_children_up(
             (
                 "remove",
                 "file-1",
-                NativeFileIdentity("file-1", "/Folder/Child.txt", False, "rev-1"),
+                VirtualFileIdentity("file-1", "/Folder/Child.txt", False, "rev-1"),
             ),
             (
                 "remove",
                 "folder-1",
-                NativeFileIdentity("folder-1", "/Folder", True, "folder"),
+                VirtualFileIdentity("folder-1", "/Folder", True, "folder"),
             ),
         ]
     finally:
@@ -1316,12 +1515,12 @@ def test_restart_removes_clean_orphans_from_children_up(
             (
                 "remove",
                 "file-1",
-                NativeFileIdentity("file-1", "/Folder/Child.txt", False, "rev-1"),
+                VirtualFileIdentity("file-1", "/Folder/Child.txt", False, "rev-1"),
             ),
             (
                 "remove",
                 "folder-1",
-                NativeFileIdentity("folder-1", "/Folder", True, "folder"),
+                VirtualFileIdentity("folder-1", "/Folder", True, "folder"),
             ),
         ]
     finally:

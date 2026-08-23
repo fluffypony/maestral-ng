@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import threading
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
@@ -14,10 +15,12 @@ from maestral.exceptions import (
 )
 from maestral.virtual_files import (
     HydrationRequest,
-    NativeFileIdentity,
     NativeFileRecord,
     NativeFileState,
     VirtualFileDescriptor,
+    VirtualFileIdentity,
+    VirtualFileRootBinding,
+    VirtualFileRootIdentity,
 )
 
 
@@ -146,26 +149,66 @@ class FakeVirtualFileBackend:
         self.require_empty_directories = False
         self.cascade_directory_removals = False
 
-    def start(self, root_path: str, request_hydration: HydrationRequest) -> None:
+    def start(
+        self, root_path: str, request_hydration: HydrationRequest
+    ) -> VirtualFileRootBinding:
         self.calls.append(("start", root_path))
         self.request_hydration = request_hydration
         self.started = True
+        status = os.lstat(root_path)
+        return VirtualFileRootBinding(
+            source_root_path=root_path,
+            root_path=root_path,
+            cache_path="/fake-cache",
+            root_identity=VirtualFileRootIdentity(
+                device=str(status.st_dev),
+                inode=str(status.st_ino),
+                mode=status.st_mode,
+            ),
+        )
 
     def stop(self) -> None:
         self.calls.append(("stop",))
         self.started = False
         self.request_hydration = None
 
+    def cache_path_for_root(self, root_marker_id: str) -> str:
+        return f"/fake-cache/{root_marker_id}"
+
+    def registration_committed(self, root_marker_id: str) -> bool:
+        del root_marker_id
+        return self.started
+
+    def validate_root(self, root_path: str, root_marker_id: str) -> None:
+        self.calls.append(("validate_root", root_path, root_marker_id))
+        if not self.started:
+            raise VirtualFileBusyError(
+                "Fake virtual root is inactive", "Start the fake backend first."
+            )
+
+    def detach(self, root_path: str, root_marker_id: str) -> str:
+        self.calls.append(("detach", root_path, root_marker_id))
+        self.items = {
+            provider_id: item
+            for provider_id, item in self.items.items()
+            if item.content is not None or item.descriptor.is_directory
+        }
+        self.started = False
+        self.request_hydration = None
+        return root_path
+
     def upsert(
         self,
         item: VirtualFileDescriptor,
         *,
-        expected: NativeFileIdentity | None,
+        expected_identity: VirtualFileIdentity | None,
     ) -> None:
-        self.calls.append(("upsert", item.provider_id, item.revision, expected))
+        self.calls.append(
+            ("upsert", item.provider_id, item.revision, expected_identity)
+        )
         old = self.items.get(item.provider_id)
         if old is None:
-            if expected is not None:
+            if expected_identity is not None:
                 raise VirtualFileRevisionError(
                     "Fake placeholder revision changed", item.provider_id
                 )
@@ -173,30 +216,40 @@ class FakeVirtualFileBackend:
                 descriptor=item, pinned=item.pinned
             )
             return
-        if old.descriptor == item and old.pinned == item.pinned:
+        current_item = replace(old.descriptor, pinned=old.pinned)
+        if current_item == item:
             return
-        current_identity = NativeFileIdentity(
+        current_identity = VirtualFileIdentity(
             provider_id=old.descriptor.provider_id,
             path=old.descriptor.path,
             is_directory=old.descriptor.is_directory,
             revision=old.descriptor.revision,
         )
-        if current_identity != expected:
+        if current_identity != expected_identity:
             raise VirtualFileRevisionError(
                 "Fake placeholder revision changed", item.provider_id
             )
-        if old.dirty or old.open_count:
-            raise VirtualFileBusyError(
-                "Cannot update the fake placeholder",
-                "The file has local changes or is open.",
+        moves_directory = (
+            old.descriptor.is_directory and old.descriptor.path != item.path
+        )
+        affected = [old]
+        if moves_directory:
+            prefix = old.descriptor.path.rstrip("/") + "/"
+            affected.extend(
+                child
+                for child in self.items.values()
+                if child.descriptor.path.startswith(prefix)
             )
-        old_path = old.descriptor.path
-        if old.descriptor.is_directory and old_path != item.path:
-            old_prefix = old_path.rstrip("/") + "/"
+        if any(native.dirty or native.open_count for native in affected):
+            raise VirtualFileBusyError(
+                "Cannot update the fake placeholder", "The file is dirty or open."
+            )
+        if moves_directory:
+            prefix = old.descriptor.path.rstrip("/") + "/"
             for child in self.items.values():
-                if child is old or not child.descriptor.path.startswith(old_prefix):
+                if child is old or not child.descriptor.path.startswith(prefix):
                     continue
-                suffix = child.descriptor.path[len(old_path) :]
+                suffix = child.descriptor.path[len(old.descriptor.path) :]
                 child.descriptor = replace(child.descriptor, path=item.path + suffix)
         if old.descriptor.revision != item.revision:
             old.content = None
@@ -204,27 +257,27 @@ class FakeVirtualFileBackend:
         old.descriptor = item
         old.pinned = item.pinned
 
-    def remove(self, provider_id: str, *, expected: NativeFileIdentity) -> None:
-        self.calls.append(("remove", provider_id, expected))
+    def remove(self, expected_identity: VirtualFileIdentity) -> None:
+        provider_id = expected_identity.provider_id
+        self.calls.append(("remove", provider_id, expected_identity))
         item = self.items.get(provider_id)
         if item is None:
             return
-        current_identity = NativeFileIdentity(
+        current_identity = VirtualFileIdentity(
             provider_id=item.descriptor.provider_id,
             path=item.descriptor.path,
             is_directory=item.descriptor.is_directory,
             revision=item.descriptor.revision,
         )
-        if current_identity != expected:
+        if current_identity != expected_identity:
             raise VirtualFileRevisionError(
                 "Fake placeholder revision changed", provider_id
             )
         if item.dirty or item.open_count:
             raise VirtualFileBusyError(
-                "Cannot remove the fake placeholder",
-                "The file has local changes or is open.",
+                "Cannot remove the fake placeholder", "The file is dirty or open."
             )
-        if item is not None and self.require_empty_directories:
+        if self.require_empty_directories:
             prefix = item.descriptor.path.rstrip("/") + "/"
             if any(
                 child_id != provider_id and child.descriptor.path.startswith(prefix)
@@ -300,7 +353,7 @@ class FakeVirtualFileBackend:
         if native is None:
             return None
         return NativeFileState(
-            identity=NativeFileIdentity(
+            identity=VirtualFileIdentity(
                 provider_id=native.descriptor.provider_id,
                 path=native.descriptor.path,
                 is_directory=native.descriptor.is_directory,
@@ -316,10 +369,12 @@ class FakeVirtualFileBackend:
         self.calls.append(("recover",))
         return [
             NativeFileRecord(
-                provider_id=provider_id,
-                path=item.descriptor.path,
-                is_directory=item.descriptor.is_directory,
-                revision=item.descriptor.revision,
+                identity=VirtualFileIdentity(
+                    provider_id=provider_id,
+                    path=item.descriptor.path,
+                    is_directory=item.descriptor.is_directory,
+                    revision=item.descriptor.revision,
+                ),
                 hydrated_revision=item.hydrated_revision,
                 pinned=item.pinned,
                 dirty=item.dirty,

@@ -9,6 +9,7 @@ import platform
 import posixpath
 import re
 import sqlite3
+import stat
 import tempfile
 import threading
 import unicodedata
@@ -17,6 +18,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from stat import S_ISREG
 from typing import BinaryIO, Protocol, cast
+
+from fasteners import InterProcessLock
 
 from .constants import ROOT_MARKER_FILE, ROOT_MARKER_TEMP_PREFIX
 from .core import (
@@ -38,8 +41,11 @@ from .exceptions import (
     VirtualFilesUnsupportedError,
 )
 from .providers.base import RemoteProvider
-from .utils.appdirs import get_data_path
-from .utils.path import is_fs_link, normalize
+from .utils.appdirs import get_cache_path, get_data_path
+from .utils.path import is_fs_link
+from .utils.path import makedirs as rooted_makedirs
+from .utils.path import normalize, rooted_item_snapshot
+from .utils.path import unlink as rooted_unlink
 
 MIRROR_MODE = "mirror"
 VIRTUAL_MODE = "virtual"
@@ -100,8 +106,7 @@ def _validate_virtual_path(
         raise ValueError(f"The virtual-file {name} is invalid")
     components = path[1:].split("/")
     if any(
-        component in {"", ".", ".."}
-        or not _has_utf8_length_at_most(component, 255)
+        component in {"", ".", ".."} or not _has_utf8_length_at_most(component, 255)
         for component in components
     ):
         raise ValueError(f"The virtual-file {name} is invalid")
@@ -194,6 +199,35 @@ class _VirtualFileRecord(Model):
 
 
 @dataclass(frozen=True)
+class VirtualFileIdentity:
+    """Fields which bind a mutation to one exact native catalog item."""
+
+    provider_id: str
+    path: str
+    is_directory: bool
+    revision: str
+
+
+@dataclass(frozen=True)
+class VirtualFileRootIdentity:
+    """Durable no-follow identity of an adopted native root directory."""
+
+    device: str
+    inode: str
+    mode: int
+
+
+@dataclass(frozen=True)
+class VirtualFileRootBinding:
+    """Platform paths and durable identity returned by native root startup."""
+
+    source_root_path: str
+    root_path: str
+    cache_path: str
+    root_identity: VirtualFileRootIdentity
+
+
+@dataclass(frozen=True)
 class VirtualFileDescriptor:
     """Provider metadata required by a native placeholder backend."""
 
@@ -211,7 +245,7 @@ class VirtualFileDescriptor:
 class NativeFileState:
     """Native state used for recovery and safe eviction checks."""
 
-    identity: NativeFileIdentity
+    identity: VirtualFileIdentity
     hydrated_revision: str | None
     pinned: bool
     dirty: bool = False
@@ -219,23 +253,10 @@ class NativeFileState:
 
 
 @dataclass(frozen=True)
-class NativeFileIdentity:
-    """Immutable native fields required by a destructive compare-and-swap."""
-
-    provider_id: str
-    path: str
-    is_directory: bool
-    revision: str
-
-
-@dataclass(frozen=True)
 class NativeFileRecord:
     """One native placeholder returned by crash recovery enumeration."""
 
-    provider_id: str
-    path: str
-    is_directory: bool
-    revision: str
+    identity: VirtualFileIdentity
     hydrated_revision: str | None
     pinned: bool
     dirty: bool = False
@@ -261,18 +282,28 @@ class VirtualFileBackend(Protocol):
     backend_id: str
     supported: bool
 
-    def start(self, root_path: str, request_hydration: HydrationRequest) -> None: ...
+    def start(
+        self, root_path: str, request_hydration: HydrationRequest
+    ) -> VirtualFileRootBinding: ...
 
     def stop(self) -> None: ...
+
+    def cache_path_for_root(self, root_marker_id: str) -> str: ...
+
+    def registration_committed(self, root_marker_id: str) -> bool: ...
+
+    def validate_root(self, root_path: str, root_marker_id: str) -> None: ...
+
+    def detach(self, root_path: str, root_marker_id: str) -> str: ...
 
     def upsert(
         self,
         item: VirtualFileDescriptor,
         *,
-        expected: NativeFileIdentity | None,
+        expected_identity: VirtualFileIdentity | None,
     ) -> None: ...
 
-    def remove(self, provider_id: str, *, expected: NativeFileIdentity) -> None: ...
+    def remove(self, expected_identity: VirtualFileIdentity) -> None: ...
 
     def set_pinned(self, provider_id: str, pinned: bool) -> None: ...
 
@@ -303,24 +334,42 @@ class UnsupportedVirtualFileBackend:
             f"No virtual-file backend is installed for {platform.system()}.",
         )
 
-    def start(self, root_path: str, request_hydration: HydrationRequest) -> None:
+    def start(
+        self, root_path: str, request_hydration: HydrationRequest
+    ) -> VirtualFileRootBinding:
         del root_path, request_hydration
         raise self._unsupported()
 
     def stop(self) -> None:
         return
 
+    def cache_path_for_root(self, root_marker_id: str) -> str:
+        del root_marker_id
+        return ""
+
+    def registration_committed(self, root_marker_id: str) -> bool:
+        del root_marker_id
+        return False
+
+    def validate_root(self, root_path: str, root_marker_id: str) -> None:
+        del root_path, root_marker_id
+        raise self._unsupported()
+
+    def detach(self, root_path: str, root_marker_id: str) -> str:
+        del root_path, root_marker_id
+        raise self._unsupported()
+
     def upsert(
         self,
         item: VirtualFileDescriptor,
         *,
-        expected: NativeFileIdentity | None,
+        expected_identity: VirtualFileIdentity | None,
     ) -> None:
-        del item, expected
+        del item, expected_identity
         raise self._unsupported()
 
-    def remove(self, provider_id: str, *, expected: NativeFileIdentity) -> None:
-        del provider_id, expected
+    def remove(self, expected_identity: VirtualFileIdentity) -> None:
+        del expected_identity
         raise self._unsupported()
 
     def set_pinned(self, provider_id: str, pinned: bool) -> None:
@@ -349,14 +398,16 @@ class UnsupportedVirtualFileBackend:
         raise self._unsupported()
 
 
-def create_native_virtual_file_backend() -> VirtualFileBackend:
-    """Select an installed native backend.
+def create_native_virtual_file_backend(config_name: str) -> VirtualFileBackend:
+    """Select the installed native backend for one profile.
 
-    Platform implementations deliberately live outside this core checkpoint. They must
-    replace this selection point when their native client is added.
+    A missing binary produces an inactive backend. This lets an existing virtual-mode
+    profile initialise so that the user can select mirror mode again. Selecting virtual
+    mode remains strict because :class:`Maestral` checks ``supported`` before saving it.
     """
-    backend = UnsupportedVirtualFileBackend()
-    raise backend._unsupported()
+    from .virtual_files_native import create_process_virtual_file_backend
+
+    return create_process_virtual_file_backend(config_name)
 
 
 class _VirtualFileStore:
@@ -488,9 +539,7 @@ class _VirtualFileStore:
         ).fetchone()
         if row is None:
             raise ValueError("The virtual-file cursor is invalid")
-        return _validate_virtual_cursor(
-            row["cursor"], "cursor", allow_empty=True
-        )
+        return _validate_virtual_cursor(row["cursor"], "cursor", allow_empty=True)
 
     @property
     def needs_full_snapshot(self) -> bool:
@@ -607,6 +656,11 @@ class VirtualFileController:
         )
         self._needs_full_snapshot = True
         self._snapshot_native_by_id: dict[str, NativeFileRecord] = {}
+        self._stage_directory = get_cache_path(
+            "maestral", f"{config_name}.virtual-stage", create=False
+        )
+        self._stage_lock = InterProcessLock(f"{self._stage_directory}.lock")
+        self._stage_lock_held = False
         self._store: _VirtualFileStore | None = None
         self._lock = threading.RLock()
         self._lifecycle_lock = threading.Lock()
@@ -622,6 +676,7 @@ class VirtualFileController:
         self._backend_started = False
         self._remote_polling = remote_polling
         self._root_path = ""
+        self._root_binding: VirtualFileRootBinding | None = None
         self._connected = False
         self._last_worker_error = ""
         self._closed = False
@@ -641,6 +696,11 @@ class VirtualFileController:
     @property
     def connected(self) -> bool:
         return self.running and self._connected
+
+    @property
+    def root_binding(self) -> VirtualFileRootBinding | None:
+        """Return the last confirmed platform root binding."""
+        return self._root_binding
 
     @property
     def cursor(self) -> str:
@@ -697,6 +757,18 @@ class VirtualFileController:
                 )
             self.provider = provider
 
+    def cache_path_for_root(self, root_marker_id: str) -> str:
+        """Return the private native cache path for one durable root identity."""
+        return self._backend.cache_path_for_root(root_marker_id)
+
+    def registration_committed(self, root_marker_id: str) -> bool:
+        """Return whether one native root has a confirmed registration."""
+        return self._backend.registration_committed(root_marker_id)
+
+    def validate_root(self, root_path: str, root_marker_id: str) -> None:
+        """Validate one active native registration without reading its namespace."""
+        self._backend.validate_root(root_path, root_marker_id)
+
     def reset(self) -> None:
         """Remove all local virtual state without changing remote content."""
         with self._lifecycle_lock:
@@ -726,10 +798,7 @@ class VirtualFileController:
                     self._set_checkpoint("", needs_full_snapshot=False)
                     if self._backend_started:
                         for record in records:
-                            self._backend.remove(
-                                record.provider_id,
-                                expected=self._native_identity(record),
-                            )
+                            self._backend.remove(self._native_identity(record))
                     with self._lock:
                         self._get_store().records.delete(AllQuery())
                         self._last_worker_error = ""
@@ -737,6 +806,8 @@ class VirtualFileController:
                 if self._backend_started:
                     self._backend.stop()
                     self._backend_started = False
+                    self._root_binding = None
+                    self._release_stage_lock()
 
     def detach(self) -> None:
         """Forget the virtual root while preserving every native item."""
@@ -752,8 +823,10 @@ class VirtualFileController:
                 if self._backend_started:
                     self._backend.stop()
                     self._backend_started = False
+                    self._root_binding = None
+                    self._release_stage_lock()
 
-    def start(self, root_path: str) -> None:
+    def start(self, root_path: str) -> VirtualFileRootBinding:
         """Start the native root and recover all durable operations."""
         with self._lock:
             self._raise_if_closed()
@@ -765,7 +838,12 @@ class VirtualFileController:
         with self._lifecycle_lock:
             with self._lock:
                 if self.running:
-                    return
+                    if self._root_binding is None:
+                        raise VirtualFileBusyError(
+                            "The virtual root binding is unavailable",
+                            "Stop the native root and start it again.",
+                        )
+                    return self._root_binding
                 if self._worker is not None:
                     if self._worker.is_alive():
                         raise VirtualFileBusyError(
@@ -784,8 +862,18 @@ class VirtualFileController:
                 self._ready.clear()
                 self._running.set()
             try:
-                self._backend.start(root_path, self._hydrate_on_open)
+                if not self._stage_lock.acquire(blocking=False):
+                    raise VirtualFileBusyError(
+                        "Virtual file staging is busy",
+                        "Another process owns this profile's hydration stage.",
+                    )
+                self._stage_lock_held = True
+                self._prepare_stage_directory()
+                binding = self._backend.start(root_path, self._hydrate_on_open)
                 self._backend_started = True
+                with self._lock:
+                    self._root_path = binding.root_path
+                    self._root_binding = binding
                 pinned_to_hydrate = self._recover()
                 self._ready.set()
             except BaseException as start_error:
@@ -806,6 +894,10 @@ class VirtualFileController:
                         ) from stop_error
                     else:
                         self._backend_started = False
+                        self._root_binding = None
+                        self._release_stage_lock()
+                else:
+                    self._release_stage_lock()
                 raise
             with self._lock:
                 self._connected = not self._remote_polling
@@ -825,6 +917,7 @@ class VirtualFileController:
                 self.hydrate(provider_id)
             except Exception:
                 pass
+        return binding
 
     def stop(self) -> None:
         """Stop remote polling and the native root."""
@@ -834,6 +927,8 @@ class VirtualFileController:
                 if self._backend_started:
                     self._backend.stop()
                     self._backend_started = False
+                    self._root_binding = None
+                    self._release_stage_lock()
 
     def close(self) -> None:
         """Stop the controller and close its lazy database connection."""
@@ -961,8 +1056,10 @@ class VirtualFileController:
     @staticmethod
     def _native_identity(
         record: _VirtualFileRecord | NativeFileRecord | VirtualFileDescriptor,
-    ) -> NativeFileIdentity:
-        return NativeFileIdentity(
+    ) -> VirtualFileIdentity:
+        if isinstance(record, NativeFileRecord):
+            return record.identity
+        return VirtualFileIdentity(
             provider_id=record.provider_id,
             path=(
                 record.path_cased
@@ -972,6 +1069,10 @@ class VirtualFileController:
             is_directory=bool(record.is_directory),
             revision=record.revision,
         )
+
+    def _remove_native(self, expected_identity: VirtualFileIdentity) -> None:
+        """Remove an item with an idempotent native identity check."""
+        self._backend.remove(expected_identity)
 
     @staticmethod
     def _status(record: _VirtualFileRecord) -> dict[str, object]:
@@ -1229,9 +1330,7 @@ class VirtualFileController:
                     "Cannot stage the remote deletion",
                 )
             deleting_directories = [
-                record
-                for record in deleting_records
-                if bool(record.is_directory)
+                record for record in deleting_records if bool(record.is_directory)
             ]
             for entry in entries:
                 record = self._get_store().get(entry.id)
@@ -1333,16 +1432,14 @@ class VirtualFileController:
             for record in deleting_records
         ]
         with self._lock:
-            self._get_store().records.update_many(
-                [*all_staged, *durable_deletions]
-            )
+            self._get_store().records.update_many([*all_staged, *durable_deletions])
 
         staged_by_id = {record.provider_id: record for record in all_staged}
         for old in sorted(roots, key=lambda item: item.path_lower.count("/")):
             staged = staged_by_id[old.provider_id]
             self._backend.upsert(
                 self._descriptor(staged),
-                expected=self._native_identity(old),
+                expected_identity=self._native_identity(old),
             )
             inspected = self._inspect_native(old.provider_id)
             if inspected is None or inspected.identity != self._native_identity(staged):
@@ -1381,7 +1478,7 @@ class VirtualFileController:
 
         native_records = list(self._snapshot_native_by_id.values())
         for native in native_records:
-            target = live_entries.get(native.provider_id)
+            target = live_entries.get(native.identity.provider_id)
             target_identity = (
                 self._metadata_identity(target) if target is not None else None
             )
@@ -1398,36 +1495,39 @@ class VirtualFileController:
         orphans = [
             native
             for native in native_records
-            if native.provider_id not in live_entries
+            if native.identity.provider_id not in live_entries
         ]
         moved = [
             native
             for native in native_records
-            if native.provider_id in live_entries
+            if native.identity.provider_id in live_entries
             and (
-                native.path != live_entries[native.provider_id].path_display
-                or native.is_directory
-                != isinstance(live_entries[native.provider_id], FolderMetadata)
+                native.identity.path
+                != live_entries[native.identity.provider_id].path_display
+                or native.identity.is_directory
+                != isinstance(live_entries[native.identity.provider_id], FolderMetadata)
                 or any(
-                    native.provider_id != orphan.provider_id
-                    and normalize(native.path).startswith(
-                        normalize(orphan.path).rstrip("/") + "/"
+                    native.identity.provider_id != orphan.identity.provider_id
+                    and normalize(native.identity.path).startswith(
+                        normalize(orphan.identity.path).rstrip("/") + "/"
                     )
                     for orphan in orphans
-                    if orphan.is_directory
+                    if orphan.identity.is_directory
                 )
             )
         ]
         occupied_paths = {
-            normalize(native.path) for native in self._snapshot_native_by_id.values()
+            normalize(native.identity.path)
+            for native in self._snapshot_native_by_id.values()
         } | final_paths
         for native in sorted(
             moved,
-            key=lambda item: item.path.count("/"),
+            key=lambda item: item.identity.path.count("/"),
             reverse=True,
         ):
-            target = live_entries[native.provider_id]
-            digest = hashlib.sha256(native.provider_id.encode("utf-8")).hexdigest()[:16]
+            provider_id = native.identity.provider_id
+            target = live_entries[provider_id]
+            digest = hashlib.sha256(provider_id.encode("utf-8")).hexdigest()[:16]
             counter = 0
             while True:
                 suffix = f"-{counter}" if counter else ""
@@ -1443,19 +1543,16 @@ class VirtualFileController:
             )
             self._backend.upsert(
                 descriptor,
-                expected=self._native_identity(native),
+                expected_identity=self._native_identity(native),
             )
-            current = self._inspect_native(native.provider_id)
+            current = self._inspect_native(provider_id)
             if current is None:
                 raise VirtualFileNotFoundError(
                     "Cannot rebuild the virtual root",
                     "The staged native item disappeared.",
                 )
-            self._snapshot_native_by_id[native.provider_id] = NativeFileRecord(
-                provider_id=current.identity.provider_id,
-                path=current.identity.path,
-                is_directory=current.identity.is_directory,
-                revision=current.identity.revision,
+            self._snapshot_native_by_id[provider_id] = NativeFileRecord(
+                identity=current.identity,
                 hydrated_revision=current.hydrated_revision,
                 pinned=current.pinned,
                 dirty=current.dirty,
@@ -1464,20 +1561,17 @@ class VirtualFileController:
 
         for orphan in sorted(
             orphans,
-            key=lambda item: item.path.count("/"),
+            key=lambda item: item.identity.path.count("/"),
             reverse=True,
         ):
-            self._backend.remove(
-                orphan.provider_id,
-                expected=self._native_identity(orphan),
-            )
-            self._snapshot_native_by_id.pop(orphan.provider_id, None)
+            self._backend.remove(self._native_identity(orphan))
+            self._snapshot_native_by_id.pop(orphan.identity.provider_id, None)
 
     @staticmethod
     def _metadata_identity(
         metadata: FileMetadata | FolderMetadata,
-    ) -> NativeFileIdentity:
-        return NativeFileIdentity(
+    ) -> VirtualFileIdentity:
+        return VirtualFileIdentity(
             provider_id=metadata.id,
             path=metadata.path_display,
             is_directory=isinstance(metadata, FolderMetadata),
@@ -1612,7 +1706,7 @@ class VirtualFileController:
         recovered_native = (
             self._snapshot_native_by_id.get(provider_id) if old is None else None
         )
-        target_identity = NativeFileIdentity(
+        target_identity = VirtualFileIdentity(
             provider_id=provider_id,
             path=metadata.path_display,
             is_directory=is_directory,
@@ -1670,9 +1764,13 @@ class VirtualFileController:
                 else None
             ),
         )
+        native_before = self._inspect_native(provider_id) if self.running else None
+        self._require_native_state_mutable(
+            native_before, "Cannot apply the remote file change"
+        )
 
-        descendants: list[_VirtualFileRecord] = []
         moved_descendants: list[_VirtualFileRecord] = []
+        previous_descendants: list[_VirtualFileRecord] = []
         if (
             old is not None
             and bool(old.is_directory)
@@ -1682,12 +1780,12 @@ class VirtualFileController:
             )
         ):
             with self._lock:
-                descendants = [
+                previous_descendants = [
                     item
                     for item in self._get_store().tree(old.path_lower)
                     if item.provider_id != old.provider_id
                 ]
-            for descendant in descendants:
+            for descendant in previous_descendants:
                 lower_suffix = descendant.path_lower[len(old.path_lower) :]
                 cased_suffix = descendant.path_cased[len(old.path_cased) :]
                 moved_descendants.append(
@@ -1712,12 +1810,12 @@ class VirtualFileController:
         try:
             self._backend.upsert(
                 self._descriptor(record),
-                expected=(
-                    self._native_identity(old)
-                    if old is not None
+                expected_identity=(
+                    native_before.identity
+                    if native_before is not None
                     else (
-                        self._native_identity(self._snapshot_native_by_id[provider_id])
-                        if provider_id in self._snapshot_native_by_id
+                        self._native_identity(recovered_native)
+                        if recovered_native is not None
                         else None
                     )
                 ),
@@ -1732,7 +1830,7 @@ class VirtualFileController:
                         "The native directory move did not rebase its full tree.",
                     )
         except BaseException as exc:
-            self._save_error(provider_id, record.generation, exc)
+            self._repair_failed_upsert(record, exc)
             raise
 
         self._mark_native_applied([record, *moved_descendants])
@@ -1830,7 +1928,7 @@ class VirtualFileController:
             raise ValueError("The native open count is invalid")
 
     @staticmethod
-    def _validate_native_identity(identity: NativeFileIdentity) -> None:
+    def _validate_native_identity(identity: VirtualFileIdentity) -> None:
         _validate_virtual_token(identity.provider_id, "native provider identity")
         _validate_virtual_path(identity.path, "native path", allow_staging=True)
         if not isinstance(identity.is_directory, bool):
@@ -1981,10 +2079,7 @@ class VirtualFileController:
             reverse=True,
         ):
             try:
-                self._backend.remove(
-                    deleting.provider_id,
-                    expected=self._native_identity(deleting),
-                )
+                self._backend.remove(self._native_identity(deleting))
             except BaseException as exc:
                 self._save_error(deleting.provider_id, deleting.generation, exc)
                 raise
@@ -2007,7 +2102,7 @@ class VirtualFileController:
             native = self._inspect_native(target.provider_id)
             self._backend.upsert(
                 self._descriptor(target),
-                expected=native.identity if native is not None else None,
+                expected_identity=native.identity if native is not None else None,
             )
         self._mark_native_applied(records)
 
@@ -2300,9 +2395,11 @@ class VirtualFileController:
             with tempfile.NamedTemporaryFile(
                 mode="w+b",
                 prefix=f"maestral-{self.config_name}-hydrate-",
+                dir=self._stage_directory,
                 delete=False,
             ) as staged:
                 staged_path = staged.name
+                os.chmod(staged_path, 0o600)
                 metadata = self.provider.download(
                     record.path_cased,
                     cast(BinaryIO, staged),
@@ -2340,10 +2437,7 @@ class VirtualFileController:
     @staticmethod
     def _native_record_from_state(state: NativeFileState) -> NativeFileRecord:
         return NativeFileRecord(
-            provider_id=state.identity.provider_id,
-            path=state.identity.path,
-            is_directory=state.identity.is_directory,
-            revision=state.identity.revision,
+            identity=state.identity,
             hydrated_revision=state.hydrated_revision,
             pinned=state.pinned,
             dirty=state.dirty,
@@ -2407,7 +2501,7 @@ class VirtualFileController:
                 )
             source_path = record.staging_source_path_cased
             assert source_path is not None
-            source_identity = NativeFileIdentity(
+            source_identity = VirtualFileIdentity(
                 provider_id=record.provider_id,
                 path=source_path,
                 is_directory=bool(record.is_directory),
@@ -2418,7 +2512,7 @@ class VirtualFileController:
             if native_identity == source_identity:
                 self._backend.upsert(
                     self._descriptor(record),
-                    expected=source_identity,
+                    expected_identity=source_identity,
                 )
                 inspected = self._inspect_native(record.provider_id)
                 if inspected is None:
@@ -2475,7 +2569,7 @@ class VirtualFileController:
             source_path = record.staging_source_path_cased
             assert source_path is not None
             allowed_identities = {
-                NativeFileIdentity(
+                VirtualFileIdentity(
                     provider_id=record.provider_id,
                     path=source_path,
                     is_directory=bool(record.is_directory),
@@ -2493,7 +2587,7 @@ class VirtualFileController:
                 suffix = record.path_cased[len(ancestor.path_cased) :]
                 ancestor_final = final_records[ancestor.provider_id]
                 allowed_identities.add(
-                    NativeFileIdentity(
+                    VirtualFileIdentity(
                         provider_id=record.provider_id,
                         path=ancestor_final.path_cased + suffix,
                         is_directory=bool(record.is_directory),
@@ -2508,7 +2602,7 @@ class VirtualFileController:
             if native_identity != final_identity:
                 self._backend.upsert(
                     self._descriptor(final),
-                    expected=native_identity,
+                    expected_identity=native_identity,
                 )
                 inspected = self._inspect_native(record.provider_id)
                 if inspected is None or inspected.identity != final_identity:
@@ -2533,6 +2627,85 @@ class VirtualFileController:
         self._validate_store_records(all_records)
         return all_records
 
+    def _prepare_stage_directory(self) -> None:
+        """Prepare a private stage root and remove owned files from an old run."""
+        try:
+            identity = rooted_makedirs(self._stage_directory, mode=0o700, exist_ok=True)
+            status = os.lstat(self._stage_directory)
+            if (status.st_dev, status.st_ino, status.st_mode) != identity:
+                raise OSError("The virtual-file stage root changed")
+            if os.name != "nt":
+                flags = (
+                    os.O_RDONLY
+                    | getattr(os, "O_DIRECTORY", 0)
+                    | getattr(os, "O_NOFOLLOW", 0)
+                    | getattr(os, "O_CLOEXEC", 0)
+                )
+                descriptor = os.open(self._stage_directory, flags)
+                try:
+                    opened = os.fstat(descriptor)
+                    if (opened.st_dev, opened.st_ino, opened.st_mode) != identity:
+                        raise OSError("The virtual-file stage root changed")
+                    os.fchmod(descriptor, 0o700)
+                    status = os.fstat(descriptor)
+                finally:
+                    os.close(descriptor)
+            else:
+                os.chmod(self._stage_directory, 0o700)
+                status = os.lstat(self._stage_directory)
+
+            identity = (status.st_dev, status.st_ino, status.st_mode)
+            final_snapshot = rooted_item_snapshot(
+                self._stage_directory,
+                self._stage_directory,
+                expected_root_identity=identity,
+            )
+            if (
+                final_snapshot[:3] != identity
+                or not stat.S_ISDIR(status.st_mode)
+                or is_fs_link(status)
+                or (hasattr(os, "getuid") and status.st_uid != os.getuid())
+                or (os.name != "nt" and stat.S_IMODE(status.st_mode) != 0o700)
+            ):
+                raise OSError("The virtual-file stage root is unsafe")
+
+            prefix = f"maestral-{self.config_name}-hydrate-"
+            with os.scandir(self._stage_directory) as entries:
+                for entry in entries:
+                    entry_status = entry.stat(follow_symlinks=False)
+                    if (
+                        entry.name.startswith(prefix)
+                        and stat.S_ISREG(entry_status.st_mode)
+                        and not is_fs_link(entry_status)
+                        and (
+                            not hasattr(os, "getuid")
+                            or entry_status.st_uid == os.getuid()
+                        )
+                    ):
+                        rooted_unlink(
+                            entry.path,
+                            root_path=self._stage_directory,
+                            expected_root_identity=identity,
+                            expected_target_identity=(
+                                entry_status.st_dev,
+                                entry_status.st_ino,
+                                entry_status.st_mode,
+                                entry_status.st_size,
+                                entry_status.st_mtime_ns,
+                                entry_status.st_ctime_ns,
+                            ),
+                        )
+        except OSError:
+            raise MaestralApiError(
+                "Virtual file staging is unavailable",
+                "The private virtual-file stage directory is unsafe.",
+            ) from None
+
+    def _release_stage_lock(self) -> None:
+        if self._stage_lock_held:
+            self._stage_lock.release()
+            self._stage_lock_held = False
+
     def _recover(self) -> list[str]:
         """Replay desired native state and settle interrupted operations."""
         pinned_to_hydrate: list[str] = []
@@ -2548,21 +2721,17 @@ class VirtualFileController:
         native_by_id: dict[str, NativeFileRecord] = {}
         for native_record in native_records:
             self._validate_native_record(native_record)
-            native_path_lower = normalize(native_record.path)
-            if (
-                native_record.provider_id in native_ids
-                or native_path_lower in native_paths
-            ):
+            identity = native_record.identity
+            native_path_lower = normalize(identity.path)
+            if identity.provider_id in native_ids or native_path_lower in native_paths:
                 raise ValueError("The native recovery result has invalid identities")
-            native_ids.add(native_record.provider_id)
+            native_ids.add(identity.provider_id)
             native_paths.add(native_path_lower)
-            native_path_types[native_path_lower] = native_record.is_directory
-            native_by_id[native_record.provider_id] = native_record
+            native_path_types[native_path_lower] = identity.is_directory
+            native_by_id[identity.provider_id] = native_record
         _validate_tree_structure(native_path_types, "native recovery result")
         staged_records = [
-            record
-            for record in records
-            if record.staging_source_path_cased is not None
+            record for record in records if record.staging_source_path_cased is not None
         ]
         if staged_records:
             self._ensure_staged_move_sources(staged_records, native_by_id)
@@ -2585,14 +2754,11 @@ class VirtualFileController:
         if not self._needs_full_snapshot:
             for orphan in sorted(
                 orphan_records,
-                key=lambda item: item.path.count("/"),
+                key=lambda item: item.identity.path.count("/"),
                 reverse=True,
             ):
-                self._backend.remove(
-                    orphan.provider_id,
-                    expected=self._native_identity(orphan),
-                )
-                native_by_id.pop(orphan.provider_id, None)
+                self._backend.remove(self._native_identity(orphan))
+                native_by_id.pop(orphan.identity.provider_id, None)
 
         deleting = [
             record
@@ -2632,10 +2798,7 @@ class VirtualFileController:
                     self._get_store().put(preserved)
                 continue
             if recovered_native is not None:
-                self._backend.remove(
-                    record.provider_id,
-                    expected=self._native_identity(recovered_native),
-                )
+                self._backend.remove(self._native_identity(recovered_native))
                 native_by_id.pop(record.provider_id, None)
             with self._lock:
                 self._get_store().delete(record.provider_id)
@@ -2678,7 +2841,7 @@ class VirtualFileController:
             descriptor = self._descriptor(record)
             self._backend.upsert(
                 descriptor,
-                expected=(
+                expected_identity=(
                     self._native_identity(recovered_native)
                     if recovered_native is not None
                     else None
@@ -2816,13 +2979,10 @@ class VirtualFileController:
                     )
                 for orphan in sorted(
                     snapshot_orphans,
-                    key=lambda item: item.path.count("/"),
+                    key=lambda item: item.identity.path.count("/"),
                     reverse=True,
                 ):
-                    self._backend.remove(
-                        orphan.provider_id,
-                        expected=self._native_identity(orphan),
-                    )
+                    self._backend.remove(self._native_identity(orphan))
                 self._set_checkpoint(latest_cursor, needs_full_snapshot=False)
                 self._snapshot_native_by_id.clear()
                 return
@@ -2901,17 +3061,27 @@ class VirtualFileController:
             )
         return record
 
-    def _ensure_native_item_mutable(self, provider_id: str, operation: str) -> None:
-        """Reject a native mutation which could destroy local content or an open file."""
-        if not self.running:
-            return
-        native = self._inspect_native(provider_id)
+    @staticmethod
+    def _require_native_state_mutable(
+        native: NativeFileState | None,
+        operation: str,
+    ) -> None:
         if native is not None and (native.dirty or native.open_count):
             raise VirtualFileBusyError(
                 operation,
                 "The native item has local changes or is open. Its content was "
                 "preserved.",
             )
+
+    def _ensure_native_item_mutable(
+        self, provider_id: str, operation: str
+    ) -> NativeFileState | None:
+        """Reject a native mutation which could destroy local content or an open file."""
+        if not self.running:
+            return None
+        native = self._inspect_native(provider_id)
+        self._require_native_state_mutable(native, operation)
+        return native
 
     def _inspect_native(self, provider_id: str) -> NativeFileState | None:
         """Inspect one adapter item and validate its untrusted identity and state."""
@@ -2934,6 +3104,14 @@ class VirtualFileController:
         ):
             raise ValueError("The native inspection open count is invalid")
         return native
+
+    def _repair_failed_upsert(
+        self,
+        target: _VirtualFileRecord,
+        exc: BaseException,
+    ) -> None:
+        """Keep the durable target so an unchanged remote retry can repair it."""
+        self._save_error(target.provider_id, target.generation, exc)
 
     @staticmethod
     def _copy_record(

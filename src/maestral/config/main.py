@@ -90,6 +90,9 @@ DEFAULTS_STATE: _DefaultsType = {
         "pending_downloads": [],  # incomplete downloads to retry on next sync
         "ignored_symlink_paths": [],  # local symlink overlays ignored by sync
     },
+    "virtual_files": {
+        "root_bindings": {},  # durable per-root native source and visible paths
+    },
     "recovery": {
         "sync_reset": {},  # durable sync-state or unlink reset journal
         "vault_secret_cleanup": {},  # obsolete encrypted-vault password cleanup
