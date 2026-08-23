@@ -316,6 +316,58 @@ def test_restart_retries_interrupted_pinned_hydration(
         second.close()
 
 
+def test_restart_preserves_dirty_pinned_content(
+    config_name: str, tmp_path: Path
+) -> None:
+    provider = FakeVirtualProvider()
+    backend = FakeVirtualFileBackend()
+    first = make_controller(config_name, tmp_path, provider, backend)
+    metadata = provider.add_file("file-1", "/file.txt", "rev-1", b"remote")
+    first.reconcile_remote_change(metadata)
+    first.pin("file-1")
+    backend.items["file-1"].content = b"local changes"
+    backend.set_access_state("file-1", dirty=True)
+    first.close()
+
+    second = make_controller(config_name, tmp_path, provider, backend)
+    try:
+        status = second.get_status("file-1")
+        assert status["hydration_state"] == "hydrated"
+        assert status["pinned"] is True
+        assert status["error"] == "Local changes were preserved after restart."
+        assert backend.items["file-1"].content == b"local changes"
+        with pytest.raises(VirtualFileBusyError, match="local changes"):
+            second.hydrate("file-1")
+    finally:
+        second.close()
+
+
+def test_failed_reset_clears_cursor_before_rows(
+    config_name: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    provider = FakeVirtualProvider()
+    backend = FakeVirtualFileBackend()
+    controller = make_controller(config_name, tmp_path, provider, backend)
+    metadata = provider.add_file("file-1", "/file.txt", "rev-1", b"data")
+    controller.reconcile_remote_batch([metadata], "cursor-1")
+    controller.stop()
+
+    store = controller._get_store()
+    monkeypatch.setattr(
+        store.records,
+        "delete",
+        Mock(side_effect=RuntimeError("simulated database failure")),
+    )
+
+    try:
+        with pytest.raises(RuntimeError, match="simulated database failure"):
+            controller.reset()
+        assert controller.cursor == ""
+        assert controller.get_status("file-1")["revision"] == "rev-1"
+    finally:
+        controller.close()
+
+
 def test_restart_finishes_folder_deletion_from_children_up(
     config_name: str, tmp_path: Path
 ) -> None:

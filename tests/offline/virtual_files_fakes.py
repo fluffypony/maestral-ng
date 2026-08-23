@@ -213,6 +213,11 @@ class FakeVirtualFileBackend:
             raise VirtualFileRevisionError(
                 "Fake placeholder revision changed", item.provider_id
             )
+        if native.dirty:
+            raise VirtualFileBusyError(
+                "Cannot materialize the fake placeholder",
+                "The file has local changes.",
+            )
         with open(staged_path, "rb") as file:
             native.content = file.read()
         native.hydrated_revision = expected_revision

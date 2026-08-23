@@ -348,6 +348,10 @@ class VirtualFileController:
 
             try:
                 with self._remote_lock:
+                    # Publish an empty cursor before any destructive reset work. If the
+                    # process stops after this save, the next start performs a full
+                    # remote snapshot and rebuilds any missing native state.
+                    self._state.set("virtual_files", "cursor", "")
                     with self._lock:
                         records = sorted(
                             self._get_store().all(),
@@ -359,7 +363,6 @@ class VirtualFileController:
                             self._backend.remove(record.provider_id)
                     with self._lock:
                         self._get_store().records.delete(AllQuery())
-                        self._state.set("virtual_files", "cursor", "")
                         self._last_worker_error = ""
             finally:
                 if backend_started:
@@ -725,6 +728,11 @@ class VirtualFileController:
                             "The native open request has an old revision.",
                         )
                     native = self._backend.inspect(provider_id)
+                    if native is not None and native.dirty:
+                        raise VirtualFileBusyError(
+                            "Could not hydrate this file",
+                            "The native file has local changes which must be preserved.",
+                        )
                     if (
                         record.hydration_state is HydrationState.Hydrated
                         and record.materialized_revision == record.revision
@@ -941,10 +949,12 @@ class VirtualFileController:
         desired_ids = {record.provider_id for record in records}
         native_records = self._backend.recover()
         native_ids: set[str] = set()
+        native_by_id: dict[str, NativeFileRecord] = {}
         for native_record in native_records:
             if not native_record.provider_id or native_record.provider_id in native_ids:
                 raise ValueError("The native recovery result has invalid identities")
             native_ids.add(native_record.provider_id)
+            native_by_id[native_record.provider_id] = native_record
         for orphan_id in sorted(native_ids - desired_ids):
             self._backend.remove(orphan_id)
 
@@ -959,6 +969,16 @@ class VirtualFileController:
 
         for record in records:
             if record.hydration_state is HydrationState.Deleting:
+                continue
+            recovered_native = native_by_id.get(record.provider_id)
+            if recovered_native is not None and recovered_native.dirty:
+                preserved = self._copy_record(
+                    record,
+                    hydration_state=HydrationState.Hydrated,
+                    materialized_revision=recovered_native.hydrated_revision,
+                    last_error="Local changes were preserved after restart.",
+                )
+                self._get_store().put(preserved)
                 continue
             descriptor = self._descriptor(record)
             self._backend.upsert(descriptor)
