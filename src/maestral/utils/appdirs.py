@@ -19,6 +19,8 @@ __all__ = [
     "get_data_path",
 ]
 
+WINDOWS_LOCAL_APP_DIR = "Maestral Data"
+
 
 def to_full_path(
     path: str, subfolder: Optional[str], filename: Optional[str], create: bool
@@ -55,6 +57,13 @@ def _windows_appdata(local: bool) -> str:
 
     kind = "Local" if local else "Roaming"
     return osp.join(get_home_dir(), "AppData", kind)
+
+
+def _windows_local_subfolder(subfolder: Optional[str]) -> Optional[str]:
+    """Keep runtime data outside the legacy Windows application directory."""
+    if subfolder == "maestral":
+        return WINDOWS_LOCAL_APP_DIR
+    return subfolder
 
 
 def get_conf_path(
@@ -108,6 +117,7 @@ def get_data_path(
         state_path = os.environ.get("XDG_DATA_HOME", fallback)
     elif platform.system() == "Windows":
         state_path = _windows_appdata(local=True)
+        subfolder = _windows_local_subfolder(subfolder)
     else:
         raise RuntimeError("Platform not supported")
 
@@ -135,6 +145,7 @@ def get_cache_path(
         cache_path = os.environ.get("XDG_CACHE_HOME", fallback)
     elif platform.system() == "Windows":
         cache_path = _windows_appdata(local=True)
+        subfolder = _windows_local_subfolder(subfolder)
     else:
         raise RuntimeError("Platform not supported")
 
@@ -161,6 +172,7 @@ def get_log_path(
         log_path = get_cache_path(create=False)
     elif platform.system() == "Windows":
         log_path = _windows_appdata(local=True)
+        subfolder = _windows_local_subfolder(subfolder)
     else:
         raise RuntimeError("Platform not supported")
 
@@ -223,6 +235,7 @@ def get_runtime_path(
         runtime_path = os.environ.get("XDG_RUNTIME_DIR", fallback)
     elif platform.system() == "Windows":
         runtime_path = _windows_appdata(local=True)
+        subfolder = _windows_local_subfolder(subfolder)
     else:
         raise RuntimeError("Platform not supported")
 

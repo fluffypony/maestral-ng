@@ -86,7 +86,7 @@ def test_windows_app_dirs(monkeypatch, tmp_path):
     )
 
     endpoint = get_runtime_path("maestral", "work.endpoint")
-    assert endpoint == str(local / "maestral/work.endpoint")
+    assert endpoint == str(local / "Maestral Data/work.endpoint")
     assert Path(endpoint).parent.is_dir()
 
 
