@@ -8,6 +8,7 @@ import shutil
 import time
 import uuid
 from collections.abc import Iterator
+from dataclasses import replace as dataclass_replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import BinaryIO
@@ -21,13 +22,12 @@ from maestral.core import (
     Metadata,
     WriteMode,
 )
+from maestral.cryptomator import StorageMapEntry, VaultEntry, VaultInfo
 from maestral.exceptions import FileConflictError, NotFoundError
 from maestral.providers.encrypted import (
     EncryptedRemoteProvider,
     EncryptedVaultError,
     PhysicalVaultMirror,
-    VaultEntry,
-    VaultStorageEntry,
 )
 from maestral.utils.hashing import sha256_content_hasher
 from maestral.utils.path import normalize
@@ -35,6 +35,7 @@ from maestral.utils.path import normalize
 
 class FakeRemoteProvider:
     provider_id = "fake"
+    namespace_id = "namespace:fake"
     api_url = "https://example.invalid"
     content_hasher_factory = staticmethod(sha256_content_hasher)
     bandwidth_limit_up = 0.0
@@ -269,13 +270,13 @@ class FakeSecretStore:
     def __init__(self) -> None:
         self.secret: str | None = None
 
-    def load(self) -> str | None:
+    def load_password(self) -> str | None:
         return self.secret
 
-    def save(self, secret: str) -> None:
+    def save_password(self, secret: str) -> None:
         self.secret = secret
 
-    def delete(self) -> None:
+    def delete_password(self) -> None:
         self.secret = None
 
 
@@ -285,7 +286,7 @@ class FakeCryptomatorSession:
         self.vault_path: Path | None = None
         self.opened = False
         self.entries: dict[str, VaultEntry] = {}
-        self.storage: dict[str, VaultStorageEntry] = {}
+        self.storage: dict[str, StorageMapEntry] = {}
         self.contents: dict[str, bytes] = {}
 
     def _vault(self) -> Path:
@@ -304,7 +305,7 @@ class FakeCryptomatorSession:
         parent = posixpath.dirname(logical_path) or "/"
         if parent == "/":
             return "d/root"
-        return self.storage[parent]["storage_path"]
+        return self.storage[parent].storage_path
 
     def _entry_path(self, logical_path: str) -> str:
         return (
@@ -318,23 +319,23 @@ class FakeCryptomatorSession:
 
     def initialize(
         self, vault_path: str | os.PathLike[str], secret: bytes | bytearray
-    ) -> dict[str, object]:
+    ) -> VaultInfo:
         assert self._password(secret) == self.password
         self.vault_path = Path(vault_path)
         (self._vault() / "d" / "root").mkdir(parents=True)
         (self._vault() / "vault.cryptomator").write_bytes(b"signed vault config")
         (self._vault() / "masterkey.cryptomator").write_bytes(b"protected key")
         self.opened = True
-        return {"vault_format": 8, "key_id": "masterkeyfile:masterkey.cryptomator"}
+        return VaultInfo(self._vault(), 8, 220, "masterkeyfile:masterkey.cryptomator")
 
     def open(
         self, vault_path: str | os.PathLike[str], secret: bytes | bytearray
-    ) -> dict[str, object]:
+    ) -> VaultInfo:
         assert self._password(secret) == self.password
         self.vault_path = Path(vault_path)
         assert (self._vault() / "vault.cryptomator").is_file()
         self.opened = True
-        return {"vault_format": 8, "key_id": "masterkeyfile:masterkey.cryptomator"}
+        return VaultInfo(self._vault(), 8, 220, "masterkeyfile:masterkey.cryptomator")
 
     def close_vault(self) -> None:
         self.opened = False
@@ -345,11 +346,11 @@ class FakeCryptomatorSession:
     def snapshot(self, *, include_hash: bool = False) -> list[VaultEntry]:
         assert self.opened
         assert include_hash
-        return [self.entries[path].copy() for path in sorted(self.entries)]  # type: ignore[misc]
+        return [self.entries[path] for path in sorted(self.entries)]
 
-    def storage_map(self) -> list[VaultStorageEntry]:
+    def storage_map(self) -> list[StorageMapEntry]:
         assert self.opened
-        return [self.storage[path].copy() for path in sorted(self.storage)]  # type: ignore[misc]
+        return [self.storage[path] for path in sorted(self.storage)]
 
     def put_file(
         self,
@@ -367,27 +368,25 @@ class FakeCryptomatorSession:
             source.seek(0)
             content = source.read()
             source.seek(0)
-        storage_path = self.storage.get(logical_path, {}).get(
-            "storage_path", self._entry_path(logical_path)
+        current_storage = self.storage.get(logical_path)
+        storage_path = (
+            current_storage.storage_path
+            if current_storage is not None
+            else self._entry_path(logical_path)
         )
-        assert isinstance(storage_path, str)
         physical = self._physical(storage_path)
         physical.parent.mkdir(parents=True, exist_ok=True)
         physical.write_bytes(bytes(byte ^ 0xA5 for byte in content))
         self.contents[logical_path] = content
-        self.entries[logical_path] = {
-            "path": logical_path,
-            "type": "file",
-            "size": len(content),
-            "modified_ms": modified_ms or int(time.time() * 1000),
-            "sha256": hashlib.sha256(content).hexdigest(),
-            "link_target": "",
-        }
-        self.storage[logical_path] = {
-            "path": logical_path,
-            "type": "file",
-            "storage_path": storage_path,
-        }
+        self.entries[logical_path] = VaultEntry(
+            logical_path,
+            "file",
+            len(content),
+            modified_ms or int(time.time() * 1000),
+            hashlib.sha256(content).hexdigest(),
+            None,
+        )
+        self.storage[logical_path] = StorageMapEntry(logical_path, "file", storage_path)
 
     def get_file(
         self,
@@ -411,19 +410,15 @@ class FakeCryptomatorSession:
         marker = self._physical(self._entry_path(logical_path))
         marker.mkdir()
         (marker / "dir.c9r").write_bytes(token.encode())
-        self.entries[logical_path] = {
-            "path": logical_path,
-            "type": "directory",
-            "size": 0,
-            "modified_ms": int(time.time() * 1000),
-            "sha256": "",
-            "link_target": "",
-        }
-        self.storage[logical_path] = {
-            "path": logical_path,
-            "type": "directory",
-            "storage_path": storage_path,
-        }
+        self.entries[logical_path] = VaultEntry(
+            logical_path,
+            "directory",
+            0,
+            int(time.time() * 1000),
+        )
+        self.storage[logical_path] = StorageMapEntry(
+            logical_path, "directory", storage_path
+        )
 
     def move(self, source: str, target: str, *, replace: bool = False) -> None:
         assert not replace
@@ -439,14 +434,13 @@ class FakeCryptomatorSession:
             new_path = target + old_path[len(source) :]
             entry = self.entries.pop(old_path)
             storage = self.storage.pop(old_path)
-            entry["path"] = new_path
-            storage["path"] = new_path
-            if entry["type"] == "file" and old_path == source:
-                storage["storage_path"] = target_marker.relative_to(
-                    self._vault()
-                ).as_posix()
-            self.entries[new_path] = entry
-            self.storage[new_path] = storage
+            storage_path = storage.storage_path
+            if entry.type == "file" and old_path == source:
+                storage_path = target_marker.relative_to(self._vault()).as_posix()
+            self.entries[new_path] = dataclass_replace(entry, path=new_path)
+            self.storage[new_path] = dataclass_replace(
+                storage, path=new_path, storage_path=storage_path
+            )
             if old_path in self.contents:
                 self.contents[new_path] = self.contents.pop(old_path)
 
@@ -463,9 +457,9 @@ class FakeCryptomatorSession:
         else:
             marker.unlink()
         for path in sorted(selected, key=len, reverse=True):
-            if self.entries[path]["type"] == "directory":
+            if self.entries[path].type == "directory":
                 shutil.rmtree(
-                    self._physical(self.storage[path]["storage_path"]),
+                    self._physical(self.storage[path].storage_path),
                     ignore_errors=True,
                 )
             self.entries.pop(path)
