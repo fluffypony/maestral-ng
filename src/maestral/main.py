@@ -57,6 +57,7 @@ from .core import (
     SharedLinkMetadata,
     UpdateCheckResult,
 )
+from .cryptomator import CryptomatorClient, resolve_sidecar_path
 from .database.core import Database
 from .errorhandling import CONNECTION_ERRORS, convert_api_errors
 from .exceptions import (
@@ -70,7 +71,7 @@ from .exceptions import (
     UnsupportedFileTypeForDiff,
     UpdateCheckError,
 )
-from .keyring import CredentialStorage
+from .keyring import CredentialStorage, VaultSecretStorage
 from .logging import (
     LOG_FMT_SHORT,
     AwaitableHandler,
@@ -80,7 +81,8 @@ from .logging import (
 )
 from .manager import SyncManager
 from .models import SyncErrorEntry, SyncEvent, SyncStatus
-from .providers.base import create_provider, normalise_provider_name
+from .providers.base import RemoteProvider, create_provider, normalise_provider_name
+from .providers.encrypted import EncryptedRemoteProvider
 from .sync import SyncDirection, SyncEngine
 from .utils import exc_info_tuple, get_newer_version
 from .utils.appdirs import get_cache_path, get_data_path
@@ -219,12 +221,9 @@ class Maestral:
         self._check_and_run_post_update_scripts()
 
         # Set up sync infrastructure.
-        self.client = create_provider(
+        self.client = self._create_client(
             self.provider,
-            self.config_name,
             self.cred_storage,
-            bandwidth_limit_up=self.bandwidth_limit_up,
-            bandwidth_limit_down=self.bandwidth_limit_down,
         )
         self._sync_event_condition = threading.Condition()
         self._sync_event_cursor = 0
@@ -477,6 +476,222 @@ class Maestral:
         """The selected remote storage provider."""
         return self._provider
 
+    @property
+    def encryption_enabled(self) -> bool:
+        """Whether the selected remote provider uses a Cryptomator vault."""
+        enabled = self._conf.get("encryption", "enabled")
+        if not isinstance(enabled, bool):
+            raise ValueError("The encryption setting is invalid")
+        return enabled
+
+    @property
+    def encryption_vault_path(self) -> str:
+        """The absolute provider path of the configured Cryptomator vault."""
+        path = self._conf.get("encryption", "remote_path")
+        if not isinstance(path, str):
+            raise ValueError("The encrypted vault path is invalid")
+        return path
+
+    @property
+    def encryption_cache_path(self) -> str:
+        """The private local ciphertext mirror used by Cryptomator."""
+        path = self._conf.get("encryption", "cache_path")
+        if not isinstance(path, str):
+            raise ValueError("The encrypted cache path is invalid")
+        return path
+
+    @property
+    def encryption_vault_open(self) -> bool:
+        """Whether the configured Cryptomator vault is open."""
+        return (
+            isinstance(self.client, EncryptedRemoteProvider) and self.client.vault_open
+        )
+
+    def _create_client(
+        self,
+        provider: str,
+        cred_storage: CredentialStorage,
+        *,
+        encryption: tuple[bool, str, str] | None = None,
+    ) -> RemoteProvider:
+        """Create one base provider and apply the configured storage transform."""
+        base_client = create_provider(
+            provider,
+            self.config_name,
+            cred_storage,
+            bandwidth_limit_up=self.bandwidth_limit_up,
+            bandwidth_limit_down=self.bandwidth_limit_down,
+        )
+        if encryption is None:
+            encryption = (
+                self.encryption_enabled,
+                self.encryption_vault_path,
+                self.encryption_cache_path,
+            )
+        enabled, remote_path, cache_path = encryption
+        if not enabled:
+            return base_client
+        if not remote_path or not cache_path or not osp.isabs(cache_path):
+            base_client.close()
+            raise ValueError("The encrypted vault configuration is incomplete")
+
+        sidecar: CryptomatorClient | None = None
+        try:
+            sidecar = CryptomatorClient(resolve_sidecar_path())
+            return EncryptedRemoteProvider(
+                base_client,
+                VaultSecretStorage(self.config_name),
+                remote_path,
+                cache_path,
+                sidecar=sidecar,
+            )
+        except BaseException:
+            if sidecar is not None:
+                sidecar.terminate()
+            base_client.close()
+            raise
+
+    def _save_encryption_settings(
+        self, enabled: bool, remote_path: str, cache_path: str
+    ) -> None:
+        """Save all encryption settings as one configuration update."""
+        with self._conf._lock:
+            snapshot = self._conf._configuration_snapshot()
+            save_generation = self._conf.save_generation
+            try:
+                self._conf.set("encryption", "enabled", enabled, save=False)
+                self._conf.set("encryption", "remote_path", remote_path, save=False)
+                self._conf.set("encryption", "cache_path", cache_path, save=False)
+                self._conf.save()
+            except BaseException:
+                if not self._conf.save_committed_since(save_generation):
+                    self._conf._restore_configuration_snapshot(snapshot)
+                raise
+
+    def _check_client_can_change(self, operation: str) -> None:
+        """Reject provider-stack changes which could orphan live sync state."""
+        with self.manager._lock:
+            if (
+                self.manager.running.is_set()
+                or self.manager._active_internal_operation is not None
+            ):
+                raise BusyError(operation, "Please try again when sync is idle.")
+        if self._conf.get("auth", "account_id") or self.client.linked:
+            raise MaestralApiError(
+                operation,
+                "Unlink the current account before you change remote encryption.",
+            )
+        if self.sync.dropbox_path:
+            raise MaestralApiError(
+                operation,
+                "Remove the local sync folder before you change remote encryption.",
+            )
+        if self._state.get("recovery", "sync_reset"):
+            raise MaestralApiError(
+                operation, "Finish the pending account recovery first."
+            )
+
+    def configure_encryption(
+        self, remote_path: str, cache_path: str | None = None
+    ) -> None:
+        """Use one format-eight Cryptomator vault for this unlinked profile.
+
+        ``remote_path`` is an absolute path in the selected provider. ``cache_path``
+        stores ciphertext only. Maestral chooses a private application-data path when
+        it is omitted.
+        """
+        expanded_cache = osp.expanduser(
+            cache_path or get_data_path("maestral", f"{self.config_name}.cryptomator")
+        )
+        if not osp.isabs(expanded_cache):
+            raise ValueError("The encrypted cache path must be absolute")
+        resolved_cache = osp.abspath(expanded_cache)
+
+        with self._provider_selection_lock, self.sync.sync_lock:
+            if (
+                self.encryption_enabled
+                and remote_path == self.encryption_vault_path
+                and resolved_cache == self.encryption_cache_path
+            ):
+                return
+            self._check_client_can_change("Cannot configure remote encryption")
+            new_client = self._create_client(
+                self.provider,
+                self.cred_storage,
+                encryption=(True, remote_path, resolved_cache),
+            )
+            old_client = self.client
+            try:
+                self._save_encryption_settings(True, remote_path, resolved_cache)
+                self.client = new_client
+                self.sync.client = new_client
+            except BaseException:
+                new_client.close()
+                raise
+
+        try:
+            old_client.close()
+        except Exception:
+            self._logger.debug("Could not close the old provider client", exc_info=True)
+
+    def disable_encryption(self) -> None:
+        """Remove the Cryptomator transform from this unlinked profile."""
+        with self._provider_selection_lock, self.sync.sync_lock:
+            if not self.encryption_enabled:
+                return
+            self._check_client_can_change("Cannot disable remote encryption")
+            new_client = self._create_client(
+                self.provider,
+                self.cred_storage,
+                encryption=(False, "", ""),
+            )
+            old_client = self.client
+            try:
+                self._save_encryption_settings(False, "", "")
+                self.client = new_client
+                self.sync.client = new_client
+            except BaseException:
+                new_client.close()
+                raise
+
+        try:
+            old_client.close()
+        except Exception:
+            self._logger.debug("Could not close the old provider client", exc_info=True)
+
+    def initialise_encrypted_vault(self, password: str) -> None:
+        """Create and open the configured remote Cryptomator vault."""
+        with self.sync.sync_lock:
+            self._encrypted_client().initialise_vault(password)
+
+    def attach_encrypted_vault(self, password: str) -> None:
+        """Open an existing remote Cryptomator vault and save its password."""
+        with self.sync.sync_lock:
+            self._encrypted_client().attach_vault(password)
+
+    def unlock_encrypted_vault(self) -> None:
+        """Open the configured vault with its saved keyring password."""
+        with self.sync.sync_lock:
+            self._encrypted_client().unlock_vault()
+
+    def lock_encrypted_vault(self) -> None:
+        """Close the configured vault and wipe its in-memory password."""
+        with self.manager._lock:
+            if self.manager.running.is_set():
+                raise BusyError(
+                    "Cannot lock the encrypted vault", "Stop sync and try again."
+                )
+        with self.sync.sync_lock:
+            self._encrypted_client().lock_vault()
+
+    def _encrypted_client(self) -> EncryptedRemoteProvider:
+        if not isinstance(self.client, EncryptedRemoteProvider):
+            raise MaestralApiError(
+                "Remote encryption is not configured",
+                "Configure a Cryptomator vault and try again.",
+            )
+        return self.client
+
     def _save_provider_selection(self, provider: str, *, selected: bool) -> None:
         """Save the provider and its explicit selection as one config update."""
         with self._conf._lock:
@@ -544,12 +759,9 @@ class Maestral:
                 new_cred_storage = CredentialStorage(
                     self.config_name, selected_provider
                 )
-                new_client = create_provider(
+                new_client = self._create_client(
                     selected_provider,
-                    self.config_name,
                     new_cred_storage,
-                    bandwidth_limit_up=self.bandwidth_limit_up,
-                    bandwidth_limit_down=self.bandwidth_limit_down,
                 )
                 try:
                     self._save_provider_selection(selected_provider, selected=True)
@@ -602,6 +814,8 @@ class Maestral:
             "provider_selected",
         }:
             raise ValueError("Use the provider selection API for this setting")
+        if normalised_section == "encryption":
+            raise ValueError("Use the remote encryption API for this setting")
         self._conf.set(section, name, value)
 
     def get_conf(self, section: str, name: str) -> Any:
@@ -798,6 +1012,10 @@ class Maestral:
             "config_name": self.config_name,
             "version": self.version,
             "provider": self.provider,
+            "encryption_enabled": self.encryption_enabled,
+            "encryption_vault_path": self.encryption_vault_path,
+            "encryption_cache_path": self.encryption_cache_path,
+            "encryption_vault_open": self.encryption_vault_open,
             "status": self.status,
             "pending_link": self.pending_link,
             "pending_dropbox_folder": self.pending_dropbox_folder,

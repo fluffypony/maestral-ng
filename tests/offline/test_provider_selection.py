@@ -4,10 +4,12 @@ from unittest.mock import Mock
 import pytest
 
 import maestral.config.main as config_module
+import maestral.main as main_module
 from maestral.client import DropboxClient
 from maestral.config import MaestralConfig
 from maestral.exceptions import MaestralApiError, NotLinkedError
 from maestral.main import Maestral
+from maestral.providers.encrypted import EncryptedRemoteProvider
 from maestral.providers.google_drive import GoogleDriveProvider
 from maestral.rpc import JsonRpcDispatcher
 
@@ -32,6 +34,19 @@ def rpc_request(
     if params is not None:
         request["params"] = params
     return request
+
+
+class FakeCryptomatorClient:
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.terminated = False
+        self.shutdown_called = False
+
+    def shutdown(self) -> None:
+        self.shutdown_called = True
+
+    def terminate(self) -> None:
+        self.terminated = True
 
 
 def test_provider_must_be_selected_before_authentication(
@@ -149,6 +164,89 @@ def test_rpc_exposes_provider_selection_and_snapshot(
     assert "set_provider" in handshake["methods"]
     assert response["result"] is None
     assert snapshot["provider"] == "google_drive"
+
+
+def test_encryption_configuration_rebuilds_provider_stack(
+    unselected_maestral: Maestral,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cache_path = tmp_path / "ciphertext"
+    monkeypatch.setattr(main_module, "CryptomatorClient", FakeCryptomatorClient)
+    monkeypatch.setattr(
+        main_module, "resolve_sidecar_path", lambda: Path("/fake/cryptomator")
+    )
+
+    unselected_maestral.configure_encryption("/Maestral Vault", str(cache_path))
+
+    config = MaestralConfig(unselected_maestral.config_name)
+    assert isinstance(unselected_maestral.client, EncryptedRemoteProvider)
+    assert unselected_maestral.sync.client is unselected_maestral.client
+    assert unselected_maestral.encryption_enabled is True
+    assert unselected_maestral.encryption_vault_path == "/Maestral Vault"
+    assert unselected_maestral.encryption_cache_path == str(cache_path)
+    assert unselected_maestral.encryption_vault_open is False
+    assert config.get("encryption", "enabled") is True
+    assert config.get("encryption", "remote_path") == "/Maestral Vault"
+    assert config.get("encryption", "cache_path") == str(cache_path)
+
+    unselected_maestral.set_provider("google_drive")
+    assert isinstance(unselected_maestral.client, EncryptedRemoteProvider)
+    assert unselected_maestral.provider == "google_drive"
+    assert unselected_maestral.client.provider_id == "cryptomator_google_drive"
+
+    unselected_maestral.disable_encryption()
+    assert isinstance(unselected_maestral.client, GoogleDriveProvider)
+    assert unselected_maestral.encryption_enabled is False
+    assert unselected_maestral.encryption_vault_path == ""
+    assert unselected_maestral.encryption_cache_path == ""
+
+
+def test_encryption_configuration_is_exposed_over_rpc(
+    unselected_maestral: Maestral,
+) -> None:
+    dispatcher = JsonRpcDispatcher(unselected_maestral)
+    handshake = dispatcher.dispatch(rpc_request("rpc.handshake"))["result"]
+    snapshot = dispatcher.dispatch(rpc_request("get_app_snapshot"))["result"]
+
+    assert "configure_encryption" in handshake["methods"]
+    assert "disable_encryption" in handshake["methods"]
+    assert "initialise_encrypted_vault" in handshake["methods"]
+    assert "attach_encrypted_vault" in handshake["methods"]
+    assert "unlock_encrypted_vault" in handshake["methods"]
+    assert "lock_encrypted_vault" in handshake["methods"]
+    assert "encryption_enabled" in handshake["properties"]["read"]
+    assert "encryption_vault_open" in handshake["properties"]["read"]
+    assert snapshot["encryption_enabled"] is False
+    assert snapshot["encryption_vault_path"] == ""
+    assert snapshot["encryption_cache_path"] == ""
+    assert snapshot["encryption_vault_open"] is False
+
+
+def test_encryption_configuration_rejects_unsafe_transitions(
+    unselected_maestral: Maestral,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(main_module, "CryptomatorClient", FakeCryptomatorClient)
+    monkeypatch.setattr(
+        main_module, "resolve_sidecar_path", lambda: Path("/fake/cryptomator")
+    )
+
+    with pytest.raises(ValueError, match="cache path must be absolute"):
+        unselected_maestral.configure_encryption("/Vault", "relative/cache")
+
+    unselected_maestral._conf.set("auth", "account_id", "linked-account")
+    with pytest.raises(MaestralApiError, match="Unlink the current account"):
+        unselected_maestral.configure_encryption("/Vault", str(tmp_path / "ciphertext"))
+    unselected_maestral._conf.set("auth", "account_id", "")
+
+    unselected_maestral.sync.dropbox_path = str(tmp_path / "sync")
+    with pytest.raises(MaestralApiError, match="local sync folder"):
+        unselected_maestral.configure_encryption("/Vault", str(tmp_path / "ciphertext"))
+
+    with pytest.raises(ValueError, match="remote encryption API"):
+        unselected_maestral.set_conf("encryption", "enabled", True)
 
 
 @pytest.mark.parametrize("provider", ["onedrive", "", "dropbox_v2"])

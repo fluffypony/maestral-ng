@@ -29,6 +29,11 @@ DEFAULTS_CONFIG: _DefaultsType = {
         "keyring": "automatic",  # keychain backend to use for credential storage
         "token_access_type": "offline",
     },
+    "encryption": {
+        "enabled": False,  # wrap the remote provider in a Cryptomator vault
+        "remote_path": "",  # absolute provider path of the format-8 vault
+        "cache_path": "",  # private local ciphertext mirror
+    },
     "app": {
         "notification_level": 15,  # desktop notification level, default: FILECHANGE
         "log_level": 20,  # log level for journal and file, default: INFO
