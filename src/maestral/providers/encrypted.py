@@ -123,6 +123,7 @@ class VaultSecretStore(Protocol):
 
 _PhysicalKind = Literal["file", "directory"]
 _PhysicalOperationKind = Literal["move", "mkdir", "upload", "remove"]
+_VaultState = Literal["locked", "opening", "open", "closing", "failed", "closed"]
 _WINDOWS_RESERVED_NAMES = {
     "CON",
     "PRN",
@@ -1786,14 +1787,12 @@ class EncryptedRemoteProvider:
         self._metadata_by_path: dict[str, FileMetadata | FolderMetadata] = {}
         self._metadata_by_id: dict[str, FileMetadata | FolderMetadata] = {}
         self._cursor = ""
-        self._loaded = False
+        self._state: _VaultState = "locked"
         self._closed = False
 
         self.config_name = provider.config_name
         self.provider_id = f"cryptomator_{provider.provider_id}"
         self.api_url = provider.api_url
-        self.bandwidth_limit_up = provider.bandwidth_limit_up
-        self.bandwidth_limit_down = provider.bandwidth_limit_down
 
     @property
     def linked(self) -> bool:
@@ -1812,8 +1811,24 @@ class EncryptedRemoteProvider:
         return self._provider.is_team_space
 
     @property
+    def bandwidth_limit_up(self) -> float:
+        return self._provider.bandwidth_limit_up
+
+    @bandwidth_limit_up.setter
+    def bandwidth_limit_up(self, value: float) -> None:
+        self._provider.bandwidth_limit_up = value
+
+    @property
+    def bandwidth_limit_down(self) -> float:
+        return self._provider.bandwidth_limit_down
+
+    @bandwidth_limit_down.setter
+    def bandwidth_limit_down(self, value: float) -> None:
+        self._provider.bandwidth_limit_down = value
+
+    @property
     def vault_open(self) -> bool:
-        return self._loaded
+        return self._state == "open"
 
     @property
     def vault_path(self) -> str:
@@ -1854,7 +1869,7 @@ class EncryptedRemoteProvider:
 
     def update_path_root(self, root_info: RootInfo) -> None:
         with self._lock:
-            if self._loaded:
+            if self._state == "open":
                 raise EncryptedVaultError(
                     "Cannot change the remote account root",
                     "Lock the encrypted vault before this account change.",
@@ -1864,69 +1879,69 @@ class EncryptedRemoteProvider:
     def initialise_vault(self, secret: str) -> None:
         """Create a new format-eight vault in an empty remote folder."""
         secret_bytes = self._encode_secret(secret)
+        adopted = False
         with self._lock:
-            self._require_open_provider()
-            if self._loaded:
+            try:
+                self._require_open_provider()
+                self._require_locked_state()
+            except BaseException:
                 self._wipe(secret_bytes)
-                raise EncryptedVaultError(
-                    "Encrypted vault is already open",
-                    "Lock the current vault before creating another vault.",
-                )
+                raise
             try:
                 self._prepare_local_root_for_initialisation()
+                self._state = "opening"
                 self._vault_info = self._sidecar.initialize(
                     self._mirror.local_root, secret_bytes
                 )
+                self._state = "closing"
                 self._sidecar.close_vault()
-                self._mirror.initialise_remote()
-                self._vault_info = self._sidecar.open(
-                    self._mirror.local_root, secret_bytes
-                )
+                self._state = "locked"
+                self._vault_info = None
                 self._secret_store.save_password(secret)
-                self._secret = secret_bytes
-                self._loaded = True
-                self._rebuild_logical_metadata()
+                self._mirror.initialise_remote()
+                self._open_with_secret(secret_bytes)
+                adopted = True
             except BaseException:
-                if self._secret is not secret_bytes:
+                if self._state != "locked":
+                    self._abort_sidecar(secret_bytes)
+                else:
                     self._wipe(secret_bytes)
-                self._loaded = False
                 raise
+            finally:
+                if not adopted:
+                    self._wipe(secret_bytes)
 
     def attach_vault(self, secret: str) -> None:
         """Verify and save the password for an existing remote vault."""
         secret_bytes = self._encode_secret(secret)
+        adopted = False
         with self._lock:
-            self._require_open_provider()
-            if self._loaded:
-                self._wipe(secret_bytes)
-                raise EncryptedVaultError(
-                    "Encrypted vault is already open",
-                    "Lock the current vault before attaching another vault.",
-                )
             try:
-                self._cursor = self._mirror.refresh()
-                self._vault_info = self._sidecar.open(
-                    self._mirror.local_root, secret_bytes
-                )
-                self._rebuild_logical_metadata()
-                self._secret_store.save_password(secret)
-                self._secret = secret_bytes
-                self._loaded = True
+                self._require_open_provider()
+                self._require_locked_state()
             except BaseException:
                 self._wipe(secret_bytes)
-                try:
-                    self._sidecar.close_vault()
-                except Exception:
-                    pass
-                self._loaded = False
                 raise
+            try:
+                self._cursor = self._mirror.refresh()
+                self._open_with_secret(secret_bytes)
+                self._secret_store.save_password(secret)
+                adopted = True
+            except BaseException:
+                if self._state != "locked":
+                    self._abort_sidecar(secret_bytes)
+                raise
+            finally:
+                if not adopted:
+                    self._wipe(secret_bytes)
 
     def unlock_vault(self) -> None:
         """Load the saved password and open the configured remote vault."""
         with self._lock:
-            if self._loaded:
+            if self._state == "open":
                 return
             self._require_open_provider()
+            self._require_locked_state()
             secret = self._secret_store.load_password()
             if secret is None:
                 raise EncryptedVaultError(
@@ -1934,43 +1949,55 @@ class EncryptedRemoteProvider:
                     "Save the vault password in the system keyring and try again.",
                 )
             secret_bytes = self._encode_secret(secret)
+            adopted = False
             try:
                 self._cursor = self._mirror.refresh()
-                self._vault_info = self._sidecar.open(
-                    self._mirror.local_root, secret_bytes
-                )
-                self._secret = secret_bytes
-                self._loaded = True
-                self._rebuild_logical_metadata()
+                self._open_with_secret(secret_bytes)
+                adopted = True
             except BaseException:
-                self._wipe(secret_bytes)
-                self._loaded = False
+                if self._state != "locked":
+                    self._abort_sidecar(secret_bytes)
                 raise
+            finally:
+                if not adopted:
+                    self._wipe(secret_bytes)
 
     def lock_vault(self) -> None:
         with self._lock:
-            if self._loaded:
+            if self._state == "open":
+                self._state = "closing"
                 try:
                     self._sidecar.close_vault()
-                finally:
-                    self._loaded = False
-                    self._metadata_by_path.clear()
-                    self._metadata_by_id.clear()
-                    self._vault_info = None
-            if self._secret is not None:
-                self._wipe(self._secret)
-                self._secret = None
+                except BaseException:
+                    self._abort_sidecar()
+                    raise
+                self._state = "locked"
+            self._clear_runtime_state()
 
     def close(self) -> None:
         with self._lock:
             if self._closed:
                 return
+            first_error: BaseException | None = None
             try:
                 self.lock_vault()
+            except BaseException as exc:
+                first_error = exc
+            try:
                 self._sidecar.shutdown()
-            finally:
-                self._closed = True
+            except BaseException as exc:
+                if first_error is None:
+                    first_error = exc
+            try:
                 self._provider.close()
+            except BaseException as exc:
+                if first_error is None:
+                    first_error = exc
+            self._clear_runtime_state()
+            self._closed = True
+            self._state = "closed"
+            if first_error is not None:
+                raise first_error
 
     def __enter__(self) -> EncryptedRemoteProvider:
         return self
@@ -2289,60 +2316,130 @@ class EncryptedRemoteProvider:
         raise self._unsupported("shared links")
 
     def _ensure_loaded(self) -> None:
-        if not self._loaded:
+        if self._state != "open":
             self.unlock_vault()
 
     def _require_open_provider(self) -> None:
-        if self._closed:
+        if self._closed or self._state == "closed":
             raise EncryptedVaultError(
                 "Encrypted provider is closed", "Start a new provider session."
+            )
+        if self._state == "failed":
+            raise EncryptedVaultError(
+                "Encrypted sidecar session failed",
+                "Start a new provider session before another vault operation.",
             )
         if not self._provider.linked:
             raise EncryptedVaultError(
                 "Remote account is not linked", "Link the remote account first."
             )
 
+    def _require_locked_state(self) -> None:
+        if self._state == "open":
+            raise EncryptedVaultError(
+                "Encrypted vault is already open",
+                "Lock the current vault before opening another vault.",
+            )
+        if self._state != "locked":
+            raise EncryptedVaultError(
+                "Encrypted vault session is unavailable",
+                "Start a new provider session before another vault operation.",
+            )
+
+    def _open_with_secret(self, secret: bytearray) -> None:
+        self._require_locked_state()
+        self._state = "opening"
+        self._vault_info = self._sidecar.open(self._mirror.local_root, secret)
+        self._rebuild_logical_metadata()
+        self._secret = secret
+        self._state = "open"
+
+    def _close_for_transition(self) -> bytearray:
+        secret = self._require_secret()
+        if self._state != "open":
+            raise EncryptedVaultError(
+                "Encrypted vault is not open", "Unlock the vault and try again."
+            )
+        self._state = "closing"
+        try:
+            self._sidecar.close_vault()
+        except BaseException:
+            self._abort_sidecar(secret)
+            raise
+        self._state = "locked"
+        self._vault_info = None
+        self._metadata_by_path.clear()
+        self._metadata_by_id.clear()
+        return secret
+
+    def _clear_runtime_state(self) -> None:
+        self._metadata_by_path.clear()
+        self._metadata_by_id.clear()
+        self._vault_info = None
+        if self._secret is not None:
+            self._wipe(self._secret)
+            self._secret = None
+
+    def _abort_sidecar(self, candidate_secret: bytearray | None = None) -> None:
+        try:
+            self._sidecar.close_vault()
+        except BaseException:
+            pass
+        try:
+            self._sidecar.shutdown()
+        except BaseException:
+            pass
+        current_secret = self._secret
+        self._clear_runtime_state()
+        if candidate_secret is not None and candidate_secret is not current_secret:
+            self._wipe(candidate_secret)
+        self._state = "failed"
+
     def _refresh_locked(self) -> None:
-        self._sidecar.close_vault()
+        secret = self._close_for_transition()
         try:
             self._cursor = self._mirror.refresh()
-            self._vault_info = self._sidecar.open(
-                self._mirror.local_root, self._require_secret()
-            )
-            self._rebuild_logical_metadata()
+            self._open_with_secret(secret)
         except BaseException:
-            self._loaded = False
+            self._abort_sidecar(secret)
             raise
 
     def _mutate_locked(self, operation: Callable[[], None]) -> None:
+        if self._mirror.journal_path.exists():
+            secret = self._close_for_transition()
+            try:
+                self._mirror.resume_pending_transaction()
+                self._open_with_secret(secret)
+            except BaseException:
+                self._abort_sidecar(secret)
+                raise
         before = self._mirror.snapshot_local()
         try:
             operation()
-        except BaseException:
-            self._recover_from_remote_locked()
+        except BaseException as operation_error:
+            try:
+                secret = self._close_for_transition()
+                self._cursor = self._mirror.refresh()
+                self._open_with_secret(secret)
+            except BaseException as recovery_error:
+                self._abort_sidecar(self._secret)
+                raise operation_error from recovery_error
             raise
-        self._sidecar.close_vault()
+        secret = self._close_for_transition()
         try:
             self._mirror.commit(before)
-            self._vault_info = self._sidecar.open(
-                self._mirror.local_root, self._require_secret()
-            )
-            self._rebuild_logical_metadata()
-        except BaseException:
-            self._recover_from_remote_locked()
+        except BaseException as commit_error:
+            try:
+                self._open_with_secret(secret)
+            except BaseException as reopen_error:
+                self._abort_sidecar(secret)
+                raise commit_error from reopen_error
             raise
-
-    def _recover_from_remote_locked(self) -> None:
         try:
-            self._sidecar.close_vault()
-        except Exception:
-            pass
-        self._cursor = self._mirror.refresh()
-        self._vault_info = self._sidecar.open(
-            self._mirror.local_root, self._require_secret()
-        )
-        self._loaded = True
-        self._rebuild_logical_metadata()
+            self._open_with_secret(secret)
+        except BaseException:
+            self._abort_sidecar(secret)
+            raise
 
     def _logical_change_page(
         self, indexed_paths: Mapping[str, str] | None

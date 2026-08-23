@@ -296,6 +296,7 @@ class FakeCryptomatorSession:
         self.password = password
         self.vault_path: Path | None = None
         self.opened = False
+        self.shutdown_count = 0
         self.entries: dict[str, VaultEntry] = {}
         self.storage: dict[str, StorageMapEntry] = {}
         self.contents: dict[str, bytes] = {}
@@ -353,6 +354,7 @@ class FakeCryptomatorSession:
 
     def shutdown(self) -> None:
         self.opened = False
+        self.shutdown_count += 1
 
     def snapshot(self, *, include_hash: bool = False) -> list[VaultEntry]:
         assert self.opened
@@ -740,3 +742,54 @@ def test_encrypted_provider_rejects_storage_map_mismatch(tmp_path: Path) -> None
     with pytest.raises(EncryptedVaultError, match="different sizes"):
         provider._rebuild_logical_metadata()
     provider.close()
+
+
+def test_failed_vault_rebuild_terminates_sidecar_and_wipes_secret(
+    tmp_path: Path,
+) -> None:
+    sidecar = FakeCryptomatorSession("password")
+    provider = EncryptedRemoteProvider(
+        FakeRemoteProvider(tmp_path / "remote-provider"),
+        FakeSecretStore(),
+        "/Encrypted",
+        tmp_path / "ciphertext-cache",
+        sidecar=sidecar,
+    )
+    provider.initialise_vault("password")
+    provider.upload(io.BytesIO(b"content"), "/file.txt")
+    provider.lock_vault()
+    sidecar.storage.clear()
+
+    with pytest.raises(EncryptedVaultError, match="different sizes"):
+        provider.unlock_vault()
+
+    assert provider._state == "failed"
+    assert provider._secret is None
+    assert provider._metadata_by_path == {}
+    assert sidecar.shutdown_count == 1
+
+
+def test_failed_vault_close_terminates_sidecar_and_wipes_secret(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sidecar = FakeCryptomatorSession("password")
+    provider = EncryptedRemoteProvider(
+        FakeRemoteProvider(tmp_path / "remote-provider"),
+        FakeSecretStore(),
+        "/Encrypted",
+        tmp_path / "ciphertext-cache",
+        sidecar=sidecar,
+    )
+    provider.initialise_vault("password")
+
+    def fail_close() -> None:
+        raise RuntimeError("close failed")
+
+    monkeypatch.setattr(sidecar, "close_vault", fail_close)
+    with pytest.raises(RuntimeError, match="close failed"):
+        provider.lock_vault()
+
+    assert provider._state == "failed"
+    assert provider._secret is None
+    assert provider._metadata_by_path == {}
+    assert sidecar.shutdown_count == 1
