@@ -1461,6 +1461,10 @@ def test_recovery_completion_rebinds_replacement_after_clear(
     sync_engine.rescan.assert_called_once_with(str(local_path))
 
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="Windows open writers prevent path evacuation",
+)
 def test_remote_ancestor_deletion_recovers_writes_from_open_managed_file(
     sync_engine: SyncEngine, tmp_path: Path
 ) -> None:
