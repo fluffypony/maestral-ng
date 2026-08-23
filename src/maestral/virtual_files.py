@@ -1639,6 +1639,22 @@ class VirtualFileController:
         return page.entries, cursor, page.has_more
 
     @staticmethod
+    def _validate_full_snapshot(entries: Sequence[Metadata]) -> None:
+        """Validate one authoritative live tree without consulting stored rows."""
+        provider_ids: set[str] = set()
+        paths: dict[str, bool] = {}
+        for entry in entries:
+            if not isinstance(entry, (FileMetadata, FolderMetadata)):
+                raise ValueError("The remote snapshot contains a non-live entry")
+            if entry.id in provider_ids:
+                raise ValueError("The remote snapshot has duplicate provider IDs")
+            if entry.path_lower in paths:
+                raise ValueError("The remote snapshot has duplicate final paths")
+            provider_ids.add(entry.id)
+            paths[entry.path_lower] = isinstance(entry, FolderMetadata)
+        _validate_tree_structure(paths, "remote snapshot")
+
+    @staticmethod
     def _validate_remote_metadata(metadata: Metadata) -> None:
         """Reject remote metadata which cannot map to one contained native item."""
         if not isinstance(metadata, (DeletedMetadata, FileMetadata, FolderMetadata)):
@@ -2609,6 +2625,7 @@ class VirtualFileController:
                     snapshot_complete = not has_more
                 if not saw_page or not snapshot_complete:
                     raise ValueError("The remote snapshot is incomplete")
+                self._validate_full_snapshot(snapshot_entries)
                 if self._needs_full_snapshot:
                     self._prepare_missing_database_snapshot(snapshot_entries)
                 seen_ids = self._reconcile_remote_batch(

@@ -1477,6 +1477,28 @@ def test_malformed_snapshot_tree_fails_before_native_mutation(
     controller.close()
 
 
+def test_full_snapshot_cannot_borrow_a_parent_from_stale_rows(
+    config_name: str, tmp_path: Path
+) -> None:
+    provider = FakeVirtualProvider()
+    backend = FakeVirtualFileBackend()
+    controller = make_controller(config_name, tmp_path, provider, backend)
+    parent = make_folder("parent-old", "/Parent")
+    controller.reconcile_remote_batch([parent], "cursor-old")
+    controller._state.set("virtual_files", "cursor", "")
+    child = provider.add_file("child-new", "/Parent/Child.txt", "rev-1", b"child")
+    provider.pages = [ListFolderResult([child], False, "cursor-new")]
+    call_count = len(backend.calls)
+
+    with pytest.raises(ValueError, match="missing parent directory"):
+        controller.refresh_remote()
+
+    assert len(backend.calls) == call_count
+    assert set(backend.items) == {"parent-old"}
+    assert controller.cursor == ""
+    controller.close()
+
+
 def test_corrupt_store_tree_fails_before_native_mutation(
     config_name: str, tmp_path: Path
 ) -> None:
