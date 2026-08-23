@@ -9,8 +9,43 @@ import requests
 
 import maestral.main
 from maestral.constants import GITHUB_RELEASES_API
-from maestral.exceptions import MaestralApiError, NotLinkedError
+from maestral.exceptions import (
+    MaestralApiError,
+    NotLinkedError,
+    VirtualFilesUnsupportedError,
+)
 from maestral.main import Maestral
+from maestral.virtual_files import VirtualFileRootBinding, VirtualFileRootIdentity
+
+from .virtual_files_fakes import FakeVirtualFileBackend
+
+
+def unlink_reset_journal(
+    *,
+    sync_mode: str = "mirror",
+    root_path: str = "",
+    source_root_path: str = "",
+    source_root_identity: list[object] | None = None,
+    root_marker_id: str = "",
+    native_registration_committed: bool = False,
+) -> dict[str, object]:
+    return {
+        "kind": "unlink",
+        "phase": "virtual",
+        "provider": "dropbox",
+        "account_id": "old-account",
+        "keyring": "automatic",
+        "credentials_deleted": True,
+        "vault_password_deleted": True,
+        "virtual_files_reset": False,
+        "sync_mode": sync_mode,
+        "root_path": root_path,
+        "source_root_path": source_root_path,
+        "source_root_identity": source_root_identity,
+        "root_marker_id": root_marker_id,
+        "native_registration_committed": native_registration_committed,
+        "root_marker_removed": False,
+    }
 
 
 def test_root_creation_reservation_blocks_a_concurrent_start(
@@ -206,6 +241,349 @@ def test_unlink_keeps_valid_default_state_with_existing_database(
     assert m._state.get("account", "path_root_nsid") == ""
     backup_path = Path(m._conf.backup_path_for_version(None))
     assert "linked-account" not in backup_path.read_text()
+
+
+@pytest.mark.parametrize(
+    ("sync_mode", "registered"),
+    [("mirror", True), ("virtual", False)],
+)
+def test_unlink_without_a_live_virtual_registration_clears_core_state(
+    m: Maestral,
+    monkeypatch: pytest.MonkeyPatch,
+    sync_mode: str,
+    registered: bool,
+) -> None:
+    journal = unlink_reset_journal(
+        sync_mode=sync_mode,
+        native_registration_committed=registered,
+    )
+    m._state.set("recovery", "sync_reset", journal)
+    clear = Mock()
+    detach = Mock()
+    monkeypatch.setattr(m.virtual_files, "clear", clear)
+    monkeypatch.setattr(m.virtual_files, "detach", detach)
+    monkeypatch.setattr(m.manager, "reload_download_queue", Mock())
+
+    m._complete_pending_unlink_reset()
+
+    clear.assert_called_once_with()
+    detach.assert_not_called()
+    completed = m._state.get("recovery", "sync_reset")
+    assert completed["phase"] == "queue"
+    assert completed["virtual_files_reset"] is True
+    assert completed["root_marker_removed"] is True
+
+
+def test_registered_virtual_unlink_detaches_before_marker_removal(
+    m: Maestral,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    marker_id = "a" * 32
+    source = tmp_path / "source"
+    visible = tmp_path / "visible"
+    source.mkdir()
+    visible.mkdir()
+    marker = source / ".maestral-root"
+    marker.write_text(f"maestral-root-v1:{marker_id}\n")
+    marker.chmod(0o600)
+    source_stat = source.lstat()
+    journal = unlink_reset_journal(
+        sync_mode="virtual",
+        root_path=str(visible),
+        source_root_path=str(source),
+        source_root_identity=[
+            str(source_stat.st_dev),
+            str(source_stat.st_ino),
+            source_stat.st_mode,
+        ],
+        root_marker_id=marker_id,
+        native_registration_committed=True,
+    )
+    m._state.set("recovery", "sync_reset", journal)
+
+    def detach(root_path: str, saved_marker_id: str) -> str:
+        assert marker.is_file()
+        assert root_path == str(visible)
+        assert saved_marker_id == marker_id
+        return str(source)
+
+    monkeypatch.setattr(m.virtual_files, "detach", Mock(side_effect=detach))
+    monkeypatch.setattr(m.virtual_files, "clear", Mock())
+    monkeypatch.setattr(m.manager, "reload_download_queue", Mock())
+
+    m._complete_pending_unlink_reset()
+
+    assert not marker.exists()
+    m.virtual_files.clear.assert_not_called()
+    completed = m._state.get("recovery", "sync_reset")
+    assert completed["phase"] == "queue"
+    assert completed["root_marker_removed"] is True
+
+
+def test_failed_virtual_detach_keeps_the_unlink_reset_replayable(
+    m: Maestral,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    marker_id = "b" * 32
+    source = tmp_path / "source"
+    visible = tmp_path / "visible"
+    source.mkdir()
+    visible.mkdir()
+    marker = source / ".maestral-root"
+    marker.write_text(f"maestral-root-v1:{marker_id}\n")
+    source_stat = source.lstat()
+    journal = unlink_reset_journal(
+        sync_mode="virtual",
+        root_path=str(visible),
+        source_root_path=str(source),
+        source_root_identity=[
+            str(source_stat.st_dev),
+            str(source_stat.st_ino),
+            source_stat.st_mode,
+        ],
+        root_marker_id=marker_id,
+        native_registration_committed=True,
+    )
+    m._state.set("recovery", "sync_reset", journal)
+    detach = Mock(side_effect=OSError("native detach failed"))
+    monkeypatch.setattr(m.virtual_files, "detach", detach)
+    monkeypatch.setattr(m.manager, "reload_download_queue", Mock())
+
+    with pytest.raises(OSError, match="native detach failed"):
+        m._complete_pending_unlink_reset()
+
+    assert marker.is_file()
+    assert m._state.get("recovery", "sync_reset") == journal
+
+
+def test_unlink_retries_after_native_detach_before_marker_removal(
+    m: Maestral,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    marker_id = "c" * 32
+    source = tmp_path / "source"
+    visible = tmp_path / "visible"
+    source.mkdir()
+    visible.mkdir()
+    marker = source / ".maestral-root"
+    marker.write_text(f"maestral-root-v1:{marker_id}\n")
+    marker.chmod(0o600)
+    source_stat = source.lstat()
+    journal = unlink_reset_journal(
+        sync_mode="virtual",
+        root_path=str(visible),
+        source_root_path=str(source),
+        source_root_identity=[
+            str(source_stat.st_dev),
+            str(source_stat.st_ino),
+            source_stat.st_mode,
+        ],
+        root_marker_id=marker_id,
+        native_registration_committed=True,
+    )
+    m._state.set("recovery", "sync_reset", journal)
+    detach = Mock(return_value=str(source))
+    original_remove = m._remove_pending_unlink_root_marker
+    remove_attempts = 0
+
+    def remove(saved_journal: dict[str, object]) -> None:
+        nonlocal remove_attempts
+        remove_attempts += 1
+        if remove_attempts == 1:
+            raise OSError("crash after native detach")
+        original_remove(saved_journal)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(m.virtual_files, "detach", detach)
+    monkeypatch.setattr(m, "_remove_pending_unlink_root_marker", remove)
+    monkeypatch.setattr(m.manager, "reload_download_queue", Mock())
+
+    with pytest.raises(OSError, match="crash after native detach"):
+        m._complete_pending_unlink_reset()
+    assert marker.is_file()
+    assert m._state.get("recovery", "sync_reset") == journal
+
+    m._complete_pending_unlink_reset()
+
+    assert detach.call_count == 2
+    assert not marker.exists()
+    assert m._state.get("recovery", "sync_reset")["phase"] == "queue"
+
+
+def test_unlink_config_reset_keeps_the_saved_sync_mode(m: Maestral) -> None:
+    m.sync._begin_sync_reset(
+        "unlink",
+        provider="dropbox",
+        account_id="old-account",
+        sync_mode="virtual",
+    )
+
+    m.sync._complete_pending_sync_reset()
+
+    assert m._conf.get("sync", "mode") == "virtual"
+    assert m.sync._validated_sync_reset()["phase"] == "virtual"
+    m._state.set("recovery", "sync_reset", {})
+
+
+def test_old_unlink_journal_migrates_root_context_once(m: Maestral) -> None:
+    m._conf.set("sync", "mode", "virtual")
+    old_journal = {
+        "kind": "unlink",
+        "phase": "virtual",
+        "provider": "dropbox",
+        "account_id": "old-account",
+        "keyring": "automatic",
+        "credentials_deleted": True,
+        "vault_password_deleted": True,
+        "virtual_files_reset": False,
+        "root_path": "/old/root",
+        "root_marker_id": "d" * 32,
+    }
+    m._state.set("recovery", "sync_reset", old_journal)
+
+    migrated = m.sync._validated_sync_reset()
+
+    assert migrated["sync_mode"] == "virtual"
+    assert migrated["source_root_path"] == "/old/root"
+    assert migrated["source_root_identity"] is None
+    assert migrated["native_registration_committed"] is False
+    assert migrated["root_marker_removed"] is False
+    assert m._state.get("recovery", "sync_reset") == migrated
+    m._state.set("recovery", "sync_reset", {})
+
+
+@pytest.mark.parametrize(
+    "saved_bindings",
+    [
+        {},
+        {"e" * 32: {"state": "accepted"}},
+    ],
+)
+def test_unlink_rejects_a_missing_backend_before_credential_deletion(
+    m: Maestral,
+    monkeypatch: pytest.MonkeyPatch,
+    saved_bindings: dict[str, object],
+) -> None:
+    marker_id = "e" * 32
+    m._sync_mode = "virtual"
+    m._conf.set("sync", "mode", "virtual")
+    m._conf.set("sync", "path", "/old/virtual-root")
+    m._conf.set("sync", "root_marker_id", marker_id)
+    m._state.set("virtual_files", "root_bindings", saved_bindings)
+    unlink = Mock()
+    delete_creds = Mock()
+    monkeypatch.setattr(m, "_check_linked", Mock())
+    monkeypatch.setattr(m.client, "unlink", unlink)
+    monkeypatch.setattr(m.cred_storage, "delete_creds", delete_creds)
+
+    with pytest.raises(VirtualFilesUnsupportedError, match="native virtual-file"):
+        m.unlink()
+
+    unlink.assert_not_called()
+    delete_creds.assert_not_called()
+    assert m._state.get("recovery", "sync_reset") == {}
+
+
+def test_unlink_repairs_a_pending_native_registration_before_reset(
+    m: Maestral,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    marker_id = "f" * 32
+    source = tmp_path / "source"
+    visible = tmp_path / "visible"
+    source.mkdir()
+    visible.mkdir()
+    source_stat = source.lstat()
+    visible_stat = visible.lstat()
+    binding = VirtualFileRootBinding(
+        source_root_path=str(source),
+        root_path=str(visible),
+        cache_path=str(tmp_path / "native-cache"),
+        source_root_identity=VirtualFileRootIdentity(
+            str(source_stat.st_dev), str(source_stat.st_ino), source_stat.st_mode
+        ),
+        root_identity=VirtualFileRootIdentity(
+            str(visible_stat.st_dev), str(visible_stat.st_ino), visible_stat.st_mode
+        ),
+    )
+    backend = FakeVirtualFileBackend()
+    backend.root_binding = binding
+    m.virtual_files.replace_backend(backend)
+    m._sync_mode = "virtual"
+    m._conf.set("sync", "mode", "virtual")
+    m._conf.set("sync", "root_marker_id", marker_id)
+    m.sync._publish_dropbox_path(
+        str(source), (source_stat.st_dev, source_stat.st_ino, source_stat.st_mode)
+    )
+    events: list[str] = []
+
+    def repair() -> VirtualFileRootBinding:
+        events.append("repair")
+        backend._registration_committed = True
+        return binding
+
+    monkeypatch.setattr(m, "_start_virtual_files", repair)
+
+    context = m._unlink_root_context()
+
+    assert events == ["repair"]
+    assert context == {
+        "sync_mode": "virtual",
+        "root_path": str(visible),
+        "source_root_path": str(source),
+        "source_root_identity": [
+            str(source_stat.st_dev),
+            str(source_stat.st_ino),
+            source_stat.st_mode,
+        ],
+        "root_marker_id": marker_id,
+        "native_registration_committed": True,
+    }
+
+
+def test_unlink_uses_an_already_detached_binding_without_restart(
+    m: Maestral,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    marker_id = "1" * 32
+    source = tmp_path / "source"
+    visible = tmp_path / "visible"
+    source.mkdir()
+    visible.mkdir()
+    source_stat = source.lstat()
+    visible_stat = visible.lstat()
+    binding = VirtualFileRootBinding(
+        source_root_path=str(source),
+        root_path=str(visible),
+        cache_path=str(tmp_path / "native-cache"),
+        source_root_identity=VirtualFileRootIdentity(
+            str(source_stat.st_dev), str(source_stat.st_ino), source_stat.st_mode
+        ),
+        root_identity=VirtualFileRootIdentity(
+            str(visible_stat.st_dev), str(visible_stat.st_ino), visible_stat.st_mode
+        ),
+    )
+    backend = FakeVirtualFileBackend()
+    backend.root_binding = binding
+    backend._binding_detached = True
+    m.virtual_files.replace_backend(backend)
+    m._sync_mode = "virtual"
+    m._conf.set("sync", "mode", "virtual")
+    m._conf.set("sync", "root_marker_id", marker_id)
+    m.sync._publish_dropbox_path(str(visible))
+    repair = Mock()
+    monkeypatch.setattr(m, "_start_virtual_files", repair)
+
+    context = m._unlink_root_context()
+
+    repair.assert_not_called()
+    assert context["root_path"] == str(visible)
+    assert context["source_root_path"] == str(source)
+    assert context["native_registration_committed"] is False
 
 
 def test_unlink_reservation_does_not_wait_for_a_concurrent_stop(

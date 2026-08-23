@@ -22,7 +22,7 @@ from typing import BinaryIO, Protocol, cast
 
 from fasteners import InterProcessLock
 
-from .config import MaestralConfig
+from .config import MaestralConfig, MaestralState
 from .constants import ROOT_MARKER_FILE, ROOT_MARKER_TEMP_PREFIX
 from .core import (
     DeletedMetadata,
@@ -37,6 +37,7 @@ from .database.query import AllQuery, MatchQuery
 from .database.types import SqlEnum, SqlInt, SqlPath, SqlString
 from .exceptions import (
     CursorResetError,
+    MaestralApiError,
     VirtualFileBusyError,
     VirtualFileNotFoundError,
     VirtualFileRevisionError,
@@ -60,7 +61,20 @@ _MAX_REMOTE_PAGES = 100_000
 _MAX_REMOTE_BATCH_ITEMS = 10_000_000
 _MAX_STATUS_PAGE_ITEMS = 256
 _MAX_SOURCE_IDENTITY_BYTES = 16 * 1_024
+_MAX_STORED_ERROR_LENGTH = 4_096
 _CONTENT_HASH_PATTERN = re.compile(r"(?:[0-9a-f]{32}|[0-9a-f]{64})")
+_PROFILE_LOCKS_GUARD = threading.Lock()
+_PROFILE_LOCKS: dict[str, threading.Lock] = {}
+
+
+def _profile_process_lock(path: str) -> threading.Lock:
+    """Return one process-local lock for an interprocess lock path."""
+    with _PROFILE_LOCKS_GUARD:
+        lock = _PROFILE_LOCKS.get(path)
+        if lock is None:
+            lock = threading.Lock()
+            _PROFILE_LOCKS[path] = lock
+        return lock
 
 
 def _has_utf8_length_at_most(value: str, limit: int) -> bool:
@@ -92,6 +106,21 @@ def _validate_virtual_cursor(
     ):
         raise ValueError(f"The virtual-file {name} is invalid")
     return value
+
+
+def _stored_error_message(exc: BaseException) -> str:
+    """Return one bounded, control-free error for the durable index."""
+    try:
+        message = str(exc)
+    except Exception:
+        message = type(exc).__name__
+    message = "".join(
+        " " if unicodedata.category(character) == "Cc" else character
+        for character in message
+    )
+    if len(message) > _MAX_STORED_ERROR_LENGTH:
+        message = message[: _MAX_STORED_ERROR_LENGTH - 3] + "..."
+    return message
 
 
 def _validate_virtual_path(
@@ -343,6 +372,9 @@ class UnsupportedVirtualFileBackend:
 
     backend_id = "unsupported"
     supported = False
+
+    def __init__(self, config_name: str = "") -> None:
+        self.config_name = config_name
 
     def _unsupported(self) -> VirtualFilesUnsupportedError:
         return VirtualFilesUnsupportedError(
@@ -749,8 +781,11 @@ class VirtualFileController:
         self._stage_directory = get_cache_path(
             "maestral", f"{config_name}.virtual-stage", create=False
         )
-        self._stage_lock = InterProcessLock(f"{self._stage_directory}.lock")
+        stage_lock_path = f"{self._stage_directory}.lock"
+        self._stage_lock = InterProcessLock(stage_lock_path)
+        self._profile_process_lock = _profile_process_lock(stage_lock_path)
         self._stage_lock_held = False
+        self._profile_process_lock_held = False
         self._store: _VirtualFileStore | None = None
         self._lock = threading.RLock()
         self._lifecycle_lock = threading.Lock()
@@ -818,7 +853,8 @@ class VirtualFileController:
     def _remote_source_identity(self) -> str:
         """Return one stable local identity for the selected remote source."""
         config = MaestralConfig(self.config_name)
-        namespace = getattr(self.provider, "namespace_id", "")
+        state = MaestralState(self.config_name)
+        namespace = state.get("account", "path_root_nsid")
         provider_identity = getattr(self.provider, "virtual_source_identity", "")
         if not isinstance(namespace, str) or not isinstance(provider_identity, str):
             raise ValueError("The remote source identity is invalid")
@@ -902,8 +938,9 @@ class VirtualFileController:
     def reset(self) -> None:
         """Remove all local virtual state without changing remote content."""
         with self._lifecycle_lock:
-            self._quiesce()
+            self._acquire_profile_lock()
             try:
+                self._quiesce()
                 with self._remote_lock:
                     with self._lock:
                         records = sorted(
@@ -937,13 +974,15 @@ class VirtualFileController:
                     self._backend.stop()
                     self._backend_started = False
                     self._root_binding = None
+                if not self._backend_started:
                     self._release_stage_lock()
 
     def clear(self) -> None:
         """Clear core virtual state after no native registration was created."""
         with self._lifecycle_lock:
-            self._quiesce()
+            self._acquire_profile_lock()
             try:
+                self._quiesce()
                 with self._remote_lock:
                     self._set_checkpoint("", needs_full_snapshot=False)
                     with self._lock:
@@ -955,25 +994,32 @@ class VirtualFileController:
                     self._backend.stop()
                     self._backend_started = False
                     self._root_binding = None
+                if not self._backend_started:
                     self._release_stage_lock()
 
     def detach(self, root_path: str, root_marker_id: str) -> str:
         """Detach one registered native root, then clear its core state."""
         with self._lifecycle_lock:
-            self._quiesce()
-            with self._remote_lock:
-                if self._backend_started:
-                    self._backend.stop()
-                    self._backend_started = False
-                    self._root_binding = None
+            self._acquire_profile_lock()
+            try:
+                self._quiesce()
+                with self._remote_lock:
+                    if self._backend_started:
+                        self._backend.stop()
+                        self._backend_started = False
+                        self._root_binding = None
+                    source_root = self._backend.detach(root_path, root_marker_id)
+                    self._set_checkpoint("", needs_full_snapshot=False)
+                    with self._lock:
+                        self._get_store().records.delete(AllQuery())
+                        self._get_store().clear_source()
+                        self._last_worker_error = ""
+            except BaseException:
+                if not self._backend_started:
                     self._release_stage_lock()
-                source_root = self._backend.detach(root_path, root_marker_id)
-                self._set_checkpoint("", needs_full_snapshot=False)
-                with self._lock:
-                    self._get_store().records.delete(AllQuery())
-                    self._get_store().clear_source()
-                    self._last_worker_error = ""
-                return source_root
+                raise
+            self._release_stage_lock()
+            return source_root
 
     def start(
         self,
@@ -997,6 +1043,7 @@ class VirtualFileController:
         )
         binding: VirtualFileRootBinding | None = None
         binding_validated = False
+        registration_attempted = False
 
         with self._lifecycle_lock:
             with self._lock:
@@ -1025,15 +1072,11 @@ class VirtualFileController:
                 self._ready.clear()
                 self._running.set()
             try:
-                if not self._stage_lock.acquire(blocking=False):
-                    raise VirtualFileBusyError(
-                        "Virtual file staging is busy",
-                        "Another process owns this profile's hydration stage.",
-                    )
-                self._stage_lock_held = True
+                self._acquire_profile_lock()
                 self._prepare_stage_directory()
                 with self._lock:
                     self._get_store().bind_source(self._remote_source_identity())
+                registration_attempted = True
                 binding = self._backend.start(root_path, self._hydrate_on_open)
                 self._backend_started = True
                 with self._lock:
@@ -1066,24 +1109,30 @@ class VirtualFileController:
                     else:
                         self._backend_started = False
                         self._root_binding = None
+                try:
+                    if (
+                        root_marker_id is not None
+                        and not binding_validated
+                        and registration_attempted
+                        and not (
+                            binding_was_accepted
+                            or self._backend.binding_accepted(root_marker_id)
+                        )
+                        and self._backend.registration_committed(root_marker_id)
+                    ):
+                        failed_binding = binding or self._backend.binding_for_root(
+                            root_marker_id
+                        )
+                        if failed_binding is None:
+                            raise VirtualFileBusyError(
+                                "Could not clean up the virtual root",
+                                "The native registration exists without its saved "
+                                "binding.",
+                            ) from start_error
+                        self._backend.detach(failed_binding.root_path, root_marker_id)
+                finally:
+                    if not self._backend_started:
                         self._release_stage_lock()
-                else:
-                    self._release_stage_lock()
-                if (
-                    root_marker_id is not None
-                    and not binding_validated
-                    and not binding_was_accepted
-                    and self._backend.registration_committed(root_marker_id)
-                ):
-                    failed_binding = binding or self._backend.binding_for_root(
-                        root_marker_id
-                    )
-                    if failed_binding is None:
-                        raise VirtualFileBusyError(
-                            "Could not clean up the virtual root",
-                            "The native registration exists without its saved binding.",
-                        ) from start_error
-                    self._backend.detach(failed_binding.root_path, root_marker_id)
                 raise
             with self._lock:
                 self._connected = not self._remote_polling
@@ -1125,9 +1174,13 @@ class VirtualFileController:
                     )
             binding: VirtualFileRootBinding | None = None
             accepted = self._backend.binding_accepted(root_marker_id)
+            registration_attempted = False
             try:
+                self._acquire_profile_lock()
+                self._prepare_stage_directory()
                 with self._lock:
                     self._get_store().bind_source(self._remote_source_identity())
+                registration_attempted = True
                 binding = self._backend.start(root_path, self._hydrate_on_open)
                 self._backend_started = True
                 self._root_binding = binding
@@ -1147,24 +1200,34 @@ class VirtualFileController:
                     else:
                         self._backend_started = False
                         self._root_binding = None
-                if not accepted and self._backend.registration_committed(
-                    root_marker_id
+                accepted = accepted or self._backend.binding_accepted(root_marker_id)
+                if (
+                    registration_attempted
+                    and not accepted
+                    and self._backend.registration_committed(root_marker_id)
                 ):
                     failed_binding = binding or self._backend.binding_for_root(
                         root_marker_id
                     )
                     if failed_binding is None:
+                        self._release_stage_lock()
                         raise VirtualFileBusyError(
                             "Could not clean up the virtual root",
                             "The native registration has no saved binding.",
                         ) from start_error
-                    self._backend.detach(failed_binding.root_path, root_marker_id)
+                    try:
+                        self._backend.detach(failed_binding.root_path, root_marker_id)
+                    finally:
+                        self._release_stage_lock()
+                else:
+                    self._release_stage_lock()
                 raise
 
             self._backend.stop()
             with self._lock:
                 self._backend_started = False
                 self._root_binding = None
+            self._release_stage_lock()
             assert binding is not None
             return binding
 
@@ -2280,8 +2343,11 @@ class VirtualFileController:
                 raise ValueError("The stored virtual-file generation is invalid")
             if record.last_error is not None and (
                 not isinstance(record.last_error, str)
-                or len(record.last_error) > 4096
-                or "\x00" in record.last_error
+                or len(record.last_error) > _MAX_STORED_ERROR_LENGTH
+                or any(
+                    unicodedata.category(character) == "Cc"
+                    for character in record.last_error
+                )
             ):
                 raise ValueError("The stored virtual-file error is invalid")
         _validate_tree_structure(path_types, "virtual-file database")
@@ -2510,12 +2576,18 @@ class VirtualFileController:
 
     def pin(self, provider_id: str) -> dict[str, object]:
         """Persist a pin and hydrate its newest remote revision."""
-        with self._remote_lock:
-            status = self._pin(provider_id)
-            hydrate = self.running
-        if hydrate:
-            return self.hydrate(provider_id)
-        return status
+        with self._lifecycle_lock:
+            acquired = self._acquire_profile_lock()
+            try:
+                with self._remote_lock:
+                    status = self._pin(provider_id)
+                    hydrate = self.running
+                if hydrate:
+                    return self.hydrate(provider_id)
+                return status
+            finally:
+                if acquired:
+                    self._release_stage_lock()
 
     def _pin(self, provider_id: str) -> dict[str, object]:
         """Pin one item while remote reconciliation is excluded."""
@@ -2549,8 +2621,14 @@ class VirtualFileController:
 
     def unpin(self, provider_id: str) -> dict[str, object]:
         """Remove a durable pin without evicting cached content."""
-        with self._remote_lock:
-            return self._unpin(provider_id)
+        with self._lifecycle_lock:
+            acquired = self._acquire_profile_lock()
+            try:
+                with self._remote_lock:
+                    return self._unpin(provider_id)
+            finally:
+                if acquired:
+                    self._release_stage_lock()
 
     def _unpin(self, provider_id: str) -> dict[str, object]:
         """Unpin one item while remote reconciliation is excluded."""
@@ -2884,6 +2962,37 @@ class VirtualFileController:
         self._validate_store_records(all_records)
         return all_records
 
+    def _acquire_profile_lock(self) -> bool:
+        """Acquire profile mutation ownership and discard stale database caches."""
+        if self._stage_lock_held:
+            return False
+        if not self._profile_process_lock.acquire(blocking=False):
+            raise VirtualFileBusyError(
+                "Virtual file staging is busy",
+                "Another process owns this profile's hydration stage.",
+            )
+        try:
+            if not self._stage_lock.acquire(blocking=False):
+                raise VirtualFileBusyError(
+                    "Virtual file staging is busy",
+                    "Another process owns this profile's hydration stage.",
+                )
+        except BaseException:
+            self._profile_process_lock.release()
+            raise
+        self._profile_process_lock_held = True
+        self._stage_lock_held = True
+        try:
+            with self._lock:
+                if self._store is not None:
+                    self._store.records.clear_cache()
+                    self._needs_full_snapshot = self._store.needs_full_snapshot
+                self._snapshot_native_by_id.clear()
+        except BaseException:
+            self._release_stage_lock()
+            raise
+        return True
+
     def _prepare_stage_directory(self) -> None:
         """Prepare a private stage root and remove owned files from an old run."""
         try:
@@ -2959,9 +3068,14 @@ class VirtualFileController:
             ) from None
 
     def _release_stage_lock(self) -> None:
-        if self._stage_lock_held:
-            self._stage_lock.release()
+        try:
+            if self._stage_lock_held:
+                self._stage_lock.release()
+        finally:
             self._stage_lock_held = False
+            if self._profile_process_lock_held:
+                self._profile_process_lock.release()
+                self._profile_process_lock_held = False
 
     def _recover(self) -> list[str]:
         """Replay desired native state and settle interrupted operations."""
@@ -3386,7 +3500,9 @@ class VirtualFileController:
         with self._lock:
             record = self._get_store().get(provider_id)
             if record is not None and record.generation == generation:
-                self._get_store().put(self._copy_record(record, last_error=str(exc)))
+                self._get_store().put(
+                    self._copy_record(record, last_error=_stored_error_message(exc))
+                )
 
     def _save_hydration_failure(
         self, provider_id: str, generation: int, exc: BaseException
@@ -3399,7 +3515,7 @@ class VirtualFileController:
                         record,
                         hydration_state=HydrationState.OnlineOnly,
                         materialized_revision=None,
-                        last_error=str(exc),
+                        last_error=_stored_error_message(exc),
                     )
                 )
 
@@ -3414,6 +3530,6 @@ class VirtualFileController:
                         record,
                         hydration_state=HydrationState.Hydrated,
                         materialized_revision=record.revision,
-                        last_error=str(exc),
+                        last_error=_stored_error_message(exc),
                     )
                 )

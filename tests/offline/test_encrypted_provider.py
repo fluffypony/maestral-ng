@@ -20,6 +20,7 @@ from typing import BinaryIO
 
 import pytest
 
+from maestral.config import MaestralState
 from maestral.core import (
     FileMetadata,
     FolderMetadata,
@@ -741,6 +742,53 @@ def test_remote_vault_root_must_be_dedicated() -> None:
 
     with pytest.raises(ValueError, match="invalid"):
         PhysicalVaultMirror._normalise_remote_root("/Encrypted/../escape")
+
+
+def test_virtual_source_identity_is_available_offline_after_restart(
+    tmp_path: Path,
+) -> None:
+    remote = FakeRemoteProvider(tmp_path / "remote-provider")
+    secrets = FakeSecretStore()
+    cache = tmp_path / "ciphertext-cache"
+    first = EncryptedRemoteProvider(
+        remote,
+        secrets,
+        "/Encrypted",
+        cache,
+        sidecar=FakeCryptomatorSession("password"),
+    )
+    first.initialise_vault("password")
+    vault_identity = first.virtual_source_identity
+    first.close()
+
+    offline_sidecar = FakeCryptomatorSession("password")
+    second = EncryptedRemoteProvider(
+        remote,
+        secrets,
+        "/Encrypted",
+        cache,
+        sidecar=offline_sidecar,
+    )
+    backend = FakeVirtualFileBackend()
+    controller = VirtualFileController(
+        remote.config_name,
+        second,
+        backend,
+        database_path=str(tmp_path / "virtual-files.db"),
+        remote_polling=False,
+    )
+    MaestralState(remote.config_name).set(
+        "account", "path_root_nsid", "offline-namespace"
+    )
+    try:
+        source_identity = json.loads(controller._remote_source_identity())
+        assert second.virtual_source_identity == vault_identity
+        assert source_identity["namespace"] == "offline-namespace"
+        assert source_identity["provider_identity"] == vault_identity
+        assert offline_sidecar.opened is False
+    finally:
+        controller.close()
+        second.close()
 
 
 def test_encrypted_provider_round_trip_and_stable_identity(tmp_path: Path) -> None:

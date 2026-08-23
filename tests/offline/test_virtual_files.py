@@ -13,10 +13,11 @@ from unittest.mock import Mock
 
 import pytest
 
-from maestral.config import MaestralConfig
+from maestral.config import MaestralConfig, MaestralState
 from maestral.core import DeletedMetadata, ListFolderResult
 from maestral.exceptions import (
     CursorResetError,
+    MaestralApiError,
     VirtualFileBusyError,
     VirtualFileNotFoundError,
     VirtualFileRevisionError,
@@ -28,6 +29,8 @@ from maestral.virtual_files import (
     HydrationState,
     VirtualFileController,
     VirtualFileIdentity,
+    VirtualFileRootBinding,
+    VirtualFileRootIdentity,
 )
 
 from .virtual_files_fakes import (
@@ -54,6 +57,24 @@ def make_controller(
     )
     controller.start(str(root))
     return controller
+
+
+def make_root_binding(
+    source: Path, visible: Path, cache: Path
+) -> VirtualFileRootBinding:
+    source_stat = source.lstat()
+    visible_stat = visible.lstat()
+    return VirtualFileRootBinding(
+        source_root_path=str(source),
+        root_path=str(visible),
+        cache_path=str(cache),
+        source_root_identity=VirtualFileRootIdentity(
+            str(source_stat.st_dev), str(source_stat.st_ino), source_stat.st_mode
+        ),
+        root_identity=VirtualFileRootIdentity(
+            str(visible_stat.st_dev), str(visible_stat.st_ino), visible_stat.st_mode
+        ),
+    )
 
 
 def test_start_detaches_an_unaccepted_registration_after_validation_failure(
@@ -85,6 +106,72 @@ def test_start_detaches_an_unaccepted_registration_after_validation_failure(
     assert not backend.binding_accepted("a" * 32)
     assert ("detach", str(root), "a" * 32) in backend.calls
     controller.close()
+
+
+def test_failed_start_holds_profile_lock_through_registration_cleanup(
+    config_name: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    provider = FakeVirtualProvider()
+    backend = FakeVirtualFileBackend()
+    root = tmp_path / "virtual-root"
+    root.mkdir()
+    first = VirtualFileController(
+        config_name,
+        provider,  # type: ignore[arg-type]
+        backend,
+        database_path=str(tmp_path / "virtual-files.db"),
+        remote_polling=False,
+    )
+    second = VirtualFileController(
+        config_name,
+        provider,  # type: ignore[arg-type]
+        backend,
+        database_path=str(tmp_path / "virtual-files.db"),
+        remote_polling=False,
+    )
+    cleanup_started = threading.Event()
+    finish_cleanup = threading.Event()
+    original_detach = backend.detach
+    errors: list[BaseException] = []
+
+    def blocked_detach(root_path: str, root_marker_id: str) -> str:
+        cleanup_started.set()
+        if not finish_cleanup.wait(5):
+            raise TimeoutError("registration cleanup did not resume")
+        return original_detach(root_path, root_marker_id)
+
+    def fail_validation(_binding: object) -> None:
+        raise ValueError("unsafe root binding")
+
+    def start() -> None:
+        try:
+            first.start(
+                str(root),
+                root_marker_id="a" * 32,
+                binding_validator=fail_validation,  # type: ignore[arg-type]
+            )
+        except BaseException as exc:
+            errors.append(exc)
+
+    monkeypatch.setattr(backend, "detach", blocked_detach)
+    thread = threading.Thread(target=start)
+    thread.start()
+    assert cleanup_started.wait(5)
+
+    try:
+        with pytest.raises(VirtualFileBusyError, match="staging is busy"):
+            second.start(str(root), root_marker_id="a" * 32)
+    finally:
+        finish_cleanup.set()
+        thread.join(5)
+
+    assert not thread.is_alive()
+    assert len(errors) == 1
+    assert isinstance(errors[0], ValueError)
+    assert str(errors[0]) == "unsafe root binding"
+    second.start(str(root), root_marker_id="a" * 32)
+    second.close()
+    first.close()
 
 
 def test_recovery_failure_preserves_an_accepted_registration_for_retry(
@@ -158,9 +245,80 @@ def test_adoption_failure_preserves_a_validated_registration_for_retry(
     controller.close()
 
 
+def test_two_controllers_cannot_race_pending_binding_repair(
+    config_name: str, tmp_path: Path
+) -> None:
+    provider = FakeVirtualProvider()
+    backend = FakeVirtualFileBackend()
+    root = tmp_path / "virtual-root"
+    root.mkdir()
+    backend.start(str(root), lambda _provider_id, _revision: {})
+    backend.stop()
+    backend.calls.clear()
+    database_path = str(tmp_path / "virtual-files.db")
+    first = VirtualFileController(
+        config_name,
+        provider,  # type: ignore[arg-type]
+        backend,
+        database_path=database_path,
+        remote_polling=False,
+    )
+    second = VirtualFileController(
+        config_name,
+        provider,  # type: ignore[arg-type]
+        backend,
+        database_path=database_path,
+        remote_polling=False,
+    )
+    validation_started = threading.Event()
+    finish_validation = threading.Event()
+    errors: list[BaseException] = []
+
+    def validate(_binding: object) -> str:
+        validation_started.set()
+        if not finish_validation.wait(5):
+            raise TimeoutError("binding validation did not resume")
+        return "proof"
+
+    def repair() -> None:
+        try:
+            first.accept_pending_binding(
+                str(root),
+                "a" * 32,
+                validate,  # type: ignore[arg-type]
+                lambda _binding, _proof: None,
+            )
+        except BaseException as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=repair)
+    thread.start()
+    assert validation_started.wait(5)
+
+    try:
+        with pytest.raises(VirtualFileBusyError, match="staging is busy"):
+            second.accept_pending_binding(
+                str(root),
+                "a" * 32,
+                lambda _binding: "stale-proof",
+                lambda _binding, _proof: None,
+            )
+        assert not any(call[0] == "detach" for call in backend.calls)
+    finally:
+        finish_validation.set()
+        thread.join(5)
+        first.close()
+        second.close()
+
+    assert not thread.is_alive()
+    assert errors == []
+    assert backend.binding_accepted("a" * 32)
+
+
 def test_virtual_index_rejects_another_remote_account(
     config_name: str, tmp_path: Path
 ) -> None:
+    MaestralState(config_name).set("account", "path_root_nsid", "")
     config = MaestralConfig(config_name)
     config.set("auth", "account_id", "account-one")
     provider = FakeVirtualProvider()
@@ -321,6 +479,44 @@ def test_stage_cleanup_requires_the_profile_stage_lock(
             holder.terminate()
             holder.wait(timeout=2)
         controller.close()
+
+
+def test_second_controller_cannot_mutate_an_active_profile(
+    config_name: str, tmp_path: Path
+) -> None:
+    provider = FakeVirtualProvider()
+    backend = FakeVirtualFileBackend()
+    first = make_controller(config_name, tmp_path, provider, backend)
+    metadata = provider.add_file("file-1", "/file.txt", "rev-1", b"data")
+    first.reconcile_remote_batch([metadata], "cursor-1")
+    second = VirtualFileController(
+        config_name,
+        provider,  # type: ignore[arg-type]
+        backend,
+        database_path=str(tmp_path / "virtual-files.db"),
+        remote_polling=False,
+    )
+    assert second.get_status("file-1")["revision"] == "rev-1"
+    call_count = len(backend.calls)
+    operations = (
+        second.reset,
+        second.clear,
+        lambda: second.detach(str(tmp_path / "virtual-root"), "a" * 32),
+        lambda: second.pin("file-1"),
+        lambda: second.unpin("file-1"),
+    )
+
+    try:
+        for operation in operations:
+            with pytest.raises(VirtualFileBusyError, match="staging is busy"):
+                operation()
+
+        assert len(backend.calls) == call_count
+        assert first.cursor == "cursor-1"
+        assert first.get_status("file-1")["revision"] == "rev-1"
+    finally:
+        second.close()
+        first.close()
 
 
 def test_pin_unpin_and_safe_eviction(config_name: str, tmp_path: Path) -> None:
@@ -1176,6 +1372,61 @@ def test_restart_keeps_running_when_eager_pin_hydration_fails(
         second.close()
 
 
+@pytest.mark.parametrize("failure_source", ["provider", "adapter"])
+def test_persisted_failure_error_is_safe_across_restart(
+    config_name: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_source: str,
+) -> None:
+    provider = FakeVirtualProvider()
+    backend = FakeVirtualFileBackend()
+    first = make_controller(config_name, tmp_path, provider, backend)
+    metadata = provider.add_file("file-1", "/file.txt", "rev-1", b"data")
+    first.reconcile_remote_change(metadata)
+    message = "unsafe\x00remote\nerror:" + "x" * 5_000
+
+    if failure_source == "provider":
+        original = provider.download
+
+        def fail(*args: object, **kwargs: object) -> object:
+            del args, kwargs
+            raise OSError(message)
+
+        monkeypatch.setattr(provider, "download", fail)
+    else:
+        original = backend.materialize
+
+        def fail(*args: object, **kwargs: object) -> None:
+            del args, kwargs
+            raise OSError(message)
+
+        monkeypatch.setattr(backend, "materialize", fail)
+
+    try:
+        with pytest.raises(OSError, match="unsafe"):
+            first.hydrate("file-1")
+        stored_error = first.get_status("file-1")["error"]
+        assert isinstance(stored_error, str)
+        assert len(stored_error) == 4_096
+        assert "\x00" not in stored_error
+        assert "\n" not in stored_error
+        assert stored_error.endswith("...")
+    finally:
+        if failure_source == "provider":
+            monkeypatch.setattr(provider, "download", original)
+        else:
+            monkeypatch.setattr(backend, "materialize", original)
+        first.close()
+
+    second = make_controller(config_name, tmp_path, provider, backend)
+    try:
+        assert second.running is True
+        assert second.get_status("file-1")["hydration_state"] == "online_only"
+    finally:
+        second.close()
+
+
 def test_restart_preserves_dirty_pinned_content(
     config_name: str, tmp_path: Path
 ) -> None:
@@ -1269,6 +1520,136 @@ def test_detach_preserves_hydrated_bytes_and_clears_core_state(
     assert backend.items["file-1"].content == b"data"
     assert backend.started is False
     controller.close()
+
+
+def test_detach_failure_keeps_the_virtual_index(
+    config_name: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = FakeVirtualProvider()
+    backend = FakeVirtualFileBackend()
+    controller = make_controller(config_name, tmp_path, provider, backend)
+    metadata = provider.add_file("file-1", "/file.txt", "rev-1", b"data")
+    controller.reconcile_remote_batch([metadata], "cursor-1")
+    detach = Mock(side_effect=OSError("native export failed"))
+    monkeypatch.setattr(backend, "detach", detach)
+
+    with pytest.raises(OSError, match="native export failed"):
+        controller.detach(str(tmp_path / "virtual-root"), "a" * 32)
+
+    assert controller.cursor == "cursor-1"
+    assert controller.get_status("file-1")["revision"] == "rev-1"
+    controller.close()
+
+
+def test_fresh_detach_requires_the_profile_stage_lock(
+    config_name: str, tmp_path: Path
+) -> None:
+    provider = FakeVirtualProvider()
+    backend = FakeVirtualFileBackend()
+    root = tmp_path / "virtual-root"
+    root.mkdir()
+    backend.start(str(root), lambda _provider_id, _revision: {})
+    backend.stop()
+    backend.calls.clear()
+    controller = VirtualFileController(
+        config_name,
+        provider,  # type: ignore[arg-type]
+        backend,
+        database_path=str(tmp_path / "virtual-files.db"),
+        remote_polling=False,
+    )
+    stage_directory = Path(controller._stage_directory)
+    stage_directory.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    ready = tmp_path / "detach-lock-ready"
+    holder = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import pathlib,sys; from fasteners import InterProcessLock; "
+                "lock=InterProcessLock(sys.argv[1]); assert lock.acquire(False); "
+                "pathlib.Path(sys.argv[2]).write_text('ready'); "
+                "sys.stdin.buffer.read(1); lock.release()"
+            ),
+            f"{stage_directory}.lock",
+            str(ready),
+        ],
+        stdin=subprocess.PIPE,
+    )
+    try:
+        deadline = time.monotonic() + 2
+        while not ready.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert ready.exists()
+
+        with pytest.raises(VirtualFileBusyError, match="staging is busy"):
+            controller.detach(str(root), "a" * 32)
+
+        assert not any(call[0] == "detach" for call in backend.calls)
+    finally:
+        if holder.poll() is None:
+            assert holder.stdin is not None
+            holder.stdin.write(b"x")
+            holder.stdin.close()
+            holder.wait(timeout=2)
+        controller.close()
+
+
+def test_detach_holds_the_profile_lock_until_core_state_is_clear(
+    config_name: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    provider = FakeVirtualProvider()
+    backend = FakeVirtualFileBackend()
+    root = tmp_path / "virtual-root"
+    first = make_controller(config_name, tmp_path, provider, backend)
+    metadata = provider.add_file("file-1", "/file.txt", "rev-1", b"data")
+    first.reconcile_remote_batch([metadata], "cursor-1")
+    second = VirtualFileController(
+        config_name,
+        provider,  # type: ignore[arg-type]
+        backend,
+        database_path=str(tmp_path / "virtual-files.db"),
+        remote_polling=False,
+    )
+    assert second.get_status("file-1")["revision"] == "rev-1"
+    detach_started = threading.Event()
+    finish_detach = threading.Event()
+    original_detach = backend.detach
+    errors: list[BaseException] = []
+
+    def blocked_detach(root_path: str, root_marker_id: str) -> str:
+        detach_started.set()
+        if not finish_detach.wait(5):
+            raise TimeoutError("detach did not resume")
+        return original_detach(root_path, root_marker_id)
+
+    def detach() -> None:
+        try:
+            first.detach(str(root), "a" * 32)
+        except BaseException as exc:
+            errors.append(exc)
+
+    monkeypatch.setattr(backend, "detach", blocked_detach)
+    thread = threading.Thread(target=detach)
+    thread.start()
+    assert detach_started.wait(5)
+
+    try:
+        with pytest.raises(VirtualFileBusyError, match="staging is busy"):
+            second.start(str(root))
+    finally:
+        finish_detach.set()
+        thread.join(5)
+
+    assert not thread.is_alive()
+    assert errors == []
+    second.start(str(root))
+    assert second.status_page()["items"] == []
+    assert second.cursor == ""
+    second.close()
+    first.close()
 
 
 def test_status_pages_and_summary_cover_the_complete_index(
@@ -2312,6 +2693,210 @@ def test_virtual_start_never_starts_the_mirror_engine(
             binding_adopter=maestral._adopt_virtual_root_binding,
         )
         mirror_start.assert_not_called()
+    finally:
+        maestral.virtual_files.close()
+        maestral.manager.shutdown()
+        maestral.sync._connection.close()
+        maestral.client.close()
+
+
+def test_distinct_native_root_is_adopted_before_recovery(
+    config_name: str, tmp_path: Path
+) -> None:
+    backend = FakeVirtualFileBackend()
+    maestral = Maestral(
+        config_name,
+        virtual_file_backend=backend,
+        virtual_file_remote_polling=False,
+    )
+    source = tmp_path / "source"
+    visible = tmp_path / "visible"
+    cache = tmp_path / "native-cache"
+    source.mkdir()
+    visible.mkdir()
+    cache.mkdir(mode=0o700)
+    binding = make_root_binding(source, visible, cache)
+    backend.start_result = binding
+    marker_id = "a" * 32
+    try:
+        maestral.set_sync_mode("virtual")
+        source_stat = source.lstat()
+        maestral.sync.set_dropbox_path(
+            str(source),
+            expected_root_identity=(
+                source_stat.st_dev,
+                source_stat.st_ino,
+                source_stat.st_mode,
+            ),
+        )
+        maestral._conf.set("sync", "root_marker_id", marker_id)
+
+        returned = maestral._start_virtual_files()
+
+        assert returned == binding
+        assert maestral.sync.dropbox_path == str(visible)
+        assert maestral._conf.get("sync", "path") == str(visible)
+        assert backend.binding_accepted(marker_id)
+    finally:
+        maestral.virtual_files.close()
+        maestral.manager.shutdown()
+        maestral.sync._connection.close()
+        maestral.client.close()
+
+
+def test_accepted_binding_retries_a_failed_config_adoption(
+    config_name: str, tmp_path: Path
+) -> None:
+    backend = FakeVirtualFileBackend()
+    maestral = Maestral(
+        config_name,
+        virtual_file_backend=backend,
+        virtual_file_remote_polling=False,
+    )
+    source = tmp_path / "source"
+    visible = tmp_path / "visible"
+    cache = tmp_path / "native-cache"
+    source.mkdir()
+    visible.mkdir()
+    cache.mkdir(mode=0o700)
+    binding = make_root_binding(source, visible, cache)
+    backend.start_result = binding
+    backend.root_binding = binding
+    backend._registration_committed = True
+    backend._binding_accepted = True
+    marker_id = "b" * 32
+    try:
+        maestral.set_sync_mode("virtual")
+        maestral.sync.set_dropbox_path(str(source))
+        maestral._conf.set("sync", "root_marker_id", marker_id)
+
+        maestral._repair_unaccepted_virtual_binding()
+
+        assert maestral.sync.dropbox_path == str(visible)
+        assert maestral._conf.get("sync", "path") == str(visible)
+        assert backend.binding_accepted(marker_id)
+        assert not maestral.virtual_files.running
+    finally:
+        maestral.virtual_files.close()
+        maestral.manager.shutdown()
+        maestral.sync._connection.close()
+        maestral.client.close()
+
+
+def test_startup_repairs_a_registered_unaccepted_binding(
+    config_name: str, tmp_path: Path
+) -> None:
+    root = tmp_path / "root"
+    cache = tmp_path / "native-cache"
+    root.mkdir()
+    cache.mkdir(mode=0o700)
+    binding = make_root_binding(root, root, cache)
+    marker_id = "c" * 32
+    config = MaestralConfig(config_name)
+    config.set("sync", "mode", "virtual")
+    config.set("sync", "path", str(root))
+    config.set("sync", "root_marker_id", marker_id)
+    backend = FakeVirtualFileBackend()
+    backend.start_result = binding
+    backend.root_binding = binding
+    backend._registration_committed = True
+
+    maestral = Maestral(
+        config_name,
+        virtual_file_backend=backend,
+        virtual_file_remote_polling=False,
+    )
+    try:
+        assert backend.binding_accepted(marker_id)
+        assert maestral.sync.dropbox_path == str(root)
+        assert not maestral.virtual_files.running
+    finally:
+        maestral.virtual_files.close()
+        maestral.manager.shutdown()
+        maestral.sync._connection.close()
+        maestral.client.close()
+
+
+def test_distinct_source_swap_fails_before_placeholder_recovery(
+    config_name: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = FakeVirtualFileBackend()
+    maestral = Maestral(
+        config_name,
+        virtual_file_backend=backend,
+        virtual_file_remote_polling=False,
+    )
+    source = tmp_path / "source"
+    visible = tmp_path / "visible"
+    cache = tmp_path / "native-cache"
+    source.mkdir()
+    visible.mkdir()
+    cache.mkdir(mode=0o700)
+    binding = make_root_binding(source, visible, cache)
+    backend.start_result = binding
+    recover = Mock()
+    monkeypatch.setattr(backend, "recover", recover)
+    marker_id = "d" * 32
+    try:
+        maestral.set_sync_mode("virtual")
+        source_stat = source.lstat()
+        maestral.sync.set_dropbox_path(
+            str(source),
+            expected_root_identity=(
+                source_stat.st_dev,
+                source_stat.st_ino,
+                source_stat.st_mode,
+            ),
+        )
+        maestral._conf.set("sync", "root_marker_id", marker_id)
+        source.rename(tmp_path / "old-source")
+        source.mkdir()
+
+        with pytest.raises(MaestralApiError, match="source native root identity"):
+            maestral._start_virtual_files()
+
+        recover.assert_not_called()
+        assert backend.binding_detached(marker_id)
+        assert maestral.sync.dropbox_path == str(source)
+    finally:
+        maestral.virtual_files.close()
+        maestral.manager.shutdown()
+        maestral.sync._connection.close()
+        maestral.client.close()
+
+
+def test_binding_overlap_fails_before_placeholder_recovery(
+    config_name: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = FakeVirtualFileBackend()
+    maestral = Maestral(
+        config_name,
+        virtual_file_backend=backend,
+        virtual_file_remote_polling=False,
+    )
+    root = tmp_path / "root"
+    cache = root / "native-cache"
+    root.mkdir()
+    cache.mkdir(mode=0o700)
+    binding = make_root_binding(root, root, cache)
+    backend.start_result = binding
+    recover = Mock()
+    monkeypatch.setattr(backend, "recover", recover)
+    marker_id = "e" * 32
+    try:
+        maestral.set_sync_mode("virtual")
+        maestral.sync.set_dropbox_path(str(root))
+        maestral._conf.set("sync", "root_marker_id", marker_id)
+
+        with pytest.raises(MaestralApiError, match="overlap"):
+            maestral._start_virtual_files()
+
+        recover.assert_not_called()
+        assert backend.binding_detached(marker_id)
     finally:
         maestral.virtual_files.close()
         maestral.manager.shutdown()

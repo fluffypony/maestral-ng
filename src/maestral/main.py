@@ -272,7 +272,7 @@ class Maestral:
                 or create_native_virtual_file_backend(self.config_name)
             )
         else:
-            selected_virtual_backend = UnsupportedVirtualFileBackend()
+            selected_virtual_backend = UnsupportedVirtualFileBackend(self.config_name)
         self._state = MaestralState(self.config_name)
         self._logger = scoped_logger(__name__, self.config_name)
         self.cred_storage = CredentialStorage(self.config_name, self.provider)
@@ -499,6 +499,12 @@ class Maestral:
         binding = None
         registered = False
         if sync_mode == VIRTUAL_MODE and marker_id:
+            if not self.virtual_files.supported:
+                raise VirtualFilesUnsupportedError(
+                    "Cannot unlink this virtual root",
+                    "Restore the native virtual-file backend before you unlink this "
+                    "profile.",
+                )
             binding = self.virtual_files.binding_for_root(marker_id)
             registered = self.virtual_files.registration_committed(marker_id)
             detached = self.virtual_files.binding_detached(marker_id)
@@ -980,7 +986,7 @@ class Maestral:
         if (
             not isinstance(proof, tuple)
             or len(proof) != 3
-            or not all(isinstance(value, int) for value in proof)
+            or not all(type(value) is int for value in proof)
         ):
             raise RuntimeError("The virtual root proof is invalid")
         self.sync.set_dropbox_path(
@@ -1302,7 +1308,7 @@ class Maestral:
                         "Install the native virtual-file backend for this platform.",
                     )
             else:
-                backend = UnsupportedVirtualFileBackend()
+                backend = UnsupportedVirtualFileBackend(self.config_name)
 
             old_backend = self.virtual_files.replace_backend(backend)
             try:

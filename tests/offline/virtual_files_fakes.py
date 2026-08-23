@@ -147,6 +147,7 @@ class FakeVirtualFileBackend:
         self.request_hydration: HydrationRequest | None = None
         self.started = False
         self.root_binding: VirtualFileRootBinding | None = None
+        self.start_result: VirtualFileRootBinding | None = None
         self._registration_committed = False
         self._binding_accepted = False
         self._binding_detached = False
@@ -159,19 +160,22 @@ class FakeVirtualFileBackend:
         self.calls.append(("start", root_path))
         self.request_hydration = request_hydration
         self.started = True
-        status = os.lstat(root_path)
-        identity = VirtualFileRootIdentity(
-            device=str(status.st_dev),
-            inode=str(status.st_ino),
-            mode=status.st_mode,
-        )
-        self.root_binding = VirtualFileRootBinding(
-            source_root_path=root_path,
-            root_path=root_path,
-            cache_path="/fake-cache",
-            source_root_identity=identity,
-            root_identity=identity,
-        )
+        if self.start_result is None:
+            status = os.lstat(root_path)
+            identity = VirtualFileRootIdentity(
+                device=str(status.st_dev),
+                inode=str(status.st_ino),
+                mode=status.st_mode,
+            )
+            self.root_binding = VirtualFileRootBinding(
+                source_root_path=root_path,
+                root_path=root_path,
+                cache_path="/fake-cache",
+                source_root_identity=identity,
+                root_identity=identity,
+            )
+        else:
+            self.root_binding = self.start_result
         self._registration_committed = True
         self._binding_detached = False
         return self.root_binding

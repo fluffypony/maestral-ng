@@ -260,6 +260,10 @@ def handle(request):
 
     if method == "validate_root":
         append_log({"validate_root": params})
+        if root_identity is None and mode != "macos":
+            error(request_id, "BUSY", "The Linux native root is inactive")
+            stopped = True
+            return
         if mode == "validate-busy":
             error(request_id, "BUSY", "The native root is inactive")
             return
@@ -993,7 +997,7 @@ def test_detach_rejects_a_different_result_path(
     assert backend.registration_committed(ROOT_MARKER_ID)
 
 
-def test_validate_root_uses_the_saved_pre_mount_identity(
+def test_stopped_linux_validation_uses_the_saved_start_binding(
     fake_adapter: Path, tmp_path: Path
 ) -> None:
     log_path = tmp_path / "validate.jsonl"
@@ -1007,13 +1011,18 @@ def test_validate_root_uses_the_saved_pre_mount_identity(
     assert backend._process is None
 
     entries = wait_for_log(log_path, 2)
-    validate_params = require_object(entries[-1]["validate_root"])
-    assert validate_params == {
+    restart_params = require_object(entries[-1]["start"])
+    assert restart_params == {
         "rootId": f"maestral:{backend.config_name}:{ROOT_MARKER_ID}",
         "rootPath": str(tmp_path / "root"),
         "cachePath": str(tmp_path / "cache"),
         "rootIdentity": saved_identity,
+        "rootMarker": {
+            "name": ".maestral-root",
+            "content": f"maestral-root-v1:{ROOT_MARKER_ID}\n",
+        },
     }
+    assert all("validate_root" not in entry for entry in entries)
 
 
 def test_validate_root_maps_inactive_registration_to_busy(
@@ -1021,10 +1030,12 @@ def test_validate_root_maps_inactive_registration_to_busy(
 ) -> None:
     backend = make_backend(fake_adapter, tmp_path, mode="validate-busy")
     start_backend(backend, tmp_path)
-    backend.stop()
-    with pytest.raises(VirtualFileBusyError):
-        backend.validate_root(str(tmp_path / "root"), ROOT_MARKER_ID)
-    assert backend._process is None
+    try:
+        with pytest.raises(VirtualFileBusyError):
+            backend.validate_root(str(tmp_path / "root"), ROOT_MARKER_ID)
+        assert backend._process is not None
+    finally:
+        backend.stop()
 
 
 def test_validate_root_requires_the_exact_saved_identity(
@@ -1032,10 +1043,14 @@ def test_validate_root_requires_the_exact_saved_identity(
 ) -> None:
     backend = make_backend(fake_adapter, tmp_path, mode="bad-validate-root")
     start_backend(backend, tmp_path)
-    backend.stop()
-    with pytest.raises(NativeVirtualFileProtocolError, match="different native root"):
-        backend.validate_root(str(tmp_path / "root"), ROOT_MARKER_ID)
-    assert backend._process is None
+    try:
+        with pytest.raises(
+            NativeVirtualFileProtocolError, match="different native root"
+        ):
+            backend.validate_root(str(tmp_path / "root"), ROOT_MARKER_ID)
+        assert backend._process is None or backend._process.poll() is not None
+    finally:
+        backend.stop()
 
 
 def test_restart_rejects_a_replaced_source_root_before_launch(

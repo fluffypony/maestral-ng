@@ -604,95 +604,105 @@ class NativeProcessVirtualFileBackend:
         if not self.supported:
             raise UnsupportedVirtualFileBackend()._unsupported()
         with self._lifecycle_lock:
-            if self._started:
-                if self._active_binding is None:
-                    raise self._process_error(
-                        "The active native root binding is unavailable."
-                    )
-                return self._public_root_binding(self._active_binding)
-            root_marker_id = self._saved_root_marker_id()
-            root_id = _root_id(self.config_name, root_marker_id)
-            binding = self._prepare_start_binding(root_path, root_marker_id)
+            return self._start_locked(root_path, request_hydration)
 
-            if self._process is not None:
-                self._stop_process()
-            self._launch_process()
-            self._request_hydration = request_hydration
-            try:
-                result = self._request(
-                    "start",
-                    {
-                        "rootId": root_id,
-                        "rootPath": binding.source_root_path,
-                        "cachePath": binding.source_cache_path,
-                        "rootIdentity": binding.source_root_identity,
-                        "rootMarker": _root_marker_object(root_marker_id),
-                    },
+    def _start_locked(
+        self, root_path: str, request_hydration: HydrationRequest
+    ) -> VirtualFileRootBinding:
+        """Start one native root while holding the lifecycle lock."""
+        if self._started:
+            if self._active_binding is None:
+                raise self._process_error(
+                    "The active native root binding is unavailable."
                 )
-                completed_binding, capabilities = self._validate_start_result(
-                    result, binding
-                )
-                self._save_root_binding(completed_binding)
-                with self._state_lock:
-                    if self._fatal_error is not None:
-                        raise self._fatal_error
-                    process = self._process
-                    if process is None or process.poll() is not None:
-                        raise self._process_error(
-                            "The native virtual-file adapter exited during start."
-                        )
-                    self._root_path = completed_binding.visible_root_path
-                    self._cache_path = completed_binding.cache_path
-                    self._root_id = root_id
-                    self._active_binding = completed_binding
-                    self._adapter_capabilities = capabilities
-                    self._started = True
-                return self._public_root_binding(completed_binding)
-            except BaseException:
-                self._request_hydration = None
-                self._stop_process()
-                raise
+            return self._public_root_binding(self._active_binding)
+        root_marker_id = self._saved_root_marker_id()
+        root_id = _root_id(self.config_name, root_marker_id)
+        binding = self._prepare_start_binding(root_path, root_marker_id)
+
+        if self._process is not None:
+            self._stop_process()
+        self._launch_process()
+        self._request_hydration = request_hydration
+        try:
+            result = self._request(
+                "start",
+                {
+                    "rootId": root_id,
+                    "rootPath": binding.source_root_path,
+                    "cachePath": binding.source_cache_path,
+                    "rootIdentity": binding.source_root_identity,
+                    "rootMarker": _root_marker_object(root_marker_id),
+                },
+            )
+            completed_binding, capabilities = self._validate_start_result(
+                result, binding
+            )
+            self._save_root_binding(completed_binding)
+            with self._state_lock:
+                if self._fatal_error is not None:
+                    raise self._fatal_error
+                process = self._process
+                if process is None or process.poll() is not None:
+                    raise self._process_error(
+                        "The native virtual-file adapter exited during start."
+                    )
+                self._root_path = completed_binding.visible_root_path
+                self._cache_path = completed_binding.cache_path
+                self._root_id = root_id
+                self._active_binding = completed_binding
+                self._adapter_capabilities = capabilities
+                self._started = True
+            return self._public_root_binding(completed_binding)
+        except BaseException:
+            self._request_hydration = None
+            self._stop_process()
+            raise
 
     def stop(self) -> None:
         """Stop the native root and release all process resources."""
         with self._lifecycle_lock:
-            with self._state_lock:
-                self._closing = True
+            self._stop_locked()
 
-            self._wait_for_content_operations()
+    def _stop_locked(self) -> None:
+        """Stop one native root while holding the lifecycle lock."""
+        with self._state_lock:
+            self._closing = True
 
-            with self._state_lock:
-                process = self._process
-                fatal_error = self._fatal_error
+        self._wait_for_content_operations()
 
-            if process is not None and process.poll() is None and fatal_error is None:
-                try:
-                    result = self._request(
-                        "stop",
-                        {},
-                        timeout=self._request_timeout,
-                        terminate_on_timeout=False,
+        with self._state_lock:
+            process = self._process
+            fatal_error = self._fatal_error
+
+        if process is not None and process.poll() is None and fatal_error is None:
+            try:
+                result = self._request(
+                    "stop",
+                    {},
+                    timeout=self._request_timeout,
+                    terminate_on_timeout=False,
+                )
+                _require_exact_keys(self, result, set(), "stop result")
+            except Exception:
+                with self._state_lock:
+                    process_is_active = (
+                        process is self._process
+                        and process.poll() is None
+                        and self._fatal_error is None
                     )
-                    _require_exact_keys(self, result, set(), "stop result")
-                except Exception:
-                    with self._state_lock:
-                        process_is_active = (
-                            process is self._process
-                            and process.poll() is None
-                            and self._fatal_error is None
-                        )
-                    if process_is_active:
-                        raise
+                if process_is_active:
+                    raise
 
-            with self._state_lock:
-                self._started = False
-                self._request_hydration = None
-            self._stop_process()
-            self._root_path = ""
-            self._cache_path = ""
-            self._root_id = ""
-            self._active_binding = None
-            self._adapter_capabilities = ()
+        with self._state_lock:
+            self._started = False
+            self._request_hydration = None
+        self._stop_process()
+        self._root_path = ""
+        self._cache_path = ""
+        self._root_id = ""
+        self._active_binding = None
+        self._adapter_capabilities = ()
 
     def validate_root(self, root_path: str, root_marker_id: str) -> None:
         """Validate an active native root without reading its mounted namespace."""
@@ -727,6 +737,22 @@ class NativeProcessVirtualFileBackend:
             launched_fresh = (
                 process is None or process.poll() is not None or fatal_error is not None
             )
+            if launched_fresh and self._platform_name == "Linux":
+
+                def reject_hydration(
+                    _provider_id: str, _expected_revision: str
+                ) -> dict[str, object]:
+                    raise VirtualFileBusyError(
+                        "The virtual root is under validation",
+                        "Try to open this item after validation finishes.",
+                    )
+
+                try:
+                    self._start_locked(requested_root, reject_hydration)
+                finally:
+                    if self._started:
+                        self._stop_locked()
+                return
             if launched_fresh:
                 with self._state_lock:
                     self._closing = True
@@ -2035,12 +2061,12 @@ class NativeProcessVirtualFileBackend:
 def create_process_virtual_file_backend(config_name: str) -> VirtualFileBackend:
     """Return the native process backend, or an inactive backend when unavailable."""
     if platform.system() == "Windows":
-        return UnsupportedVirtualFileBackend()
+        return UnsupportedVirtualFileBackend(config_name)
     try:
         executable = resolve_native_virtual_file_executable()
         return NativeProcessVirtualFileBackend(config_name, executable)
     except NativeVirtualFileProcessError:
-        return UnsupportedVirtualFileBackend()
+        return UnsupportedVirtualFileBackend(config_name)
 
 
 def resolve_native_virtual_file_executable(
