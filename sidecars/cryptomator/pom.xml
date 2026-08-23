@@ -6,7 +6,7 @@
 
     <groupId>org.getmaestral</groupId>
     <artifactId>maestral-cryptomator-sidecar</artifactId>
-    <version>0.1.0</version>
+    <version>0.2.0</version>
     <name>Maestral Cryptomator sidecar</name>
     <description>An isolated Cryptomator vault-format adapter for Maestral.</description>
     <url>https://getmaestral.com</url>

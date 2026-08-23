@@ -5,6 +5,7 @@
 package org.getmaestral.cryptomator;
 
 import com.google.gson.Gson;
+import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonNull;
 import com.google.gson.JsonObject;
@@ -32,18 +33,26 @@ import java.nio.file.NotDirectoryException;
 import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.Base64;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.UUID;
 
 final class ProtocolServer implements AutoCloseable {
-    static final int PROTOCOL_VERSION = 1;
-    static final String SIDECAR_VERSION = "0.1.0";
+    static final int PROTOCOL_VERSION = 2;
+    static final String SIDECAR_VERSION = "0.2.0";
     static final String CRYPTOFS_VERSION = "2.10.0";
     static final String CRYPTOLIB_VERSION = "2.2.2";
 
     private static final int MAX_REQUEST_BYTES = 2 * 1024 * 1024;
     private static final int MAX_SECRET_BYTES = 4096;
+    private static final int DEFAULT_PAGE_ENTRIES = 4096;
+    private static final int MAX_PAGE_ENTRIES = 4096;
+    private static final int MAX_PAGE_BYTES = 8 * 1024 * 1024;
+    private static final int MAX_ACTIVE_PAGES = 8;
     private static final Gson GSON = new Gson();
 
     private final Path exchangeRoot;
+    private final Map<String, PageState> pages = new HashMap<>();
     private VaultSession session;
     private boolean shutdown;
 
@@ -97,9 +106,11 @@ final class ProtocolServer implements AutoCloseable {
 
     @Override
     public void close() throws IOException {
+        pages.clear();
         if (session != null) {
-            session.close();
+            VaultSession openSession = session;
             session = null;
+            openSession.close();
         }
     }
 
@@ -121,8 +132,16 @@ final class ProtocolServer implements AutoCloseable {
                                     requireString(params, "path"),
                                     optionalBoolean(params, "include_hash", false));
             case "snapshot" ->
-                    requireSession().snapshot(optionalBoolean(params, "include_hash", false));
-            case "storage_map" -> requireSession().storageMap();
+                    paged(
+                            "snapshot",
+                            params,
+                            () ->
+                                    requireSession()
+                                            .snapshot(
+                                                    optionalBoolean(
+                                                            params, "include_hash", false)));
+            case "storage_map" ->
+                    paged("storage_map", params, () -> requireSession().storageMap());
             case "mkdir" -> {
                 requireSession()
                         .makeDirectory(
@@ -232,8 +251,10 @@ final class ProtocolServer implements AutoCloseable {
     }
 
     private JsonObject closeVault() throws IOException {
-        requireSession().close();
+        VaultSession openSession = requireSession();
         session = null;
+        pages.clear();
+        openSession.close();
         return ok();
     }
 
@@ -254,6 +275,61 @@ final class ProtocolServer implements AutoCloseable {
             throw new SidecarException("vault_not_open", "Open a vault first.");
         }
         return session;
+    }
+
+    private JsonObject paged(String method, JsonObject params, PageLoader loader)
+            throws IOException {
+        String cursor = optionalString(params, "cursor");
+        PageState state;
+        if (cursor == null) {
+            if (pages.size() >= MAX_ACTIVE_PAGES) {
+                throw new SidecarException(
+                        "cursor_limit", "Too many paged results are still active.");
+            }
+            int limit = optionalPositiveInt(params, "limit", DEFAULT_PAGE_ENTRIES);
+            state = new PageState(method, loader.load(), 0, limit);
+        } else {
+            state = pages.get(cursor);
+            if (state == null || !state.method().equals(method)) {
+                throw new SidecarException("invalid_cursor", "The page cursor is invalid.");
+            }
+        }
+
+        JsonArray page = new JsonArray();
+        int index = state.offset();
+        int encodedBytes = 2;
+        while (index < state.entries().size() && page.size() < state.limit()) {
+            JsonElement entry = state.entries().get(index);
+            int entryBytes = GSON.toJson(entry).getBytes(StandardCharsets.UTF_8).length + 1;
+            if (!page.isEmpty() && encodedBytes + entryBytes > MAX_PAGE_BYTES) {
+                break;
+            }
+            page.add(entry);
+            encodedBytes += entryBytes;
+            index++;
+        }
+
+        String nextCursor = cursor;
+        if (index < state.entries().size()) {
+            if (nextCursor == null) {
+                nextCursor = UUID.randomUUID().toString();
+            }
+            pages.put(
+                    nextCursor,
+                    new PageState(state.method(), state.entries(), index, state.limit()));
+        } else if (nextCursor != null) {
+            pages.remove(nextCursor);
+            nextCursor = null;
+        }
+
+        JsonObject result = new JsonObject();
+        result.add("entries", page);
+        if (nextCursor == null) {
+            result.add("next_cursor", JsonNull.INSTANCE);
+        } else {
+            result.addProperty("next_cursor", nextCursor);
+        }
+        return result;
     }
 
     private static char[] decodeSecret(String encoded) {
@@ -322,6 +398,31 @@ final class ProtocolServer implements AutoCloseable {
         return value.getAsJsonObject();
     }
 
+    private static String optionalString(JsonObject object, String name) {
+        JsonElement value = object.get(name);
+        if (value == null || value.isJsonNull()) {
+            return null;
+        }
+        if (!value.isJsonPrimitive() || !value.getAsJsonPrimitive().isString()) {
+            throw new SidecarException(
+                    "invalid_request", "The " + name + " field must be a string.");
+        }
+        return value.getAsString();
+    }
+
+    private static int optionalPositiveInt(JsonObject object, String name, int defaultValue) {
+        Long value = optionalLong(object, name);
+        if (value == null) {
+            return defaultValue;
+        }
+        if (value <= 0 || value > MAX_PAGE_ENTRIES) {
+            throw new SidecarException(
+                    "invalid_request",
+                    "The " + name + " field must be between 1 and " + MAX_PAGE_ENTRIES + ".");
+        }
+        return value.intValue();
+    }
+
     private static boolean optionalBoolean(JsonObject object, String name, boolean defaultValue) {
         JsonElement value = object.get(name);
         if (value == null || value.isJsonNull()) {
@@ -344,8 +445,8 @@ final class ProtocolServer implements AutoCloseable {
                     "invalid_request", "The " + name + " field must be an integer.");
         }
         try {
-            return value.getAsLong();
-        } catch (NumberFormatException exc) {
+            return value.getAsBigDecimal().longValueExact();
+        } catch (ArithmeticException | NumberFormatException exc) {
             throw new SidecarException(
                     "invalid_request", "The " + name + " field must be an integer.");
         }
@@ -467,6 +568,13 @@ final class ProtocolServer implements AutoCloseable {
             Arrays.fill(encoded, (byte) 0);
         }
     }
+
+    @FunctionalInterface
+    private interface PageLoader {
+        JsonArray load() throws IOException;
+    }
+
+    private record PageState(String method, JsonArray entries, int offset, int limit) {}
 
     private record ErrorInfo(String code, String message) {}
 }

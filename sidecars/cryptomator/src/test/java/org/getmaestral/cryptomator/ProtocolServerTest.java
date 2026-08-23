@@ -61,7 +61,8 @@ class ProtocolServerTest {
     void reportsPinnedOfficialImplementation() {
         JsonObject hello = call("hello", new JsonObject());
 
-        assertEquals(1, hello.get("protocol_version").getAsInt());
+        assertEquals(2, hello.get("protocol_version").getAsInt());
+        assertEquals("0.2.0", hello.get("sidecar_version").getAsString());
         assertEquals("2.10.0", hello.get("cryptofs_version").getAsString());
         assertEquals("2.2.2", hello.get("cryptolib_version").getAsString());
         assertEquals(8, hello.get("vault_format").getAsInt());
@@ -153,6 +154,50 @@ class ProtocolServerTest {
                                     path.getFileName() != null
                                             && path.getFileName().toString().endsWith(".c9s")));
         }
+    }
+
+    @Test
+    void pagesOneStableSnapshotAcrossVaultChanges() {
+        initialize();
+        call("mkdir", params("path", "/a"));
+        call("mkdir", params("path", "/b"));
+        call("mkdir", params("path", "/c"));
+
+        JsonObject firstParams = new JsonObject();
+        firstParams.addProperty("limit", 2);
+        JsonObject first = call("snapshot", firstParams);
+        assertEquals(2, first.getAsJsonArray("entries").size());
+        String cursor = first.get("next_cursor").getAsString();
+
+        call("mkdir", params("path", "/created-later"));
+        JsonObject secondParams = params("cursor", cursor);
+        JsonObject second = call("snapshot", secondParams);
+        assertEquals(1, second.getAsJsonArray("entries").size());
+        assertTrue(second.get("next_cursor").isJsonNull());
+
+        JsonArray combined = first.getAsJsonArray("entries").deepCopy();
+        combined.addAll(second.getAsJsonArray("entries"));
+        assertTrue(hasPath(combined, "/a"));
+        assertTrue(hasPath(combined, "/b"));
+        assertTrue(hasPath(combined, "/c"));
+        assertFalse(hasPath(combined, "/created-later"));
+    }
+
+    @Test
+    void rejectsAnUnknownPageCursor() {
+        initialize();
+        JsonObject response =
+                callForResponse("storage_map", params("cursor", "unknown-cursor"));
+        assertEquals("invalid_cursor", errorCode(response));
+    }
+
+    @Test
+    void rejectsAFractionalPageLimit() {
+        initialize();
+        JsonObject params = new JsonObject();
+        params.addProperty("limit", 1.5);
+        JsonObject response = callForResponse("snapshot", params);
+        assertEquals("invalid_request", errorCode(response));
     }
 
     @Test
@@ -310,11 +355,16 @@ class ProtocolServerTest {
     }
 
     private JsonArray callArray(String method, JsonObject params) {
-        JsonObject response = callForResponse(method, params);
-        if (response.has("error")) {
-            throw new AssertionError(response);
+        JsonArray entries = new JsonArray();
+        JsonObject pageParams = params.deepCopy();
+        while (true) {
+            JsonObject page = call(method, pageParams);
+            entries.addAll(page.getAsJsonArray("entries"));
+            if (page.get("next_cursor").isJsonNull()) {
+                return entries;
+            }
+            pageParams = params("cursor", page.get("next_cursor").getAsString());
         }
-        return response.getAsJsonArray("result");
     }
 
     private JsonObject callForResponse(String method, JsonObject params) {

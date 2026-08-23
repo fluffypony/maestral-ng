@@ -72,7 +72,7 @@ class OfficialCryptoFsFixtureTest {
             open(server, vault);
             JsonObject snapshotParams = new JsonObject();
             snapshotParams.addProperty("include_hash", true);
-            JsonArray snapshot = resultArray(call(server, "snapshot", snapshotParams));
+            JsonArray snapshot = pagedResult(server, "snapshot", snapshotParams);
             snapshot.forEach(entry -> entry.getAsJsonObject().remove("modified_ms"));
             assertEquals(manifest.getAsJsonArray("logical_snapshot"), snapshot);
 
@@ -88,7 +88,7 @@ class OfficialCryptoFsFixtureTest {
             assertTrue(hasExactPath(snapshot, manifest.get("moved_to").getAsString()));
             assertFalse(hasExactPath(snapshot, manifest.get("moved_from").getAsString()));
 
-            JsonArray storageMap = resultArray(call(server, "storage_map", new JsonObject()));
+            JsonArray storageMap = pagedResult(server, "storage_map", new JsonObject());
             assertEquals(snapshot.size(), storageMap.size());
             assertStorageMapMatchesSnapshot(vault, snapshot, storageMap);
 
@@ -175,11 +175,18 @@ class OfficialCryptoFsFixtureTest {
         return response.getAsJsonObject("result");
     }
 
-    private static JsonArray resultArray(JsonObject response) {
-        if (response.has("error")) {
-            throw new AssertionError(response);
+    private JsonArray pagedResult(
+            ProtocolServer server, String method, JsonObject initialParams) {
+        JsonArray entries = new JsonArray();
+        JsonObject pageParams = initialParams.deepCopy();
+        while (true) {
+            JsonObject page = resultObject(call(server, method, pageParams));
+            entries.addAll(page.getAsJsonArray("entries"));
+            if (page.get("next_cursor").isJsonNull()) {
+                return entries;
+            }
+            pageParams = params("cursor", page.get("next_cursor").getAsString());
         }
-        return response.getAsJsonArray("result");
     }
 
     private static JsonObject params(String name, String value) {

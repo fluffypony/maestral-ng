@@ -47,8 +47,8 @@ __all__ = [
 ]
 
 
-PROTOCOL_VERSION = 1
-SIDECAR_VERSION = "0.1.0"
+PROTOCOL_VERSION = 2
+SIDECAR_VERSION = "0.2.0"
 CRYPTOFS_VERSION = "2.10.0"
 CRYPTOLIB_VERSION = "2.2.2"
 VAULT_FORMAT = 8
@@ -56,6 +56,7 @@ MAX_INLINE_BYTES = 1024 * 1024
 MAX_SECRET_BYTES = 4096
 MAX_RESPONSE_BYTES = 64 * 1024 * 1024
 MAX_STDERR_BYTES = 64 * 1024
+MAX_PAGED_ENTRIES = 1_000_000
 
 SIDECAR_ERROR_CODES = frozenset(
     {
@@ -63,9 +64,11 @@ SIDECAR_ERROR_CODES = frozenset(
         "already_exists",
         "authentication_failed",
         "content_too_large",
+        "cursor_limit",
         "directory_not_empty",
         "insecure_exchange_root",
         "internal_error",
+        "invalid_cursor",
         "invalid_exchange_path",
         "invalid_exchange_root",
         "invalid_json",
@@ -400,19 +403,31 @@ class CryptomatorClient:
         timeout: float | None = None,
     ) -> builtins.list[VaultEntry]:
         """Return metadata for all cleartext paths in the vault."""
-        result = _require_list(
-            self._request("snapshot", {"include_hash": include_hash}, timeout=timeout),
+        result = self._paged_request(
             "snapshot",
+            {"include_hash": include_hash},
+            timeout=timeout,
+            context="snapshot",
         )
-        return [self._vault_entry(item) for item in result]
+        entries = [self._vault_entry(item) for item in result]
+        paths = [entry.path for entry in entries]
+        if paths != sorted(paths, key=lambda path: path.encode("utf-16-be")):
+            raise CryptomatorProtocolError(
+                "The Cryptomator sidecar returned an unsorted snapshot."
+            )
+        if len(set(paths)) != len(paths):
+            raise CryptomatorProtocolError(
+                "The Cryptomator sidecar returned duplicate snapshot paths."
+            )
+        return entries
 
     @_fail_on_protocol_error
     def storage_map(
         self, *, timeout: float | None = None
     ) -> builtins.list[StorageMapEntry]:
         """Map cleartext paths to relative physical paths in the vault."""
-        result = _require_list(
-            self._request("storage_map", {}, timeout=timeout), "storage_map"
+        result = self._paged_request(
+            "storage_map", {}, timeout=timeout, context="storage map"
         )
         entries = [self._storage_map_entry(item) for item in result]
         if entries != sorted(entries, key=lambda entry: entry.path.encode("utf-16-be")):
@@ -424,6 +439,49 @@ class CryptomatorClient:
                 "The Cryptomator sidecar returned duplicate storage paths."
             )
         return entries
+
+    def _paged_request(
+        self,
+        method: Literal["snapshot", "storage_map"],
+        params: JSONObject,
+        *,
+        timeout: float | None,
+        context: str,
+    ) -> builtins.list[JSONValue]:
+        entries: builtins.list[JSONValue] = []
+        request_params = params
+        seen_cursors: set[str] = set()
+
+        while True:
+            page = _require_object(
+                self._request(method, request_params, timeout=timeout),
+                f"{context} page",
+            )
+            if set(page) != {"entries", "next_cursor"}:
+                raise CryptomatorProtocolError(
+                    f"The Cryptomator sidecar returned an invalid {context} page."
+                )
+            page_entries = _require_list(page["entries"], f"{context} entries")
+            cursor = _optional_str(page, "next_cursor")
+            entries.extend(page_entries)
+
+            if len(entries) > MAX_PAGED_ENTRIES:
+                raise CryptomatorProtocolError(
+                    f"The Cryptomator sidecar returned too many {context} entries."
+                )
+            if cursor is None:
+                return entries
+            if not cursor or len(cursor) > 128 or cursor in seen_cursors:
+                raise CryptomatorProtocolError(
+                    f"The Cryptomator sidecar returned an invalid {context} cursor."
+                )
+            if not page_entries:
+                raise CryptomatorProtocolError(
+                    f"The Cryptomator sidecar returned an empty {context} page."
+                )
+
+            seen_cursors.add(cursor)
+            request_params = {"cursor": cursor}
 
     @_fail_on_protocol_error
     def mkdir(

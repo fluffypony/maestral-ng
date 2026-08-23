@@ -160,7 +160,10 @@ final class VaultSession implements AutoCloseable {
     JsonArray snapshot(boolean includeHash) throws IOException {
         List<Path> paths;
         try (var stream = Files.walk(cleartextRoot)) {
-            paths = stream.filter(path -> !path.equals(cleartextRoot)).toList();
+            paths =
+                    stream.filter(path -> !path.equals(cleartextRoot))
+                            .limit(MAX_SNAPSHOT_ENTRIES + 1L)
+                            .toList();
         }
         if (paths.size() > MAX_SNAPSHOT_ENTRIES) {
             throw new SidecarException(

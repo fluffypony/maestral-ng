@@ -31,6 +31,7 @@ exchange_root = Path(sys.argv[sys.argv.index("--exchange-root") + 1])
 files = {}
 directories = {"/"}
 links = {}
+page_states = {}
 
 
 def send(request_id, *, result=None, error=None):
@@ -62,6 +63,19 @@ def metadata(path, include_hash=False):
     return result
 
 
+def paged_result(name, entries, params):
+    cursor = params.get("cursor")
+    if cursor is None:
+        offset = 0
+    else:
+        entries, offset = page_states.pop(cursor)
+    end = min(offset + 2, len(entries))
+    next_cursor = f"{name}:{end}" if end < len(entries) else None
+    if next_cursor is not None:
+        page_states[next_cursor] = (entries, end)
+    return {"entries": entries[offset:end], "next_cursor": next_cursor}
+
+
 for line in sys.stdin.buffer:
     request = json.loads(line)
     request_id = request["id"]
@@ -72,8 +86,8 @@ for line in sys.stdin.buffer:
         send(
             request_id,
             result={
-                "protocol_version": 2 if mode == "version" else 1,
-                "sidecar_version": "0.1.0",
+                "protocol_version": 1 if mode == "version" else 2,
+                "sidecar_version": "0.2.0",
                 "cryptofs_version": "2.10.0",
                 "cryptolib_version": "2.2.2",
                 "vault_format": 8,
@@ -160,16 +174,29 @@ for line in sys.stdin.buffer:
                 children.append(metadata(path, params["include_hash"]))
         send(request_id, result=children)
     elif method == "snapshot":
+        if mode == "repeat_cursor":
+            send(
+                request_id,
+                result={
+                    "entries": [
+                        {"path": "/loop", "type": "directory", "size": 0, "modified_ms": 1}
+                    ],
+                    "next_cursor": "repeat",
+                },
+            )
+            continue
         paths = sorted((directories - {"/"}) | files.keys() | links.keys())
-        send(request_id, result=[metadata(path, params["include_hash"]) for path in paths])
+        entries = [metadata(path, params.get("include_hash", False)) for path in paths]
+        send(request_id, result=paged_result("snapshot", entries, params))
     elif method == "storage_map":
+        entries = [
+            {"path": "/folder", "type": "directory", "storage_path": "d/aa/folder/dir.c9r"},
+            {"path": "/folder/data.bin", "type": "file", "storage_path": "d/bb/data.c9r"},
+            {"path": "/link", "type": "symlink", "storage_path": "d/cc/link/symlink.c9r"},
+        ]
         send(
             request_id,
-            result=[
-                {"path": "/folder", "type": "directory", "storage_path": "d/aa/folder/dir.c9r"},
-                {"path": "/folder/data.bin", "type": "file", "storage_path": "d/bb/data.c9r"},
-                {"path": "/link", "type": "symlink", "storage_path": "d/cc/link/symlink.c9r"},
-            ],
+            result=paged_result("storage_map", entries, params),
         )
     elif method == "move":
         source = params["source"]
@@ -314,6 +341,15 @@ def test_malformed_output_fails_all_pending(fake_sidecar: Path) -> None:
 def test_sidecar_version_mismatch(fake_sidecar: Path) -> None:
     with pytest.raises(CryptomatorProtocolError, match="not supported"):
         make_client(fake_sidecar, "version")
+
+
+def test_repeated_page_cursor_stops_process(fake_sidecar: Path) -> None:
+    client = make_client(fake_sidecar, "repeat_cursor")
+
+    with pytest.raises(CryptomatorProtocolError, match="cursor"):
+        client.snapshot()
+
+    client.terminate()
 
 
 def test_password_is_redacted(fake_sidecar: Path, tmp_path: Path) -> None:
