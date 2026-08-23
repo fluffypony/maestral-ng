@@ -1,4 +1,13 @@
-from maestral.utils.hashing import DropboxContentHasher
+from maestral.utils.hashing import DropboxContentHasher, sha256_content_hasher
+
+
+def test_sha256_content_hasher() -> None:
+    hasher = sha256_content_hasher()
+    hasher.update(b"Maestral")
+    assert (
+        hasher.hexdigest()
+        == "a202ca9ba716078f88a700d19ddda6ad09875084d79244c5531d5392b303e606"
+    )
 
 
 def test_content_hasher_copy_can_be_used_independently() -> None:

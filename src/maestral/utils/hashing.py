@@ -28,6 +28,11 @@ def md5_content_hasher() -> ContentHasher:
     return hashlib.md5(usedforsecurity=False)
 
 
+def sha256_content_hasher() -> ContentHasher:
+    """Return the hasher used for cleartext Cryptomator content checksums."""
+    return hashlib.sha256()
+
+
 class DropboxContentHasher:
     """
     Computes a hash using the same algorithm that the Dropbox API uses for the
