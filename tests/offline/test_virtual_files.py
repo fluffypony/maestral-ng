@@ -1414,6 +1414,33 @@ def test_malformed_snapshot_fails_before_native_mutation(
     controller.close()
 
 
+@pytest.mark.parametrize("update_kind", ["direct", "batch", "snapshot"])
+def test_multibyte_component_over_filesystem_limit_fails_before_native_mutation(
+    config_name: str,
+    tmp_path: Path,
+    update_kind: str,
+) -> None:
+    provider = FakeVirtualProvider()
+    backend = FakeVirtualFileBackend()
+    controller = make_controller(config_name, tmp_path, provider, backend)
+    metadata = provider.add_file("long-1", f"/{'é' * 128}", "rev-1", b"bad")
+    call_count = len(backend.calls)
+
+    with pytest.raises(ValueError, match="normalised path"):
+        if update_kind == "direct":
+            controller.reconcile_remote_change(metadata)
+        elif update_kind == "batch":
+            controller.reconcile_remote_batch([metadata], "cursor-new")
+        else:
+            controller._state.set("virtual_files", "cursor", "")
+            provider.pages = [ListFolderResult([metadata], False, "cursor-new")]
+            controller.refresh_remote()
+
+    assert len(backend.calls) == call_count
+    assert backend.items == {}
+    controller.close()
+
+
 @pytest.mark.parametrize(
     "path",
     ["/.maestral-root", "/.MAESTRAL-ROOT", "/.~maestral-root-owned"],

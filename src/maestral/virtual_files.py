@@ -79,7 +79,9 @@ def _validate_virtual_path(
         raise ValueError(f"The virtual-file {name} is invalid")
     components = path[1:].split("/")
     if any(
-        component in {"", ".", ".."} or len(component) > 255 for component in components
+        component in {"", ".", ".."}
+        or len(component.encode("utf-8")) > 255
+        for component in components
     ):
         raise ValueError(f"The virtual-file {name} is invalid")
     if components[0].casefold() == ROOT_MARKER_FILE.casefold() or components[
