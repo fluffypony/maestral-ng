@@ -10,6 +10,15 @@ The sidecar uses CryptoFS 2.10.0 and Cryptolib 2.2.2. It creates and opens vault
 format 8. Maestral keeps the unlock password in the system keyring. The remote
 vault contains only the password-protected master key and encrypted data.
 
+The `storage_map` method takes no parameters. It returns each non-root logical
+entry as `path`, `type`, and `storage_path`. The storage path uses `/` separators
+and is relative to the vault root. It points to the physical object whose file
+key backs the logical entry. A directory points to its stable `d/...` content
+directory. A shortened file points to its `.c9s/contents.c9r` object.
+Results use logical-path order. A missing file key or match returns
+`storage_mapping_missing`. More than one logical or physical match returns
+`storage_mapping_ambiguous`. The method limits both logical and physical scans.
+
 Build and test with JDK 25 or later:
 
 ```sh

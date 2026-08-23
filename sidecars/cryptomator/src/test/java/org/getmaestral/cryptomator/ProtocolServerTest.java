@@ -12,18 +12,21 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import com.google.gson.Gson;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
-import java.io.IOException;
-import java.io.RandomAccessFile;
-import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.nio.file.attribute.PosixFilePermissions;
-import java.util.Base64;
-import java.util.Comparator;
+
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+
+import java.io.IOException;
+import java.io.RandomAccessFile;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.LinkOption;
+import java.nio.file.Path;
+import java.nio.file.attribute.PosixFilePermissions;
+import java.util.Base64;
+import java.util.Comparator;
 
 class ProtocolServerTest {
     private static final Gson GSON = new Gson();
@@ -127,7 +130,11 @@ class ProtocolServerTest {
         assertTrue(
                 snapshot.asList().stream()
                         .map(element -> element.getAsJsonObject())
-                        .filter(entry -> entry.get("path").getAsString().equals("/names/Grüße 東京.txt"))
+                        .filter(
+                                entry ->
+                                        entry.get("path")
+                                                .getAsString()
+                                                .equals("/names/Grüße 東京.txt"))
                         .allMatch(entry -> entry.has("sha256")));
 
         byte[] read =
@@ -146,6 +153,67 @@ class ProtocolServerTest {
                                     path.getFileName() != null
                                             && path.getFileName().toString().endsWith(".c9s")));
         }
+    }
+
+    @Test
+    void mapsStablePhysicalStorageWithoutHostPaths() throws Exception {
+        initialize();
+        call("mkdir", params("path", "/stable-directory"));
+        writeInline("/regular.txt", "regular".getBytes(StandardCharsets.UTF_8));
+        writeInline("/stable-directory/child.txt", "child".getBytes(StandardCharsets.UTF_8));
+
+        JsonObject link = params("path", "/relative-link");
+        link.addProperty("target", "regular.txt");
+        call("symlink", link);
+
+        String longPath = "/" + "long-" + "x".repeat(185) + ".txt";
+        writeInline(longPath, "long".getBytes(StandardCharsets.UTF_8));
+
+        JsonArray beforeMove = callArray("storage_map", new JsonObject());
+        assertEquals(5, beforeMove.size());
+        assertSafeStoragePaths(beforeMove);
+        assertFalse(beforeMove.toString().contains(temporaryDirectory.toString()));
+
+        JsonObject regular = entryFor(beforeMove, "/regular.txt");
+        assertEquals("file", regular.get("type").getAsString());
+        assertTrue(regular.get("storage_path").getAsString().endsWith(".c9r"));
+        assertFalse(regular.get("storage_path").getAsString().contains(".c9s/"));
+
+        JsonObject directory = entryFor(beforeMove, "/stable-directory");
+        assertEquals("directory", directory.get("type").getAsString());
+        String directoryStoragePath = directory.get("storage_path").getAsString();
+        assertTrue(
+                Files.isDirectory(vault.resolve(directoryStoragePath), LinkOption.NOFOLLOW_LINKS));
+
+        JsonObject symbolicLink = entryFor(beforeMove, "/relative-link");
+        assertEquals("symlink", symbolicLink.get("type").getAsString());
+        assertTrue(symbolicLink.get("storage_path").getAsString().endsWith(".c9r/symlink.c9r"));
+
+        JsonObject shortened = entryFor(beforeMove, longPath);
+        assertEquals("file", shortened.get("type").getAsString());
+        assertTrue(shortened.get("storage_path").getAsString().contains(".c9s/contents.c9r"));
+
+        JsonObject move = params("source", "/stable-directory");
+        move.addProperty("target", "/moved-directory");
+        call("move", move);
+        JsonArray afterMove = callArray("storage_map", new JsonObject());
+        assertEquals(
+                directoryStoragePath,
+                entryFor(afterMove, "/moved-directory").get("storage_path").getAsString());
+        assertFalse(hasPath(afterMove, "/stable-directory"));
+    }
+
+    @Test
+    void rejectsAnAmbiguousPhysicalStorageMappingWithoutPaths() throws Exception {
+        initialize();
+        writeInline("/target.txt", "content".getBytes(StandardCharsets.UTF_8));
+        JsonObject target = entryFor(callArray("storage_map", new JsonObject()), "/target.txt");
+        Path storagePath = vault.resolve(target.get("storage_path").getAsString());
+        Files.createLink(vault.resolve("d/storage-map-duplicate"), storagePath);
+
+        JsonObject response = callForResponse("storage_map", new JsonObject());
+        assertEquals("storage_mapping_ambiguous", errorCode(response));
+        assertFalse(response.toString().contains(temporaryDirectory.toString()));
     }
 
     @Test
@@ -210,11 +278,8 @@ class ProtocolServerTest {
     void rejectsLogicalTraversalAndRootMutation() {
         initialize();
         assertEquals(
-                "invalid_path",
-                errorCode(callForResponse("mkdir", params("path", "/../escape"))));
-        assertEquals(
-                "invalid_path",
-                errorCode(callForResponse("delete", params("path", "/"))));
+                "invalid_path", errorCode(callForResponse("mkdir", params("path", "/../escape"))));
+        assertEquals("invalid_path", errorCode(callForResponse("delete", params("path", "/"))));
     }
 
     private JsonObject initialize() {
@@ -279,6 +344,29 @@ class ProtocolServerTest {
                 .anyMatch(path::equals);
     }
 
+    private static JsonObject entryFor(JsonArray entries, String path) {
+        return entries.asList().stream()
+                .map(element -> element.getAsJsonObject())
+                .filter(entry -> entry.get("path").getAsString().equals(path))
+                .findFirst()
+                .orElseThrow();
+    }
+
+    private void assertSafeStoragePaths(JsonArray entries) {
+        for (var element : entries) {
+            String storagePath = element.getAsJsonObject().get("storage_path").getAsString();
+            assertFalse(Path.of(storagePath).isAbsolute());
+            assertFalse(storagePath.contains("\\"));
+            assertTrue(storagePath.startsWith("d/"));
+            for (Path component : Path.of(storagePath)) {
+                assertFalse(component.toString().equals(".") || component.toString().equals(".."));
+            }
+            Path resolved = vault.resolve(storagePath).normalize();
+            assertTrue(resolved.startsWith(vault.resolve("d")));
+            assertTrue(Files.exists(resolved, LinkOption.NOFOLLOW_LINKS));
+        }
+    }
+
     private static byte[] deterministicBytes(int length) {
         byte[] result = new byte[length];
         for (int index = 0; index < result.length; index++) {
@@ -294,5 +382,4 @@ class ProtocolServerTest {
             throw new AssertionError(exc);
         }
     }
-
 }

@@ -5,12 +5,16 @@
 package org.getmaestral.cryptomator;
 
 import com.google.gson.Gson;
-import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonNull;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParseException;
 import com.google.gson.JsonParser;
+
+import org.cryptomator.cryptofs.VaultConfigLoadException;
+import org.cryptomator.cryptolib.api.AuthenticationFailedException;
+import org.cryptomator.cryptolib.api.InvalidPassphraseException;
+
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
@@ -28,9 +32,6 @@ import java.nio.file.NotDirectoryException;
 import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.Base64;
-import org.cryptomator.cryptofs.VaultConfigLoadException;
-import org.cryptomator.cryptolib.api.AuthenticationFailedException;
-import org.cryptomator.cryptolib.api.InvalidPassphraseException;
 
 final class ProtocolServer implements AutoCloseable {
     static final int PROTOCOL_VERSION = 1;
@@ -121,6 +122,7 @@ final class ProtocolServer implements AutoCloseable {
                                     optionalBoolean(params, "include_hash", false));
             case "snapshot" ->
                     requireSession().snapshot(optionalBoolean(params, "include_hash", false));
+            case "storage_map" -> requireSession().storageMap();
             case "mkdir" -> {
                 requireSession()
                         .makeDirectory(
@@ -177,9 +179,7 @@ final class ProtocolServer implements AutoCloseable {
             }
             case "symlink" -> {
                 requireSession()
-                        .createLink(
-                                requireString(params, "path"),
-                                requireString(params, "target"));
+                        .createLink(requireString(params, "path"), requireString(params, "target"));
                 yield ok();
             }
             case "readlink" -> {
@@ -304,7 +304,8 @@ final class ProtocolServer implements AutoCloseable {
     private static String requireString(JsonObject object, String name) {
         JsonElement value = object.get(name);
         if (value == null || !value.isJsonPrimitive() || !value.getAsJsonPrimitive().isString()) {
-            throw new SidecarException("invalid_request", "The " + name + " field must be a string.");
+            throw new SidecarException(
+                    "invalid_request", "The " + name + " field must be a string.");
         }
         return value.getAsString();
     }
@@ -315,7 +316,8 @@ final class ProtocolServer implements AutoCloseable {
             return new JsonObject();
         }
         if (!value.isJsonObject()) {
-            throw new SidecarException("invalid_request", "The " + name + " field must be an object.");
+            throw new SidecarException(
+                    "invalid_request", "The " + name + " field must be an object.");
         }
         return value.getAsJsonObject();
     }
@@ -326,7 +328,8 @@ final class ProtocolServer implements AutoCloseable {
             return defaultValue;
         }
         if (!value.isJsonPrimitive() || !value.getAsJsonPrimitive().isBoolean()) {
-            throw new SidecarException("invalid_request", "The " + name + " field must be a boolean.");
+            throw new SidecarException(
+                    "invalid_request", "The " + name + " field must be a boolean.");
         }
         return value.getAsBoolean();
     }
@@ -337,12 +340,14 @@ final class ProtocolServer implements AutoCloseable {
             return null;
         }
         if (!value.isJsonPrimitive() || !value.getAsJsonPrimitive().isNumber()) {
-            throw new SidecarException("invalid_request", "The " + name + " field must be an integer.");
+            throw new SidecarException(
+                    "invalid_request", "The " + name + " field must be an integer.");
         }
         try {
             return value.getAsLong();
         } catch (NumberFormatException exc) {
-            throw new SidecarException("invalid_request", "The " + name + " field must be an integer.");
+            throw new SidecarException(
+                    "invalid_request", "The " + name + " field must be an integer.");
         }
     }
 

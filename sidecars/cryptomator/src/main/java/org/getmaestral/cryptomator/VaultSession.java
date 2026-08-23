@@ -6,6 +6,14 @@ package org.getmaestral.cryptomator;
 
 import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
+
+import org.cryptomator.cryptofs.CryptoFileSystemProperties;
+import org.cryptomator.cryptofs.CryptoFileSystemProvider;
+import org.cryptomator.cryptofs.VaultConfig;
+import org.cryptomator.cryptolib.api.Masterkey;
+import org.cryptomator.cryptolib.api.MasterkeyLoader;
+import org.cryptomator.cryptolib.common.MasterkeyFileAccess;
+
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.CharBuffer;
@@ -31,19 +39,16 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Base64;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.HexFormat;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
-import org.cryptomator.cryptofs.CryptoFileSystemProperties;
-import org.cryptomator.cryptofs.CryptoFileSystemProvider;
-import org.cryptomator.cryptofs.VaultConfig;
-import org.cryptomator.cryptolib.api.Masterkey;
-import org.cryptomator.cryptolib.api.MasterkeyLoader;
-import org.cryptomator.cryptolib.common.MasterkeyFileAccess;
 
 final class VaultSession implements AutoCloseable {
     static final int MAX_INLINE_BYTES = 1024 * 1024;
     static final int MAX_SNAPSHOT_ENTRIES = 1_000_000;
+    private static final long MAX_STORAGE_NODES = 6L * MAX_SNAPSHOT_ENTRIES + 4096;
     static final String MASTERKEY_FILE = "masterkey.cryptomator";
     static final String CONFIG_FILE = "vault.cryptomator";
 
@@ -85,8 +90,7 @@ final class VaultSession implements AutoCloseable {
             }
         }
 
-        Path temporary =
-                realParent.resolve(".maestral-vault-" + UUID.randomUUID() + ".tmp");
+        Path temporary = realParent.resolve(".maestral-vault-" + UUID.randomUUID() + ".tmp");
         Files.createDirectory(temporary);
         PathSecurity.setPrivateDirectoryPermissions(temporary);
         boolean installed = false;
@@ -114,8 +118,7 @@ final class VaultSession implements AutoCloseable {
     static VaultSession open(Path exchangeRoot, Path requestedPath, char[] passphrase)
             throws IOException {
         Path vault = requestedPath.toAbsolutePath().normalize();
-        if (Files.isSymbolicLink(vault)
-                || !Files.isDirectory(vault, LinkOption.NOFOLLOW_LINKS)) {
+        if (Files.isSymbolicLink(vault) || !Files.isDirectory(vault, LinkOption.NOFOLLOW_LINKS)) {
             throw new SidecarException("invalid_vault", "The vault is not a directory.");
         }
         vault = vault.toRealPath(LinkOption.NOFOLLOW_LINKS);
@@ -126,7 +129,9 @@ final class VaultSession implements AutoCloseable {
 
     JsonObject info() throws IOException {
         VaultConfig.UnverifiedVaultConfig config =
-                VaultConfig.decode(Files.readString(vaultPath.resolve(CONFIG_FILE), StandardCharsets.US_ASCII));
+                VaultConfig.decode(
+                        Files.readString(
+                                vaultPath.resolve(CONFIG_FILE), StandardCharsets.US_ASCII));
         JsonObject result = new JsonObject();
         result.addProperty("vault_path", vaultPath.toString());
         result.addProperty("vault_format", config.allegedVaultVersion());
@@ -161,7 +166,8 @@ final class VaultSession implements AutoCloseable {
             paths = stream.filter(path -> !path.equals(cleartextRoot)).toList();
         }
         if (paths.size() > MAX_SNAPSHOT_ENTRIES) {
-            throw new SidecarException("vault_too_large", "The vault snapshot has too many entries.");
+            throw new SidecarException(
+                    "vault_too_large", "The vault snapshot has too many entries.");
         }
         paths = new ArrayList<>(paths);
         paths.sort(Comparator.comparing(this::toLogicalPath));
@@ -169,6 +175,70 @@ final class VaultSession implements AutoCloseable {
         JsonArray result = new JsonArray();
         for (Path path : paths) {
             result.add(metadata(path, includeHash));
+        }
+        return result;
+    }
+
+    JsonArray storageMap() throws IOException {
+        List<StorageEntry> entries = storageEntries();
+        Map<Object, StorageMatch> matchesByKey = new HashMap<>();
+        for (StorageEntry entry : entries) {
+            StorageMatch previous =
+                    matchesByKey.putIfAbsent(entry.fileKey(), new StorageMatch(entry));
+            if (previous != null) {
+                throw ambiguousStorageMapping();
+            }
+        }
+
+        Path storageRoot = vaultPath.resolve("d").normalize();
+        long nodeCount = 0;
+        try (var paths = Files.walk(storageRoot)) {
+            var iterator = paths.iterator();
+            while (iterator.hasNext()) {
+                Path path = iterator.next();
+                nodeCount++;
+                if (nodeCount > MAX_STORAGE_NODES) {
+                    throw new SidecarException(
+                            "vault_too_large",
+                            "The vault storage map has too many physical nodes.");
+                }
+
+                BasicFileAttributes attrs;
+                try {
+                    attrs =
+                            Files.readAttributes(
+                                    path, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
+                } catch (NoSuchFileException ignored) {
+                    continue;
+                }
+                Object fileKey = attrs.fileKey();
+                if (fileKey == null) {
+                    continue;
+                }
+                StorageMatch match = matchesByKey.get(fileKey);
+                if (match == null || !match.entry().accepts(attrs)) {
+                    continue;
+                }
+                if (match.storagePath() != null && !match.storagePath().equals(path)) {
+                    throw ambiguousStorageMapping();
+                }
+                match.setStoragePath(path);
+            }
+        }
+
+        JsonArray result = new JsonArray();
+        for (StorageEntry entry : entries) {
+            Path storagePath = matchesByKey.get(entry.fileKey()).storagePath();
+            if (storagePath == null) {
+                throw new SidecarException(
+                        "storage_mapping_missing",
+                        "A vault entry has no physical storage mapping.");
+            }
+            JsonObject item = new JsonObject();
+            item.addProperty("path", entry.logicalPath());
+            item.addProperty("type", entry.type());
+            item.addProperty("storage_path", toStoragePath(storageRoot, storagePath));
+            result.add(item);
         }
         return result;
     }
@@ -194,11 +264,13 @@ final class VaultSession implements AutoCloseable {
         try {
             content = Base64.getDecoder().decode(encoded);
         } catch (IllegalArgumentException exc) {
-            throw new SidecarException("invalid_request", "The inline content is not valid base64.");
+            throw new SidecarException(
+                    "invalid_request", "The inline content is not valid base64.");
         }
         if (content.length > MAX_INLINE_BYTES) {
             Arrays.fill(content, (byte) 0);
-            throw new SidecarException("content_too_large", "Use an exchange file for large content.");
+            throw new SidecarException(
+                    "content_too_large", "Use an exchange file for large content.");
         }
         try {
             putBytesOrFile(requireNonRoot(logicalPath), null, content, modifiedMillis, replace);
@@ -214,7 +286,8 @@ final class VaultSession implements AutoCloseable {
             throw new FileAlreadyExistsException(target.toString());
         }
 
-        Path temporary = target.resolveSibling(target.getFileName() + "." + UUID.randomUUID() + ".tmp");
+        Path temporary =
+                target.resolveSibling(target.getFileName() + "." + UUID.randomUUID() + ".tmp");
         try {
             Files.copy(source, temporary);
             moveAtomically(temporary, target, replace);
@@ -227,7 +300,8 @@ final class VaultSession implements AutoCloseable {
         Path path = resolveLogical(logicalPath);
         long size = Files.size(path);
         if (size > MAX_INLINE_BYTES) {
-            throw new SidecarException("content_too_large", "Use an exchange file for large content.");
+            throw new SidecarException(
+                    "content_too_large", "Use an exchange file for large content.");
         }
         return Base64.getEncoder().encodeToString(Files.readAllBytes(path));
     }
@@ -285,10 +359,10 @@ final class VaultSession implements AutoCloseable {
     private static void initializeVaultFiles(Path vault, char[] passphrase) throws IOException {
         MasterkeyFileAccess keyAccess = new MasterkeyFileAccess(new byte[0], RANDOM);
         try (Masterkey masterkey = Masterkey.generate(RANDOM)) {
-            keyAccess.persist(masterkey, vault.resolve(MASTERKEY_FILE), CharBuffer.wrap(passphrase));
+            keyAccess.persist(
+                    masterkey, vault.resolve(MASTERKEY_FILE), CharBuffer.wrap(passphrase));
         }
-        CryptoFileSystemProvider.initialize(
-                vault, properties(vault, passphrase), MASTERKEY_URI);
+        CryptoFileSystemProvider.initialize(vault, properties(vault, passphrase), MASTERKEY_URI);
     }
 
     private static FileSystem openFileSystem(Path vault, char[] passphrase) throws IOException {
@@ -299,7 +373,8 @@ final class VaultSession implements AutoCloseable {
         MasterkeyLoader loader =
                 keyId -> {
                     if (!MASTERKEY_URI.equals(keyId)) {
-                        throw new SidecarException("invalid_key_id", "The vault uses an unsupported key ID.");
+                        throw new SidecarException(
+                                "invalid_key_id", "The vault uses an unsupported key ID.");
                     }
                     return new MasterkeyFileAccess(new byte[0], RANDOM)
                             .load(vault.resolve(MASTERKEY_FILE), CharBuffer.wrap(passphrase));
@@ -379,11 +454,7 @@ final class VaultSession implements AutoCloseable {
     }
 
     private void putBytesOrFile(
-            Path target,
-            Path source,
-            byte[] content,
-            Long modifiedMillis,
-            boolean replace)
+            Path target, Path source, byte[] content, Long modifiedMillis, boolean replace)
             throws IOException {
         if (!replace && Files.exists(target, LinkOption.NOFOLLOW_LINKS)) {
             throw new FileAlreadyExistsException(target.toString());
@@ -393,8 +464,7 @@ final class VaultSession implements AutoCloseable {
             throw new NoSuchFileException("The destination parent does not exist.");
         }
 
-        Path temporary =
-                target.resolveSibling(".maestral-upload-" + UUID.randomUUID() + ".tmp");
+        Path temporary = target.resolveSibling(".maestral-upload-" + UUID.randomUUID() + ".tmp");
         try {
             if (source != null) {
                 Files.copy(source, temporary);
@@ -439,6 +509,87 @@ final class VaultSession implements AutoCloseable {
         return result;
     }
 
+    private List<StorageEntry> storageEntries() throws IOException {
+        List<Path> paths;
+        try (var stream = Files.walk(cleartextRoot)) {
+            paths =
+                    stream.filter(path -> !path.equals(cleartextRoot))
+                            .limit(MAX_SNAPSHOT_ENTRIES + 1L)
+                            .toList();
+        }
+        if (paths.size() > MAX_SNAPSHOT_ENTRIES) {
+            throw new SidecarException(
+                    "vault_too_large", "The vault storage map has too many entries.");
+        }
+        paths = new ArrayList<>(paths);
+        paths.sort(Comparator.comparing(this::toLogicalPath));
+
+        List<StorageEntry> entries = new ArrayList<>(paths.size());
+        for (Path path : paths) {
+            BasicFileAttributes attrs =
+                    Files.readAttributes(
+                            path, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
+            Object fileKey = attrs.fileKey();
+            if (fileKey == null) {
+                throw new SidecarException(
+                        "storage_mapping_missing",
+                        "A vault entry has no physical storage mapping.");
+            }
+            entries.add(new StorageEntry(toLogicalPath(path), storageType(attrs), fileKey));
+        }
+        return entries;
+    }
+
+    private static String storageType(BasicFileAttributes attrs) {
+        if (attrs.isSymbolicLink()) {
+            return "symlink";
+        } else if (attrs.isDirectory()) {
+            return "directory";
+        } else if (attrs.isRegularFile()) {
+            return "file";
+        }
+        throw new SidecarException(
+                "storage_mapping_missing", "A vault entry has no physical storage mapping.");
+    }
+
+    private String toStoragePath(Path storageRoot, Path storagePath) {
+        Path normalized = storagePath.toAbsolutePath().normalize();
+        if (!normalized.startsWith(storageRoot) || normalized.equals(storageRoot)) {
+            throw new SidecarException(
+                    "storage_mapping_missing", "A vault entry has no physical storage mapping.");
+        }
+
+        Path relative = vaultPath.relativize(normalized).normalize();
+        StringBuilder result = new StringBuilder();
+        for (Path component : relative) {
+            String value = component.toString();
+            if (value.isEmpty()
+                    || value.equals(".")
+                    || value.equals("..")
+                    || value.indexOf('/') >= 0
+                    || value.indexOf('\\') >= 0) {
+                throw new SidecarException(
+                        "storage_mapping_missing",
+                        "A vault entry has no physical storage mapping.");
+            }
+            if (!result.isEmpty()) {
+                result.append('/');
+            }
+            result.append(value);
+        }
+        if (result.isEmpty()) {
+            throw new SidecarException(
+                    "storage_mapping_missing", "A vault entry has no physical storage mapping.");
+        }
+        return result.toString();
+    }
+
+    private static SidecarException ambiguousStorageMapping() {
+        return new SidecarException(
+                "storage_mapping_ambiguous",
+                "A vault entry has more than one physical storage mapping.");
+    }
+
     private String sha256(Path path) throws IOException {
         MessageDigest digest;
         try {
@@ -461,7 +612,8 @@ final class VaultSession implements AutoCloseable {
     private Path requireNonRoot(String logicalPath) {
         Path path = resolveLogical(logicalPath);
         if (path.equals(cleartextRoot)) {
-            throw new SidecarException("invalid_path", "The operation cannot change the vault root.");
+            throw new SidecarException(
+                    "invalid_path", "The operation cannot change the vault root.");
         }
         return path;
     }
@@ -498,5 +650,32 @@ final class VaultSession implements AutoCloseable {
             result.append('/').append(component);
         }
         return result.isEmpty() ? "/" : result.toString();
+    }
+
+    private record StorageEntry(String logicalPath, String type, Object fileKey) {
+        boolean accepts(BasicFileAttributes attrs) {
+            return type.equals("directory") ? attrs.isDirectory() : attrs.isRegularFile();
+        }
+    }
+
+    private static final class StorageMatch {
+        private final StorageEntry entry;
+        private Path storagePath;
+
+        private StorageMatch(StorageEntry entry) {
+            this.entry = entry;
+        }
+
+        StorageEntry entry() {
+            return entry;
+        }
+
+        Path storagePath() {
+            return storagePath;
+        }
+
+        void setStoragePath(Path storagePath) {
+            this.storagePath = storagePath;
+        }
     }
 }

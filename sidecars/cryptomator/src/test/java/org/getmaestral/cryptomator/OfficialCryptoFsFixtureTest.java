@@ -12,11 +12,17 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import com.google.gson.Gson;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
+
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
+
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.nio.file.attribute.PosixFilePermissions;
 import java.security.MessageDigest;
@@ -25,9 +31,6 @@ import java.util.Base64;
 import java.util.HexFormat;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipInputStream;
-import org.junit.jupiter.api.BeforeEach;
-import org.junit.jupiter.api.Test;
-import org.junit.jupiter.api.io.TempDir;
 
 class OfficialCryptoFsFixtureTest {
     private static final String FIXTURE_ROOT = "fixtures/official-cryptofs-2.10.0-v8-";
@@ -79,10 +82,36 @@ class OfficialCryptoFsFixtureTest {
                                     server,
                                     "readlink",
                                     params("path", manifest.get("link_path").getAsString())));
-            assertEquals(manifest.get("link_target").getAsString(), link.get("target").getAsString());
+            assertEquals(
+                    manifest.get("link_target").getAsString(), link.get("target").getAsString());
             assertTrue(hasPath(snapshot, manifest.get("long_name").getAsString()));
             assertTrue(hasExactPath(snapshot, manifest.get("moved_to").getAsString()));
             assertFalse(hasExactPath(snapshot, manifest.get("moved_from").getAsString()));
+
+            JsonArray storageMap = resultArray(call(server, "storage_map", new JsonObject()));
+            assertEquals(snapshot.size(), storageMap.size());
+            assertStorageMapMatchesSnapshot(vault, snapshot, storageMap);
+
+            JsonObject file = entryFor(storageMap, "/content/binary.bin");
+            assertEquals("file", file.get("type").getAsString());
+            assertTrue(file.get("storage_path").getAsString().endsWith(".c9r"));
+            assertFalse(file.get("storage_path").getAsString().contains(".c9s/"));
+
+            JsonObject directory = entryFor(storageMap, "/content");
+            assertEquals("directory", directory.get("type").getAsString());
+            assertTrue(
+                    Files.isDirectory(
+                            vault.resolve(directory.get("storage_path").getAsString()),
+                            LinkOption.NOFOLLOW_LINKS));
+
+            JsonObject symbolicLink = entryFor(storageMap, manifest.get("link_path").getAsString());
+            assertEquals("symlink", symbolicLink.get("type").getAsString());
+            assertTrue(symbolicLink.get("storage_path").getAsString().endsWith(".c9r/symlink.c9r"));
+
+            String longPath = "/long-names/" + manifest.get("long_name").getAsString();
+            JsonObject shortened = entryFor(storageMap, longPath);
+            assertEquals("file", shortened.get("type").getAsString());
+            assertTrue(shortened.get("storage_path").getAsString().contains(".c9s/contents.c9r"));
         }
 
         try (var paths = Files.walk(vault.resolve("d"))) {
@@ -171,6 +200,35 @@ class OfficialCryptoFsFixtureTest {
                 .anyMatch(expected::equals);
     }
 
+    private static JsonObject entryFor(JsonArray entries, String path) {
+        return entries.asList().stream()
+                .map(entry -> entry.getAsJsonObject())
+                .filter(entry -> entry.get("path").getAsString().equals(path))
+                .findFirst()
+                .orElseThrow();
+    }
+
+    private static void assertStorageMapMatchesSnapshot(
+            Path vault, JsonArray snapshot, JsonArray storageMap) {
+        for (var element : storageMap) {
+            JsonObject entry = element.getAsJsonObject();
+            JsonObject metadata = entryFor(snapshot, entry.get("path").getAsString());
+            assertEquals(metadata.get("type"), entry.get("type"));
+
+            String storagePath = entry.get("storage_path").getAsString();
+            assertFalse(Path.of(storagePath).isAbsolute());
+            assertFalse(storagePath.contains("\\"));
+            assertTrue(storagePath.startsWith("d/"));
+            for (Path component : Path.of(storagePath)) {
+                assertFalse(component.toString().equals(".") || component.toString().equals(".."));
+            }
+            Path resolved = vault.resolve(storagePath).normalize();
+            assertTrue(resolved.startsWith(vault.resolve("d")));
+            assertTrue(Files.exists(resolved, LinkOption.NOFOLLOW_LINKS));
+        }
+        assertFalse(storageMap.toString().contains(vault.toString()));
+    }
+
     private static Path extract(String resourceName, Path destination) throws IOException {
         Files.createDirectory(destination);
         try (InputStream stream = resource(resourceName);
@@ -194,7 +252,8 @@ class OfficialCryptoFsFixtureTest {
     }
 
     private static InputStream resource(String name) {
-        InputStream stream = OfficialCryptoFsFixtureTest.class.getClassLoader().getResourceAsStream(name);
+        InputStream stream =
+                OfficialCryptoFsFixtureTest.class.getClassLoader().getResourceAsStream(name);
         assertNotNull(stream, "Missing fixture " + name);
         return stream;
     }
