@@ -182,6 +182,7 @@ def test_encryption_configuration_rebuilds_provider_stack(
     config = MaestralConfig(unselected_maestral.config_name)
     assert isinstance(unselected_maestral.client, EncryptedRemoteProvider)
     assert unselected_maestral.sync.client is unselected_maestral.client
+    assert unselected_maestral.virtual_files.provider is unselected_maestral.client
     assert unselected_maestral.encryption_enabled is True
     assert unselected_maestral.encryption_vault_ready is False
     assert unselected_maestral.encryption_vault_path == "/Maestral Vault"
@@ -203,9 +204,11 @@ def test_encryption_configuration_rebuilds_provider_stack(
     assert isinstance(unselected_maestral.client, EncryptedRemoteProvider)
     assert unselected_maestral.provider == "google_drive"
     assert unselected_maestral.client.provider_id == "cryptomator_google_drive"
+    assert unselected_maestral.virtual_files.provider is unselected_maestral.client
 
     unselected_maestral.disable_encryption()
     assert isinstance(unselected_maestral.client, GoogleDriveProvider)
+    assert unselected_maestral.virtual_files.provider is unselected_maestral.client
     assert unselected_maestral.encryption_enabled is False
     assert unselected_maestral.encryption_vault_ready is False
     assert unselected_maestral.encryption_vault_path == ""
