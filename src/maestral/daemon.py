@@ -789,6 +789,9 @@ class MaestralClient(ContextManager["MaestralClient"]):
     def _disconnect(self) -> None:
         if isinstance(self._m, JsonRpcConnection):
             self._m.close()
+        else:
+            self._m.manager.shutdown()
+            self._m.sync._connection.close()
 
     def __enter__(self) -> MaestralClient:
         return self

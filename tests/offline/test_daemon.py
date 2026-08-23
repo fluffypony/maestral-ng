@@ -1,6 +1,7 @@
 import asyncio
 import os
 import signal
+import sqlite3
 import stat
 import subprocess
 import sys
@@ -323,6 +324,11 @@ def test_fallback(config_name: str) -> None:
         assert m.config_name == config_name
         assert m._is_fallback
         assert isinstance(m._m, Maestral)
+        fallback = m._m
+
+    assert not fallback.manager.connection_helper.is_alive()
+    with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+        fallback.sync._connection.execute("SELECT 1")
 
 
 def test_remote_exceptions(config_name: str) -> None:
