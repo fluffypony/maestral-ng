@@ -545,6 +545,116 @@ def test_restart_finishes_a_crash_during_native_move_staging(
         second.close()
 
 
+def test_same_controller_retry_resumes_the_durable_move_journal(
+    config_name: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = FakeVirtualProvider()
+    backend = FakeVirtualFileBackend()
+    controller = make_controller(config_name, tmp_path, provider, backend)
+    file_a = provider.add_file("file-a", "/A.txt", "rev-a", b"A")
+    file_b = provider.add_file("file-b", "/B.txt", "rev-b", b"B")
+    controller.reconcile_remote_batch([file_a, file_b], "cursor-1")
+    original_upsert = backend.upsert
+    failed = False
+
+    def fail_first_stage(*args: object, **kwargs: object) -> None:
+        nonlocal failed
+        item = args[0]
+        if not failed and getattr(item, "path", "").startswith("/.maestral-stage-"):
+            failed = True
+            raise RuntimeError("crash during native staging")
+        original_upsert(*args, **kwargs)  # type: ignore[arg-type]
+
+    moved_a = provider.add_file("file-a", "/B.txt", "rev-a", b"A")
+    moved_b = provider.add_file("file-b", "/A.txt", "rev-b", b"B")
+    monkeypatch.setattr(backend, "upsert", fail_first_stage)
+    with pytest.raises(RuntimeError, match="during native staging"):
+        controller.reconcile_remote_batch([moved_b, moved_a], "cursor-2")
+    monkeypatch.setattr(backend, "upsert", original_upsert)
+
+    controller.reconcile_remote_batch([moved_b, moved_a], "cursor-2")
+
+    assert controller.cursor == "cursor-2"
+    assert controller.get_status("file-a")["path"] == "/B.txt"
+    assert controller.get_status("file-b")["path"] == "/A.txt"
+    with controller._lock:
+        assert all(
+            record.staging_source_path_cased is None
+            for record in controller._get_store().all()
+        )
+    controller.close()
+
+
+@pytest.mark.parametrize("deleted_kind", ["file", "directory"])
+def test_restart_deletes_a_replaced_target_before_finalising_a_staged_move(
+    config_name: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    deleted_kind: str,
+) -> None:
+    provider = FakeVirtualProvider()
+    backend = FakeVirtualFileBackend()
+    first = make_controller(config_name, tmp_path, provider, backend)
+    source = provider.add_file("file-a", "/A.txt", "rev-a", b"A")
+    destination_path = "/B.txt" if deleted_kind == "file" else "/B"
+    if deleted_kind == "file":
+        destination_entries = [
+            provider.add_file("target", destination_path, "rev-b", b"B")
+        ]
+    else:
+        destination_entries = [
+            make_folder("target", destination_path),
+            provider.add_file("old-child", "/B/Old.txt", "rev-c", b"C"),
+        ]
+        backend.require_empty_directories = True
+    first.reconcile_remote_batch([source, *destination_entries], "cursor-1")
+    original_remove = backend.remove
+
+    def fail_target_removal(*args: object, **kwargs: object) -> None:
+        if args[0] == "target":
+            raise RuntimeError("crash after native staging")
+        original_remove(*args, **kwargs)  # type: ignore[arg-type]
+
+    moved = provider.add_file("file-a", destination_path, "rev-a", b"A")
+    deleted = DeletedMetadata(
+        name=destination_path.rsplit("/", 1)[-1],
+        path_lower=destination_path.lower(),
+        path_display=destination_path,
+    )
+    monkeypatch.setattr(backend, "remove", fail_target_removal)
+    with pytest.raises(RuntimeError, match="after native staging"):
+        first.reconcile_remote_batch([deleted, moved], "cursor-2")
+    first.close()
+    monkeypatch.setattr(backend, "remove", original_remove)
+    recovery_call = len(backend.calls)
+
+    second = make_controller(config_name, tmp_path, provider, backend)
+    try:
+        recovery_calls = backend.calls[recovery_call:]
+        removal_index = next(
+            index
+            for index, call in enumerate(recovery_calls)
+            if call[0] == "remove" and call[1] == "target"
+        )
+        final_move_index = next(
+            index
+            for index, call in enumerate(recovery_calls)
+            if call[0] == "upsert"
+            and call[1] == "file-a"
+            and isinstance(call[3], NativeFileIdentity)
+            and call[3].path.startswith("/.maestral-stage-")
+        )
+        assert removal_index < final_move_index
+        assert set(backend.items) == {"file-a"}
+        assert backend.items["file-a"].descriptor.path == destination_path
+        assert second.get_status("file-a")["path"] == destination_path
+        assert second.cursor == "cursor-1"
+    finally:
+        second.close()
+
+
 @pytest.mark.parametrize("final_native_moves", [1, 2])
 def test_restart_finishes_a_crash_during_final_native_moves(
     config_name: str,
@@ -874,6 +984,53 @@ def test_status_pages_and_summary_cover_the_complete_index(
     controller.close()
 
 
+def test_close_waits_for_status_and_never_reopens_the_database(
+    config_name: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = FakeVirtualProvider()
+    backend = FakeVirtualFileBackend()
+    controller = make_controller(config_name, tmp_path, provider, backend)
+    store = controller._get_store()
+    original_summary = store.summary
+    status_started = threading.Event()
+    release_status = threading.Event()
+    status_errors: list[BaseException] = []
+
+    def blocked_summary() -> object:
+        status_started.set()
+        if not release_status.wait(2):
+            raise TimeoutError("the status call did not resume")
+        return original_summary()
+
+    monkeypatch.setattr(store, "summary", blocked_summary)
+
+    def read_status() -> None:
+        try:
+            controller.summary()
+        except BaseException as exc:
+            status_errors.append(exc)
+
+    status_thread = threading.Thread(target=read_status)
+    close_thread = threading.Thread(target=controller.close)
+    status_thread.start()
+    assert status_started.wait(1)
+    close_thread.start()
+    assert close_thread.is_alive()
+    release_status.set()
+    status_thread.join(2)
+    close_thread.join(2)
+
+    assert not status_thread.is_alive()
+    assert not close_thread.is_alive()
+    assert status_errors == []
+    assert controller._store is None
+    with pytest.raises(VirtualFileBusyError, match="closed"):
+        controller.status_page()
+    assert controller._store is None
+
+
 def test_stop_cancels_hydration_before_materialization(
     config_name: str, tmp_path: Path
 ) -> None:
@@ -1091,7 +1248,7 @@ def test_restart_removes_native_items_missing_from_durable_state(
     metadata = provider.add_file("file-1", "/file.txt", "rev-1", b"data")
     first.reconcile_remote_change(metadata)
     backend.open("file-1")
-    first.close()
+    first.stop()
     first.reset()
     first.close()
 

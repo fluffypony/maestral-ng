@@ -609,6 +609,7 @@ class VirtualFileController:
         self._root_path = ""
         self._connected = False
         self._last_worker_error = ""
+        self._closed = False
 
     @property
     def backend_id(self) -> str:
@@ -647,6 +648,7 @@ class VirtualFileController:
     def replace_backend(self, backend: VirtualFileBackend) -> VirtualFileBackend:
         """Replace the inactive native backend before a root is started."""
         with self._lock:
+            self._raise_if_closed()
             if (
                 self.running
                 or self._backend_started
@@ -664,6 +666,7 @@ class VirtualFileController:
     def replace_provider(self, provider: RemoteProvider) -> None:
         """Replace the provider before any virtual identity has been stored."""
         with self._lock:
+            self._raise_if_closed()
             has_database = os.path.exists(self._database_path)
             has_records = has_database and bool(self._get_store().all())
             if (
@@ -737,6 +740,8 @@ class VirtualFileController:
 
     def start(self, root_path: str) -> None:
         """Start the native root and recover all durable operations."""
+        with self._lock:
+            self._raise_if_closed()
         if not self.supported:
             raise UnsupportedVirtualFileBackend()._unsupported()
         if not root_path:
@@ -817,14 +822,28 @@ class VirtualFileController:
 
     def close(self) -> None:
         """Stop the controller and close its lazy database connection."""
+        with self._lock:
+            if self._closed:
+                return
         self.stop()
         with self._lock:
+            if self._closed:
+                return
             if self._store is not None:
                 self._store.close()
                 self._store = None
+            self._closed = True
+
+    def _raise_if_closed(self) -> None:
+        if self._closed:
+            raise VirtualFileBusyError(
+                "Virtual root is closed",
+                "Create a new controller before you access virtual files.",
+            )
 
     def _get_store(self) -> _VirtualFileStore:
         with self._lock:
+            self._raise_if_closed()
             if self._store is None:
                 store = _VirtualFileStore(self._database_path)
                 if store.recreated:
@@ -1000,6 +1019,7 @@ class VirtualFileController:
     def summary(self) -> dict[str, object]:
         """Return a JSON-safe virtual-root status summary."""
         with self._lock:
+            self._raise_if_closed()
             if self.supported:
                 items, pinned, state_counts = self._get_store().summary()
             else:
@@ -1040,6 +1060,14 @@ class VirtualFileController:
         publish_cursor: bool = True,
     ) -> set[str]:
         """Apply final batch targets in dependency order, then publish the cursor."""
+        with self._lock:
+            has_incomplete_batch = any(
+                record.staging_source_path_cased is not None
+                or record.hydration_state is HydrationState.Deleting
+                for record in self._get_store().all()
+            )
+        if has_incomplete_batch:
+            self._recover()
         for entry in entries:
             self._validate_remote_metadata(entry)
         live_entries, deleted_ids, final_tree = self._fold_remote_batch(entries)
@@ -1176,11 +1204,20 @@ class VirtualFileController:
         targets_by_id = {entry.id: entry for entry in entries}
         moved_records: list[_VirtualFileRecord] = []
         with self._lock:
-            deleting_directories = [
+            deleting_records = [
                 record
                 for provider_id in deleting_ids
                 if (record := self._get_store().get(provider_id)) is not None
-                and bool(record.is_directory)
+            ]
+            for record in deleting_records:
+                self._ensure_native_item_mutable(
+                    record.provider_id,
+                    "Cannot stage the remote deletion",
+                )
+            deleting_directories = [
+                record
+                for record in deleting_records
+                if bool(record.is_directory)
             ]
             for entry in entries:
                 record = self._get_store().get(entry.id)
@@ -1272,8 +1309,19 @@ class VirtualFileController:
             plans.append((records, staged_records))
 
         all_staged = [record for _old, staged in plans for record in staged]
+        durable_deletions = [
+            self._copy_record(
+                record,
+                hydration_state=HydrationState.Deleting,
+                generation=record.generation + 1,
+                last_error=None,
+            )
+            for record in deleting_records
+        ]
         with self._lock:
-            self._get_store().records.update_many(all_staged)
+            self._get_store().records.update_many(
+                [*all_staged, *durable_deletions]
+            )
 
         staged_by_id = {record.provider_id: record for record in all_staged}
         for old in sorted(roots, key=lambda item: item.path_lower.count("/")):
@@ -1834,9 +1882,10 @@ class VirtualFileController:
                 projected_path = final_lower
             else:
                 projected_path = path_lower
-            if projected_path in projected_path_types:
-                raise ValueError("The stored move targets have duplicate paths")
-            projected_path_types[projected_path] = bool(record.is_directory)
+            if record.hydration_state is not HydrationState.Deleting:
+                if projected_path in projected_path_types:
+                    raise ValueError("The stored move targets have duplicate paths")
+                projected_path_types[projected_path] = bool(record.is_directory)
             _validate_virtual_token(record.revision, "stored revision")
             if bool(record.is_directory) != (record.revision == "folder"):
                 raise ValueError("The stored folder revision is invalid")
@@ -1898,11 +1947,15 @@ class VirtualFileController:
                     item.provider_id, "Cannot apply the remote deletion"
                 )
             deleting_records = [
-                self._copy_record(
-                    item,
-                    hydration_state=HydrationState.Deleting,
-                    generation=item.generation + 1,
-                    last_error=None,
+                (
+                    item
+                    if item.hydration_state is HydrationState.Deleting
+                    else self._copy_record(
+                        item,
+                        hydration_state=HydrationState.Deleting,
+                        generation=item.generation + 1,
+                        last_error=None,
+                    )
                 )
                 for item in records
             ]
@@ -2283,18 +2336,9 @@ class VirtualFileController:
             open_count=state.open_count,
         )
 
-    def _settle_staged_moves(
-        self,
-        records: Sequence[_VirtualFileRecord],
-        native_by_id: dict[str, NativeFileRecord],
-    ) -> list[_VirtualFileRecord]:
-        """Finish durable path staging before the root becomes available."""
-        staged_records = [
-            record for record in records if record.staging_source_path_cased is not None
-        ]
-        if not staged_records:
-            return list(records)
-
+    def _staged_final_records(
+        self, staged_records: Sequence[_VirtualFileRecord]
+    ) -> dict[str, _VirtualFileRecord]:
         final_records: dict[str, _VirtualFileRecord] = {}
         for record in staged_records:
             assert record.staging_source_path_cased is not None
@@ -2310,7 +2354,15 @@ class VirtualFileController:
                 native_applied_generation=0,
                 last_error=None,
             )
+        return final_records
 
+    def _ensure_staged_move_sources(
+        self,
+        staged_records: Sequence[_VirtualFileRecord],
+        native_by_id: dict[str, NativeFileRecord],
+    ) -> None:
+        """Move each journalled source aside without publishing final paths."""
+        final_records = self._staged_final_records(staged_records)
         staged_directories = [
             record for record in staged_records if bool(record.is_directory)
         ]
@@ -2368,6 +2420,24 @@ class VirtualFileController:
                     "Cannot recover a staged virtual move",
                     "The native move identity changed after the crash.",
                 )
+
+    def _settle_staged_moves(
+        self,
+        records: Sequence[_VirtualFileRecord],
+        native_by_id: dict[str, NativeFileRecord],
+    ) -> list[_VirtualFileRecord]:
+        """Finish durable path staging before the root becomes available."""
+        staged_records = [
+            record for record in records if record.staging_source_path_cased is not None
+        ]
+        if not staged_records:
+            return list(records)
+
+        final_records = self._staged_final_records(staged_records)
+        self._ensure_staged_move_sources(staged_records, native_by_id)
+        staged_directories = [
+            record for record in staged_records if bool(record.is_directory)
+        ]
 
         settled_records: list[_VirtualFileRecord] = []
         for record in sorted(
@@ -2475,7 +2545,13 @@ class VirtualFileController:
             native_path_types[native_path_lower] = native_record.is_directory
             native_by_id[native_record.provider_id] = native_record
         _validate_tree_structure(native_path_types, "native recovery result")
-        records = self._settle_staged_moves(records, native_by_id)
+        staged_records = [
+            record
+            for record in records
+            if record.staging_source_path_cased is not None
+        ]
+        if staged_records:
+            self._ensure_staged_move_sources(staged_records, native_by_id)
         desired_ids = {record.provider_id for record in records}
         if self._needs_full_snapshot and not records and not native_records:
             self._set_checkpoint("", needs_full_snapshot=False)
@@ -2502,6 +2578,7 @@ class VirtualFileController:
                     orphan.provider_id,
                     expected=self._native_identity(orphan),
                 )
+                native_by_id.pop(orphan.provider_id, None)
 
         deleting = [
             record
@@ -2517,6 +2594,12 @@ class VirtualFileController:
             if recovered_native is not None and (
                 recovered_native.dirty or recovered_native.open_count
             ):
+                if staged_records:
+                    raise VirtualFileBusyError(
+                        "Cannot recover the virtual root",
+                        "A deleted path needed by an interrupted move has local "
+                        "changes or is open. Its content was preserved.",
+                    )
                 preserved = self._copy_record(
                     record,
                     hydration_state=(
@@ -2539,12 +2622,18 @@ class VirtualFileController:
                     record.provider_id,
                     expected=self._native_identity(recovered_native),
                 )
+                native_by_id.pop(record.provider_id, None)
             with self._lock:
                 self._get_store().delete(record.provider_id)
 
+        if staged_records:
+            self._settle_staged_moves(records, native_by_id)
+        with self._lock:
+            records = sorted(
+                self._get_store().all(), key=lambda item: item.path_lower.count("/")
+            )
+
         for record in records:
-            if record.hydration_state is HydrationState.Deleting:
-                continue
             recovered_native = native_by_id.get(record.provider_id)
             if recovered_native is not None and (
                 recovered_native.dirty or recovered_native.open_count
