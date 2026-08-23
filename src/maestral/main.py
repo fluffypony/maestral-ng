@@ -138,6 +138,7 @@ class Maestral:
 
         >>> from maestral.main import Maestral
         >>> m = Maestral(config_name='private')
+        >>> m.set_provider('dropbox')
         >>> url = m.get_auth_url()  # get token from Dropbox website
         >>> print(f'Please go to {url} to retrieve a Dropbox authorization token.')
         >>> token = input('Enter auth token: ')
@@ -176,19 +177,28 @@ class Maestral:
         self._loop = event_loop
         self._config_name = validate_config_name(config_name)
         self._conf = MaestralConfig(self.config_name)
+        self._provider_selection_lock = threading.RLock()
         configured_provider = normalise_provider_name(
             self._conf.get("auth", "provider")
         )
+        provider_selected = self._conf.get("auth", "provider_selected")
+        if not isinstance(provider_selected, bool):
+            raise ValueError("The provider selection state is invalid")
         if provider is not None:
             selected_provider = normalise_provider_name(provider)
             if (
-                self._conf.get("auth", "account_id")
-                and selected_provider != configured_provider
-            ):
+                self._conf.get("auth", "account_id") or self._conf.get("sync", "path")
+            ) and selected_provider != configured_provider:
                 raise ValueError("Unlink the current account before changing provider")
-            if selected_provider != configured_provider:
-                self._conf.set("auth", "provider", selected_provider)
+            if selected_provider != configured_provider or not provider_selected:
+                self._save_provider_selection(selected_provider, selected=True)
             configured_provider = selected_provider
+        elif (
+            self._conf.get("auth", "account_id") or self._conf.get("sync", "path")
+        ) and not provider_selected:
+            # A linked profile or an existing local root proves that its stored
+            # provider was selected before this flag existed.
+            self._save_provider_selection(configured_provider, selected=True)
         self._provider = configured_provider
         self._state = MaestralState(self.config_name)
         self._logger = scoped_logger(__name__, self.config_name)
@@ -281,7 +291,9 @@ class Maestral:
 
         :returns: URL to retrieve an authorization code.
         """
-        return self.client.get_auth_url()
+        with self._provider_selection_lock:
+            self._check_provider_selected()
+            return self.client.get_auth_url()
 
     def link(
         self,
@@ -317,7 +329,8 @@ class Maestral:
             plain text when no secure keyring is available.
         :returns: 0 on success, 1 for an invalid token and 2 for connection errors.
         """
-        with self.sync.sync_lock:
+        with self._provider_selection_lock, self.sync.sync_lock:
+            self._check_provider_selected()
             reset = self._state.get("recovery", "sync_reset")
             if isinstance(reset, dict) and reset.get("kind") == "unlink":
                 pending = self._root_bound_recovery_names()
@@ -464,6 +477,97 @@ class Maestral:
         """The selected remote storage provider."""
         return self._provider
 
+    def _save_provider_selection(self, provider: str, *, selected: bool) -> None:
+        """Save the provider and its explicit selection as one config update."""
+        with self._conf._lock:
+            snapshot = self._conf._configuration_snapshot()
+            save_generation = self._conf.save_generation
+            try:
+                self._conf.set("auth", "provider", provider, save=False)
+                self._conf.set("auth", "provider_selected", selected, save=False)
+                self._conf.save()
+            except BaseException:
+                if not self._conf.save_committed_since(save_generation):
+                    self._conf._restore_configuration_snapshot(snapshot)
+                raise
+
+    def set_provider(self, provider: str) -> None:
+        """Select the remote provider for the next account link.
+
+        Provider changes are allowed only before an account or local sync root exists.
+        Re-selecting the current provider is safe and records the required setup step.
+        """
+        selected_provider = normalise_provider_name(provider)
+
+        with self._provider_selection_lock:
+            if selected_provider == self.provider:
+                if self._conf.get("auth", "provider_selected") is not True:
+                    with self.sync.sync_lock:
+                        if self._state.get("recovery", "sync_reset"):
+                            raise MaestralApiError(
+                                "Cannot select storage provider",
+                                "Finish the pending account recovery first.",
+                            )
+                        self._save_provider_selection(selected_provider, selected=True)
+                return
+
+            old_client = self.client
+
+            with self.manager._lock:
+                if (
+                    self.manager.running.is_set()
+                    or self.manager._active_internal_operation is not None
+                ):
+                    raise BusyError(
+                        "Cannot change storage provider",
+                        "Please try again when idle.",
+                    )
+
+            with self.sync.sync_lock:
+                if self._conf.get("auth", "account_id") or old_client.linked:
+                    raise MaestralApiError(
+                        "Cannot change storage provider",
+                        "Unlink the current account before you select another provider.",
+                    )
+                if self.sync.dropbox_path:
+                    raise MaestralApiError(
+                        "Cannot change storage provider",
+                        "Remove the current local sync folder before you select "
+                        "another provider.",
+                    )
+                if self._state.get("recovery", "sync_reset"):
+                    raise MaestralApiError(
+                        "Cannot change storage provider",
+                        "Finish the pending account recovery first.",
+                    )
+
+                new_cred_storage = CredentialStorage(
+                    self.config_name, selected_provider
+                )
+                new_client = create_provider(
+                    selected_provider,
+                    self.config_name,
+                    new_cred_storage,
+                    bandwidth_limit_up=self.bandwidth_limit_up,
+                    bandwidth_limit_down=self.bandwidth_limit_down,
+                )
+                try:
+                    self._save_provider_selection(selected_provider, selected=True)
+                    self._provider = selected_provider
+                    self.cred_storage = new_cred_storage
+                    self.client = new_client
+                    self.sync.client = new_client
+                except BaseException:
+                    new_client.close()
+                    raise
+
+            try:
+                old_client.close()
+            except Exception:
+                self._logger.debug(
+                    "Could not close the old provider client", exc_info=True
+                )
+
     def set_conf(self, section: str, name: str, value: Any) -> None:
         """
         Sets a configuration option.
@@ -493,6 +597,11 @@ class Maestral:
             "root_marker_id",
         }:
             raise ValueError("Use the Dropbox root API for this setting")
+        if normalised_section == "auth" and normalised_name in {
+            "provider",
+            "provider_selected",
+        }:
+            raise ValueError("Use the provider selection API for this setting")
         self._conf.set(section, name, value)
 
     def get_conf(self, section: str, name: str) -> Any:
@@ -688,6 +797,7 @@ class Maestral:
         return {
             "config_name": self.config_name,
             "version": self.version,
+            "provider": self.provider,
             "status": self.status,
             "pending_link": self.pending_link,
             "pending_dropbox_folder": self.pending_dropbox_folder,
@@ -1793,6 +1903,7 @@ class Maestral:
         :raises OSError: if creation fails.
         :raises NotLinkedError: if no Dropbox account is linked.
         """
+        self._check_provider_selected()
         self._check_linked()
         if self._state.get("recovery", "sync_reset"):
             raise MaestralApiError(
@@ -2057,6 +2168,13 @@ class Maestral:
             raise NotLinkedError(
                 "No Dropbox account linked",
                 "Please link an account using the GUI or CLI.",
+            )
+
+    def _check_provider_selected(self) -> None:
+        if self._conf.get("auth", "provider_selected") is not True:
+            raise MaestralApiError(
+                "No storage provider selected",
+                "Select Dropbox or Google Drive before you link an account.",
             )
 
     def _check_dropbox_dir(self) -> None:

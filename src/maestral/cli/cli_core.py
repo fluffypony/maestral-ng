@@ -228,6 +228,7 @@ def start(foreground: bool, verbose: bool, config_name: str) -> None:
         m = MaestralClient(config_name)
 
         if m.pending_link:
+            m.set_provider(m.provider)
             link_dialog(m)
 
         if m.pending_dropbox_folder:

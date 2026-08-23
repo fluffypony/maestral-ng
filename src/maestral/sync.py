@@ -2791,6 +2791,8 @@ class SyncEngine:
                 save_generation = self._conf.save_generation
                 try:
                     self._conf.reset_to_defaults(save=False)
+                    self._conf.set("auth", "provider", journal["provider"], save=False)
+                    self._conf.set("auth", "provider_selected", False, save=False)
                     self._conf.save()
                 except BaseException:
                     if not self._conf.save_committed_since(save_generation):

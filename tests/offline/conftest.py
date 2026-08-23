@@ -18,6 +18,7 @@ from maestral.utils.path import delete
 @pytest.fixture
 def m():
     m = Maestral("test-config")
+    m.set_provider("dropbox")
     m.log_level = logging.DEBUG
     yield m
     m.manager.shutdown()

@@ -80,6 +80,7 @@ def m(pytestconfig, test_lock):
     config_name = "test-config"
 
     m = Maestral(config_name)
+    m.set_provider("dropbox")
     m.log_level = logging.DEBUG
     m.sync.max_cpu_percent = 20 * 100
 

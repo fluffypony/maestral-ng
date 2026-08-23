@@ -37,6 +37,8 @@ PROVIDER_NAMES = (DROPBOX, GOOGLE_DRIVE)
 
 def normalise_provider_name(value: str) -> str:
     """Return one canonical provider name."""
+    if not isinstance(value, str):
+        raise ValueError("The remote provider must be a string")
     normalised = value.strip().lower().replace("-", "_").replace(" ", "_")
     if normalised not in PROVIDER_NAMES:
         choices = ", ".join(PROVIDER_NAMES)

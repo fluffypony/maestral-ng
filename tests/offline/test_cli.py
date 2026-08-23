@@ -17,6 +17,7 @@ from maestral.cli import main
 from maestral.cli.core import OrderedGroup
 from maestral.config import MaestralConfig, MaestralState
 from maestral.daemon import MaestralClient, Start, start_maestral_daemon_process
+from maestral.exceptions import MaestralApiError
 from maestral.logging import scoped_logger
 from maestral.main import Maestral
 from maestral.notify import level_name_to_number, level_number_to_name
@@ -68,9 +69,7 @@ def test_help() -> None:
     assert result_no_arg.output == result_help_arg.output
 
 
-def test_auth_link_selects_provider_before_client_creation(
-    config_name: str, monkeypatch
-) -> None:
+def test_auth_link_selects_provider_before_link(config_name: str, monkeypatch) -> None:
     fake_client = MagicMock()
     fake_client.__enter__.return_value = fake_client
     fake_client.pending_link = True
@@ -100,12 +99,35 @@ def test_auth_link_selects_provider_before_client_creation(
     )
 
     assert result.exit_code == 0, result.output
-    assert created_with == ["google_drive"]
+    assert created_with == ["dropbox"]
+    fake_client.set_provider.assert_called_once_with("google_drive")
     fake_client.link.assert_called_once_with(
         refresh_token="token",
         access_token=None,
         allow_plaintext_keyring=False,
     )
+
+
+def test_auth_link_reports_rejected_provider_change(
+    config_name: str, monkeypatch
+) -> None:
+    fake_client = MagicMock()
+    fake_client.__enter__.return_value = fake_client
+    fake_client.set_provider.side_effect = MaestralApiError(
+        "Cannot change storage provider",
+        "Unlink the current account first.",
+    )
+
+    monkeypatch.setattr(daemon_module, "MaestralClient", Mock(return_value=fake_client))
+
+    result = CliRunner().invoke(
+        main,
+        ["auth", "link", "--provider", "google-drive", "-c", config_name],
+    )
+
+    assert result.exit_code == 1
+    assert "Unlink the current account first" in result.output
+    fake_client.link.assert_not_called()
 
 
 def test_config_cleanup_keeps_unlinked_recovery_journal(

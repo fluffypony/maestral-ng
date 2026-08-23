@@ -104,27 +104,14 @@ def inject_client(
             config_name = ctx.params.pop("config_name", "maestral")
             kwargs.pop("config_name", None)
 
+            requested_provider = None
             if select_provider:
-                from ..config import MaestralConfig
-                from ..daemon import is_running
                 from ..providers.base import normalise_provider_name
 
-                requested = ctx.params.pop("provider", None)
+                requested_provider = ctx.params.pop("provider", None)
                 kwargs.pop("provider", None)
-                if requested is not None:
-                    conf = MaestralConfig(config_name)
-                    current = normalise_provider_name(conf.get("auth", "provider"))
-                    selected = normalise_provider_name(requested)
-                    if conf.get("auth", "account_id") and selected != current:
-                        raise click.UsageError(
-                            "Unlink the current account before changing provider."
-                        )
-                    if selected != current and is_running(config_name):
-                        raise click.UsageError(
-                            "Stop the daemon before changing provider."
-                        )
-                    if selected != current:
-                        conf.set("auth", "provider", selected)
+                if requested_provider is not None:
+                    requested_provider = normalise_provider_name(requested_provider)
 
             try:
                 client = ctx.with_resource(
@@ -134,6 +121,14 @@ def inject_client(
                 click.echo("Maestral daemon is not running.")
                 ctx.exit(1)
             else:
+                if select_provider:
+                    from ..exceptions import MaestralApiError
+
+                    try:
+                        client.set_provider(requested_provider or client.provider)
+                    except MaestralApiError as exc:
+                        warn(f"{exc.title}. {exc.message}")
+                        ctx.exit(1)
                 return ctx.invoke(f, client, *args, **kwargs)
 
         if existing_config:

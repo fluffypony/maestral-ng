@@ -24,6 +24,7 @@ CONFIG_DIR_NAME = "maestral"
 DEFAULTS_CONFIG: _DefaultsType = {
     "auth": {
         "provider": "dropbox",  # remote storage provider
+        "provider_selected": False,  # provider confirmed for the next link
         "account_id": "",  # remote account id
         "keyring": "automatic",  # keychain backend to use for credential storage
         "token_access_type": "offline",
