@@ -267,7 +267,6 @@ def test_interrupted_unlink_preserves_protection_and_virtual_mode(
     config.set("encryption", "cache_path", str(cache_path))
     config.set("sync", "mode", "virtual")
     config.set("sync", "path", str(tmp_path / "old-root"))
-    state.set("virtual_files", "cursor", "old-cursor")
     state.set(
         "recovery",
         "sync_reset",

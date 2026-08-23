@@ -90,10 +90,6 @@ DEFAULTS_STATE: _DefaultsType = {
         "pending_downloads": [],  # incomplete downloads to retry on next sync
         "ignored_symlink_paths": [],  # local symlink overlays ignored by sync
     },
-    "virtual_files": {
-        "cursor": "",  # provider cursor for the separate virtual root
-        "needs_full_snapshot": False,  # missing-index recovery is incomplete
-    },
     "recovery": {
         "sync_reset": {},  # durable sync-state or unlink reset journal
         "vault_secret_cleanup": {},  # obsolete encrypted-vault password cleanup

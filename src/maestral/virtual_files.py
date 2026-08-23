@@ -11,13 +11,13 @@ import re
 import sqlite3
 import tempfile
 import threading
+import unicodedata
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from stat import S_ISREG
 from typing import BinaryIO, Protocol, cast
 
-from .config import MaestralState
 from .constants import ROOT_MARKER_FILE, ROOT_MARKER_TEMP_PREFIX
 from .core import (
     DeletedMetadata,
@@ -53,12 +53,19 @@ _MAX_STATUS_PAGE_ITEMS = 256
 _CONTENT_HASH_PATTERN = re.compile(r"(?:[0-9a-f]{32}|[0-9a-f]{64})")
 
 
+def _has_utf8_length_at_most(value: str, limit: int) -> bool:
+    try:
+        return len(value.encode("utf-8")) <= limit
+    except UnicodeEncodeError:
+        return False
+
+
 def _validate_virtual_token(value: object, name: str) -> str:
     if (
         not isinstance(value, str)
         or not value
-        or len(value) > _MAX_VIRTUAL_TOKEN_LENGTH
-        or any(ord(character) < 32 for character in value)
+        or not _has_utf8_length_at_most(value, _MAX_VIRTUAL_TOKEN_LENGTH)
+        or any(unicodedata.category(character) == "Cc" for character in value)
     ):
         raise ValueError(f"The virtual-file {name} is invalid")
     return value
@@ -71,7 +78,7 @@ def _validate_virtual_path(
         not isinstance(path, str)
         or path == "/"
         or not path.startswith("/")
-        or len(path) > _MAX_VIRTUAL_PATH_LENGTH
+        or not _has_utf8_length_at_most(path, _MAX_VIRTUAL_PATH_LENGTH)
         or "\\" in path
         or "\x00" in path
         or posixpath.normpath(path) != path
@@ -80,7 +87,7 @@ def _validate_virtual_path(
     components = path[1:].split("/")
     if any(
         component in {"", ".", ".."}
-        or len(component.encode("utf-8")) > 255
+        or not _has_utf8_length_at_most(component, 255)
         for component in components
     ):
         raise ValueError(f"The virtual-file {name} is invalid")
@@ -357,10 +364,29 @@ class _VirtualFileStore:
             with self.connection:
                 self.connection.execute(
                     f"CREATE TABLE IF NOT EXISTS {self._SENTINEL_TABLE} "
-                    "(identity TEXT PRIMARY KEY NOT NULL, status TEXT NOT NULL)"
+                    "(identity TEXT PRIMARY KEY NOT NULL, status TEXT NOT NULL, "
+                    "cursor TEXT NOT NULL DEFAULT '', "
+                    "needs_full_snapshot INTEGER NOT NULL DEFAULT 1)"
                 )
+                sentinel_columns = {
+                    row["name"]
+                    for row in self.connection.execute(
+                        f"PRAGMA table_info({self._SENTINEL_TABLE})"
+                    ).fetchall()
+                }
+                if "cursor" not in sentinel_columns:
+                    self.connection.execute(
+                        f"ALTER TABLE {self._SENTINEL_TABLE} "
+                        "ADD COLUMN cursor TEXT NOT NULL DEFAULT ''"
+                    )
+                if "needs_full_snapshot" not in sentinel_columns:
+                    self.connection.execute(
+                        f"ALTER TABLE {self._SENTINEL_TABLE} ADD COLUMN "
+                        "needs_full_snapshot INTEGER NOT NULL DEFAULT 1"
+                    )
                 sentinel = self.connection.execute(
-                    f"SELECT identity, status FROM {self._SENTINEL_TABLE}"
+                    f"SELECT identity, status, cursor, needs_full_snapshot "
+                    f"FROM {self._SENTINEL_TABLE}"
                 ).fetchall()
                 records_table_exists = (
                     self.connection.execute(
@@ -380,6 +406,8 @@ class _VirtualFileStore:
                     len(sentinel) != 1
                     or sentinel[0]["identity"] != self._SENTINEL_VALUE
                     or sentinel[0]["status"] not in {"initialising", "ready"}
+                    or not isinstance(sentinel[0]["cursor"], str)
+                    or sentinel[0]["needs_full_snapshot"] not in {0, 1}
                 ):
                     raise ValueError("The virtual-file database identity is invalid")
                 else:
@@ -437,6 +465,43 @@ class _VirtualFileStore:
                     or row["status"] != "ready"
                 ):
                     raise ValueError("The virtual-file database identity is invalid")
+
+    @property
+    def cursor(self) -> str:
+        row = self.connection.execute(
+            f"SELECT cursor FROM {self._SENTINEL_TABLE} WHERE identity = ?",
+            (self._SENTINEL_VALUE,),
+        ).fetchone()
+        if row is None or not isinstance(row["cursor"], str):
+            raise ValueError("The virtual-file cursor is invalid")
+        return row["cursor"]
+
+    @property
+    def needs_full_snapshot(self) -> bool:
+        row = self.connection.execute(
+            f"SELECT needs_full_snapshot FROM {self._SENTINEL_TABLE} "
+            "WHERE identity = ?",
+            (self._SENTINEL_VALUE,),
+        ).fetchone()
+        if row is None or row["needs_full_snapshot"] not in {0, 1}:
+            raise ValueError("The virtual-file snapshot state is invalid")
+        return bool(row["needs_full_snapshot"])
+
+    def set_checkpoint(self, cursor: str, needs_full_snapshot: bool) -> None:
+        """Commit the remote checkpoint inside its indexed database."""
+        if not isinstance(cursor, str):
+            raise ValueError("The virtual-file cursor is invalid")
+        if not isinstance(needs_full_snapshot, bool):
+            raise ValueError("The virtual-file snapshot state is invalid")
+        with self.connection:
+            changed = self.connection.execute(
+                f"UPDATE {self._SENTINEL_TABLE} "
+                "SET cursor = ?, needs_full_snapshot = ? "
+                "WHERE identity = ?",
+                (cursor, int(needs_full_snapshot), self._SENTINEL_VALUE),
+            ).rowcount
+            if changed != 1:
+                raise ValueError("The virtual-file database identity is invalid")
 
     def close(self) -> None:
         self.connection.close()
@@ -525,20 +590,7 @@ class VirtualFileController:
         self._database_path = database_path or get_data_path(
             "maestral", f"{config_name}.virtual-files"
         )
-        self._state = MaestralState(config_name)
-        database_missing = not os.path.exists(self._database_path)
-        needs_full_snapshot = self._state.get("virtual_files", "needs_full_snapshot")
-        if not isinstance(needs_full_snapshot, bool):
-            raise ValueError("The virtual-file snapshot state is invalid")
-        if database_missing:
-            with self._state._lock:
-                self._state.set("virtual_files", "cursor", "", save=False)
-                self._state.set(
-                    "virtual_files", "needs_full_snapshot", True, save=False
-                )
-                self._state.save()
-            needs_full_snapshot = True
-        self._needs_full_snapshot = needs_full_snapshot
+        self._needs_full_snapshot = True
         self._snapshot_native_by_id: dict[str, NativeFileRecord] = {}
         self._store: _VirtualFileStore | None = None
         self._lock = threading.RLock()
@@ -576,10 +628,21 @@ class VirtualFileController:
 
     @property
     def cursor(self) -> str:
-        cursor = self._state.get("virtual_files", "cursor")
-        if not isinstance(cursor, str):
-            raise ValueError("The virtual-file cursor is invalid")
-        return cursor
+        with self._lock:
+            return self._get_store().cursor
+
+    def _set_checkpoint(
+        self, cursor: str, *, needs_full_snapshot: bool | None = None
+    ) -> None:
+        """Commit a cursor with the exact virtual index which it describes."""
+        with self._lock:
+            required = (
+                self._needs_full_snapshot
+                if needs_full_snapshot is None
+                else needs_full_snapshot
+            )
+            self._get_store().set_checkpoint(cursor, required)
+            self._needs_full_snapshot = required
 
     def replace_backend(self, backend: VirtualFileBackend) -> VirtualFileBackend:
         """Replace the inactive native backend before a root is started."""
@@ -642,7 +705,7 @@ class VirtualFileController:
                     # Publish an empty cursor before any destructive reset work. If the
                     # process stops after this save, the next start performs a full
                     # remote snapshot and rebuilds any missing native state.
-                    self._state.set("virtual_files", "cursor", "")
+                    self._set_checkpoint("", needs_full_snapshot=False)
                     if self._backend_started:
                         for record in records:
                             self._backend.remove(
@@ -663,7 +726,7 @@ class VirtualFileController:
             self._quiesce()
             try:
                 with self._remote_lock:
-                    self._state.set("virtual_files", "cursor", "")
+                    self._set_checkpoint("", needs_full_snapshot=False)
                     with self._lock:
                         self._get_store().records.delete(AllQuery())
                         self._last_worker_error = ""
@@ -766,25 +829,17 @@ class VirtualFileController:
                 store = _VirtualFileStore(self._database_path)
                 if store.recreated:
                     try:
-                        with self._state._lock:
-                            self._state.set("virtual_files", "cursor", "", save=False)
-                            self._state.set(
-                                "virtual_files",
-                                "needs_full_snapshot",
-                                True,
-                                save=False,
-                            )
-                            self._state.save()
+                        store.set_checkpoint("", True)
                     except BaseException:
                         store.close()
                         raise
-                    self._needs_full_snapshot = True
                     self._snapshot_native_by_id.clear()
                     try:
                         store.mark_ready()
                     except BaseException:
                         store.close()
                         raise
+                self._needs_full_snapshot = store.needs_full_snapshot
                 self._store = store
             return self._store
 
@@ -1011,7 +1066,7 @@ class VirtualFileController:
         ):
             self._reconcile_remote_change(entry)
         if publish_cursor:
-            self._state.set("virtual_files", "cursor", cursor)
+            self._set_checkpoint(cursor)
         return live_ids
 
     def _fold_remote_batch(self, entries: Sequence[Metadata]) -> tuple[
@@ -2423,8 +2478,7 @@ class VirtualFileController:
         records = self._settle_staged_moves(records, native_by_id)
         desired_ids = {record.provider_id for record in records}
         if self._needs_full_snapshot and not records and not native_records:
-            self._state.set("virtual_files", "needs_full_snapshot", False)
-            self._needs_full_snapshot = False
+            self._set_checkpoint("", needs_full_snapshot=False)
         if self._needs_full_snapshot:
             self._snapshot_native_by_id = native_by_id.copy()
         orphan_records = [
@@ -2666,15 +2720,7 @@ class VirtualFileController:
                         orphan.provider_id,
                         expected=self._native_identity(orphan),
                     )
-                with self._state._lock:
-                    self._state.set(
-                        "virtual_files", "cursor", latest_cursor, save=False
-                    )
-                    self._state.set(
-                        "virtual_files", "needs_full_snapshot", False, save=False
-                    )
-                    self._state.save()
-                self._needs_full_snapshot = False
+                self._set_checkpoint(latest_cursor, needs_full_snapshot=False)
                 self._snapshot_native_by_id.clear()
                 return
 
@@ -2718,7 +2764,7 @@ class VirtualFileController:
                     pending_entries.extend(page_entries)
                     changes_complete = not has_more
             except CursorResetError:
-                self._state.set("virtual_files", "cursor", "")
+                self._set_checkpoint("")
                 self.refresh_remote()
                 return
             if not saw_page or not changes_complete:

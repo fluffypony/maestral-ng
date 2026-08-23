@@ -1245,6 +1245,35 @@ def test_missing_database_stages_a_live_child_before_orphan_parent_removal(
         second.close()
 
 
+def test_restored_database_uses_its_own_remote_cursor(
+    config_name: str, tmp_path: Path
+) -> None:
+    provider = FakeVirtualProvider()
+    backend = FakeVirtualFileBackend()
+    database_path = tmp_path / "virtual-files.db"
+    first = make_controller(config_name, tmp_path, provider, backend)
+    old = provider.add_file("file-1", "/old.txt", "rev-1", b"old")
+    first.reconcile_remote_batch([old], "cursor-old")
+    first.close()
+    old_database = database_path.read_bytes()
+
+    second = make_controller(config_name, tmp_path, provider, backend)
+    new = provider.add_file("file-2", "/new.txt", "rev-1", b"new")
+    second.reconcile_remote_batch([new], "cursor-new")
+    second.close()
+    database_path.write_bytes(old_database)
+
+    restored = make_controller(config_name, tmp_path, provider, backend)
+    try:
+        assert restored.cursor == "cursor-old"
+        assert restored.get_status("file-1")["path"] == "/old.txt"
+        with pytest.raises(VirtualFileNotFoundError):
+            restored.get_status("file-2")
+        assert set(backend.items) == {"file-1"}
+    finally:
+        restored.close()
+
+
 @pytest.mark.parametrize("replacement", ["missing", "empty_sqlite"])
 def test_database_loss_after_controller_creation_forces_safe_snapshot(
     config_name: str,
@@ -1377,7 +1406,7 @@ def test_incomplete_snapshot_never_deletes_native_items(
     controller = make_controller(config_name, tmp_path, provider, backend)
     metadata = provider.add_file("file-1", "/file.txt", "rev-1", b"data")
     controller.reconcile_remote_batch([metadata], "cursor-old")
-    controller._state.set("virtual_files", "cursor", "")
+    controller._set_checkpoint("")
     provider.pages = pages
     call_count = len(backend.calls)
 
@@ -1399,7 +1428,7 @@ def test_malformed_snapshot_fails_before_native_mutation(
     controller = make_controller(config_name, tmp_path, provider, backend)
     metadata = provider.add_file("file-1", "/file.txt", "rev-1", b"data")
     controller.reconcile_remote_batch([metadata], "cursor-old")
-    controller._state.set("virtual_files", "cursor", "")
+    controller._set_checkpoint("")
     malformed = provider.add_file("file-2", "/safe.txt", "rev-1", b"bad")
     malformed.path_lower = "/../escape"
     provider.pages = [ListFolderResult([malformed], False, "cursor-new")]
@@ -1432,12 +1461,38 @@ def test_multibyte_component_over_filesystem_limit_fails_before_native_mutation(
         elif update_kind == "batch":
             controller.reconcile_remote_batch([metadata], "cursor-new")
         else:
-            controller._state.set("virtual_files", "cursor", "")
+            controller._set_checkpoint("")
             provider.pages = [ListFolderResult([metadata], False, "cursor-new")]
             controller.refresh_remote()
 
     assert len(backend.calls) == call_count
     assert backend.items == {}
+    controller.close()
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("id", "é" * 513), ("rev", "revision\x7f")],
+)
+def test_native_token_limits_fail_before_database_or_native_mutation(
+    config_name: str,
+    tmp_path: Path,
+    field: str,
+    value: str,
+) -> None:
+    provider = FakeVirtualProvider()
+    backend = FakeVirtualFileBackend()
+    controller = make_controller(config_name, tmp_path, provider, backend)
+    metadata = provider.add_file("file-1", "/file.txt", "rev-1", b"bad")
+    setattr(metadata, field, value)
+    call_count = len(backend.calls)
+
+    with pytest.raises(ValueError, match="provider identity|revision"):
+        controller.reconcile_remote_batch([metadata], "cursor-new")
+
+    assert len(backend.calls) == call_count
+    assert backend.items == {}
+    assert controller.status_page()["items"] == []
     controller.close()
 
 
@@ -1464,7 +1519,7 @@ def test_reserved_root_marker_paths_fail_before_native_mutation(
         elif update_kind == "batch":
             controller.reconcile_remote_batch([metadata], "cursor-new")
         else:
-            controller._state.set("virtual_files", "cursor", "")
+            controller._set_checkpoint("")
             provider.pages = [ListFolderResult([metadata], False, "cursor-new")]
             controller.refresh_remote()
 
@@ -1484,7 +1539,7 @@ def test_malformed_snapshot_tree_fails_before_native_mutation(
     controller = make_controller(config_name, tmp_path, provider, backend)
     old = provider.add_file("old-1", "/old.txt", "rev-1", b"old")
     controller.reconcile_remote_batch([old], "cursor-old")
-    controller._state.set("virtual_files", "cursor", "")
+    controller._set_checkpoint("")
     child = provider.add_file("child-1", "/Parent/Child.txt", "rev-1", b"child")
     entries = [child]
     if invalid_parent == "file":
@@ -1512,7 +1567,7 @@ def test_full_snapshot_cannot_borrow_a_parent_from_stale_rows(
     controller = make_controller(config_name, tmp_path, provider, backend)
     parent = make_folder("parent-old", "/Parent")
     controller.reconcile_remote_batch([parent], "cursor-old")
-    controller._state.set("virtual_files", "cursor", "")
+    controller._set_checkpoint("")
     child = provider.add_file("child-new", "/Parent/Child.txt", "rev-1", b"child")
     provider.pages = [ListFolderResult([child], False, "cursor-new")]
     call_count = len(backend.calls)
