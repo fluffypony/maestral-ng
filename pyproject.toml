@@ -33,7 +33,7 @@ dependencies = [
     "requests>=2.16.2",
     "rich",
     "typing_extensions",
-    "watchdog>=2.0.1",
+    "watchdog>=6.0.0",
     "xattr; platform_system != 'Windows'",
 ]
 
