@@ -23,7 +23,7 @@ classifiers = [
 urls = { Homepage = "https://getmaestral.com" }
 requires-python = ">=3.11"
 dependencies = [
-    "click>=8.2.0",
+    "click>=8.4.2",
     "dropbox>=12.1.0,<13.0",
     "fasteners>=0.15",
     "keyring>=22",
