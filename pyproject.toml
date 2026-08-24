@@ -27,7 +27,7 @@ dependencies = [
     "dropbox>=12.1.0,<13.0",
     "fasteners>=0.15",
     "keyring>=22",
-    "keyrings.alt>=3.1.0",
+    "keyrings.alt>=5.0.2",
     "packaging",
     "pathspec>=0.5.8",
     "requests>=2.16.2",
